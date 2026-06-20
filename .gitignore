@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+bot_data.json
+.env
+test_api.py
