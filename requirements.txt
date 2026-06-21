@@ -1,2 +1,7 @@
 python-telegram-bot[job-scheduler]==21.6
 requests>=2.31.0
+[1mbase58[0m==2.1.1
+[1mhttpx[0m==0.28.1
+[1mhttpx2[0m==2.4.0
+[1msolana[0m==0.37.1
+[1msolders[0m==0.27.1
