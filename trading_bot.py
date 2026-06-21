@@ -151,10 +151,17 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"📋 Adresse:\n`{wallet.public_key}`\n\n"
         msg += f"💵 Solde: *{balance:.4f} SOL*\n"
         msg += f"\n🔗 [Voir sur Solscan](https://solscan.io/account/{wallet.public_key})"
+        msg += f"\n\n💡 Envoyez des SOL à cette adresse pour commencer à trader."
     else:
-        msg = ("❌ Aucun wallet configuré.\n\n"
-               "Utilisez /import\\_wallet `<clé_privée_base58>` pour importer votre wallet.\n\n"
-               "⚠️ Utilisez un wallet DÉDIÉ au trading, jamais votre wallet principal !")
+        # Créer un nouveau wallet automatiquement
+        pub_key = wallet.load_or_create_wallet()
+        init_trading()
+        msg = f"✅ *Nouveau Wallet créé !*\n\n"
+        msg += f"📋 Adresse:\n`{pub_key}`\n\n"
+        msg += f"💵 Solde: *0.0000 SOL*\n\n"
+        msg += f"📤 Envoyez des SOL à cette adresse depuis Phantom, Backpack ou Binance.\n\n"
+        msg += f"⚠️ Ce wallet est DÉDIÉ au trading. Ne mettez que ce que vous pouvez perdre.\n\n"
+        msg += f"Ou importez un wallet existant: /import\\_wallet `<clé_privée>`"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -648,6 +655,13 @@ async def metas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Démarrer le bot de trading"""
+    # Fix: Créer un event loop explicite pour éviter RuntimeError sur certains environnements
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     if TELEGRAM_BOT_TOKEN == "VOTRE_TOKEN_ICI":
         print("⚠️  Token Telegram non configuré dans config.py !")
         return
