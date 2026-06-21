@@ -33,18 +33,18 @@ class TradingConfig:
 
     # Budget et position
     max_budget_sol: float = 6.5          # ~1000 CHF en SOL (ajuster selon le cours)
-    position_size_sol: float = 0.3       # Taille d'une position (SOL par trade)
+    position_size_sol: float = 0.05      # Taille d'une position (SOL par trade)
     max_open_positions: int = 10         # Nombre max de positions ouvertes
 
     # Stratégie Sniper (nouveaux tokens)
     sniper_enabled: bool = True
-    sniper_position_sol: float = 0.2     # Montant par snipe (plus petit = moins risqué)
+    sniper_position_sol: float = 0.05    # Montant par snipe
     sniper_min_liquidity: float = 5000   # Liquidité min pour sniper ($)
     sniper_max_mc: float = 100_000       # MC max pour sniper ($)
 
     # Stratégie Momentum (tokens en pump)
     momentum_enabled: bool = True
-    momentum_position_sol: float = 0.3   # Montant par trade momentum
+    momentum_position_sol: float = 0.05  # Montant par trade momentum
     momentum_min_pump_5m: float = 15     # % hausse min sur 5min
     momentum_min_pump_1h: float = 40     # % hausse min sur 1h
     momentum_min_volume: float = 10_000  # Volume 24h min ($)
@@ -62,7 +62,8 @@ class TradingConfig:
 
     # RPC & API
     rpc_url: str = ""
-    jupiter_api_url: str = "https://api.jup.ag"
+    # lite-api.jup.ag est GRATUIT (pas besoin d'API key)
+    jupiter_api_url: str = "https://lite-api.jup.ag"
 
 
 @dataclass
@@ -187,8 +188,8 @@ class WalletManager:
             logger.error(f"Erreur getBalance: {e}")
             return 0.0
 
-    def get_token_balance(self, token_mint: str) -> float:
-        """Récupérer le solde d'un token SPL"""
+    def get_token_balance(self, token_mint: str) -> Tuple[float, int]:
+        """Récupérer le solde d'un token SPL - retourne (uiAmount, rawAmount)"""
         try:
             payload = {
                 "jsonrpc": "2.0",
@@ -204,12 +205,14 @@ class WalletManager:
             result = response.json()
             accounts = result.get("result", {}).get("value", [])
             if not accounts:
-                return 0.0
+                return 0.0, 0
             token_amount = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
-            return float(token_amount["uiAmount"] or 0)
+            ui_amount = float(token_amount.get("uiAmount") or 0)
+            raw_amount = int(token_amount.get("amount", "0"))
+            return ui_amount, raw_amount
         except Exception as e:
             logger.error(f"Erreur getTokenBalance: {e}")
-            return 0.0
+            return 0.0, 0
 
     def export_private_key(self) -> str:
         """Exporter la clé privée en base58 (ATTENTION: sensible !)"""
@@ -223,7 +226,7 @@ class WalletManager:
 # ============================================================
 
 class JupiterSwap:
-    """Moteur de swap via Jupiter API"""
+    """Moteur de swap via Jupiter API (lite-api.jup.ag = gratuit, pas de clé API)"""
 
     def __init__(self, wallet: WalletManager, config: TradingConfig):
         self.wallet = wallet
@@ -231,31 +234,34 @@ class JupiterSwap:
         self.base_url = config.jupiter_api_url
         self.client = httpx.Client(timeout=30)
 
-    def get_quote(self, input_mint: str, output_mint: str, amount_lamports: int) -> Optional[dict]:
+    def get_quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[dict]:
         """Obtenir un devis de swap via Jupiter"""
         try:
             url = f"{self.base_url}/swap/v1/quote"
             params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
-                "amount": str(amount_lamports),
+                "amount": str(amount),
                 "slippageBps": self.config.slippage_bps,
                 "restrictIntermediateTokens": "true",
             }
+            logger.info(f"[JUPITER] GET quote: {input_mint[:8]}... -> {output_mint[:8]}... amount={amount}")
             response = self.client.get(url, params=params)
             if response.status_code == 200:
-                return response.json()
+                quote = response.json()
+                logger.info(f"[JUPITER] Quote OK: outAmount={quote.get('outAmount', '?')}")
+                return quote
             else:
-                logger.error(f"Quote error {response.status_code}: {response.text}")
+                logger.error(f"[JUPITER] Quote error {response.status_code}: {response.text[:200]}")
                 return None
         except Exception as e:
-            logger.error(f"Erreur get_quote: {e}")
+            logger.error(f"[JUPITER] Erreur get_quote: {e}")
             return None
 
     def execute_swap(self, quote_response: dict) -> Optional[str]:
-        """Exécuter un swap à partir d'un devis"""
+        """Exécuter un swap à partir d'un devis - MÉTHODE CORRIGÉE"""
         try:
-            # 1. Obtenir la transaction sérialisée
+            # 1. Obtenir la transaction sérialisée depuis Jupiter
             url = f"{self.base_url}/swap/v1/swap"
             payload = {
                 "quoteResponse": quote_response,
@@ -264,38 +270,63 @@ class JupiterSwap:
                 "dynamicSlippage": True,
                 "prioritizationFeeLamports": {
                     "priorityLevelWithMaxLamports": {
-                        "maxLamports": 500000,  # 0.0005 SOL max priority fee
-                        "priorityLevel": "high"
+                        "maxLamports": 1000000,  # 0.001 SOL max priority fee
+                        "priorityLevel": "veryHigh"
                     }
                 }
             }
+            logger.info(f"[JUPITER] POST swap request...")
             response = self.client.post(url, json=payload)
             if response.status_code != 200:
-                logger.error(f"Swap API error: {response.text}")
+                logger.error(f"[JUPITER] Swap API error {response.status_code}: {response.text[:300]}")
                 return None
 
             swap_data = response.json()
-            swap_transaction = swap_data.get("swapTransaction")
-            if not swap_transaction:
-                logger.error(f"Pas de swapTransaction dans la réponse")
+            swap_transaction_b64 = swap_data.get("swapTransaction")
+            if not swap_transaction_b64:
+                logger.error(f"[JUPITER] Pas de swapTransaction dans la réponse: {swap_data}")
                 return None
 
-            # 2. Décoder et signer la transaction
-            raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_transaction))
-            signature = self.wallet.keypair.sign_message(bytes(raw_tx.message))
-            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-            encoded_tx = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+            logger.info(f"[JUPITER] Got swapTransaction, signing...")
 
-            # 3. Envoyer la transaction via RPC
-            tx_signature = self._send_transaction(encoded_tx)
+            # 2. Décoder la transaction
+            swap_transaction_bytes = base64.b64decode(swap_transaction_b64)
+            raw_transaction = VersionedTransaction.from_bytes(swap_transaction_bytes)
+
+            # 3. Signer la transaction - MÉTHODE CORRECTE (comme l'exemple officiel Jupiter)
+            # Trouver l'index du wallet dans les account_keys
+            account_keys = raw_transaction.message.account_keys
+            wallet_pubkey = self.wallet.keypair.pubkey()
+            wallet_index = None
+            for i, key in enumerate(account_keys):
+                if key == wallet_pubkey:
+                    wallet_index = i
+                    break
+
+            if wallet_index is None:
+                logger.error(f"[JUPITER] Wallet pubkey not found in transaction account_keys!")
+                return None
+
+            # Créer la liste des signers en remplaçant la signature placeholder
+            signers = list(raw_transaction.signatures)
+            signers[wallet_index] = self.wallet.keypair
+            signed_transaction = VersionedTransaction(raw_transaction.message, signers)
+
+            logger.info(f"[JUPITER] Transaction signed, sending to RPC...")
+
+            # 4. Envoyer la transaction signée via RPC
+            tx_signature = self._send_transaction(signed_transaction)
             return tx_signature
 
         except Exception as e:
-            logger.error(f"Erreur execute_swap: {e}")
+            logger.error(f"[JUPITER] Erreur execute_swap: {e}", exc_info=True)
             return None
 
-    def _send_transaction(self, encoded_tx: str) -> Optional[str]:
+    def _send_transaction(self, signed_tx: VersionedTransaction) -> Optional[str]:
         """Envoyer une transaction signée au réseau Solana"""
+        # Encoder en base64 pour l'envoi RPC
+        encoded_tx = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -306,7 +337,7 @@ class JupiterSwap:
                     "skipPreflight": True,
                     "preflightCommitment": "confirmed",
                     "encoding": "base64",
-                    "maxRetries": 3,
+                    "maxRetries": 5,
                 }
             ]
         }
@@ -315,59 +346,100 @@ class JupiterSwap:
             result = response.json()
             if "result" in result:
                 tx_sig = result["result"]
-                logger.info(f"Transaction envoyée: {tx_sig}")
+                logger.info(f"[JUPITER] ✅ Transaction envoyée: {tx_sig}")
                 return tx_sig
             else:
                 error = result.get("error", {})
-                logger.error(f"Erreur RPC: {error}")
+                logger.error(f"[JUPITER] ❌ Erreur RPC sendTransaction: {json.dumps(error)}")
                 return None
         except Exception as e:
-            logger.error(f"Erreur send_transaction: {e}")
+            logger.error(f"[JUPITER] Erreur send_transaction: {e}")
             return None
+
+    def confirm_transaction(self, tx_signature: str, timeout: int = 30) -> bool:
+        """Attendre la confirmation d'une transaction"""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignatureStatuses",
+                    "params": [[tx_signature], {"searchTransactionHistory": True}]
+                }
+                response = httpx.post(self.wallet.rpc_url, json=payload, timeout=10)
+                result = response.json()
+                statuses = result.get("result", {}).get("value", [])
+                if statuses and statuses[0]:
+                    status = statuses[0]
+                    if status.get("confirmationStatus") in ["confirmed", "finalized"]:
+                        if status.get("err") is None:
+                            logger.info(f"[JUPITER] ✅ TX confirmée: {tx_signature}")
+                            return True
+                        else:
+                            logger.error(f"[JUPITER] ❌ TX échouée: {status.get('err')}")
+                            return False
+            except Exception as e:
+                logger.error(f"[JUPITER] Erreur confirm: {e}")
+            time.sleep(2)
+        logger.warning(f"[JUPITER] ⏰ Timeout confirmation TX: {tx_signature}")
+        return False
 
     def buy_token(self, token_mint: str, amount_sol: float) -> Optional[str]:
         """Acheter un token avec du SOL"""
         amount_lamports = int(amount_sol * 1_000_000_000)
         sol_mint = WalletManager.SOL_MINT
 
-        logger.info(f"Achat: {amount_sol} SOL -> {token_mint[:12]}...")
+        logger.info(f"[BUY] {amount_sol} SOL -> {token_mint[:16]}...")
 
         # Obtenir le devis
         quote = self.get_quote(sol_mint, token_mint, amount_lamports)
         if not quote:
-            logger.error("Impossible d'obtenir un devis pour l'achat")
+            logger.error("[BUY] Impossible d'obtenir un devis")
             return None
 
-        out_amount = int(quote.get("outAmount", 0))
-        logger.info(f"Devis: {amount_sol} SOL -> {out_amount} tokens")
+        out_amount = quote.get("outAmount", "0")
+        logger.info(f"[BUY] Devis: {amount_sol} SOL -> {out_amount} tokens")
 
         # Exécuter le swap
         tx_sig = self.execute_swap(quote)
         if tx_sig:
-            logger.info(f"✅ Achat réussi! TX: {tx_sig}")
-        return tx_sig
+            logger.info(f"[BUY] ✅ Achat envoyé! TX: {tx_sig}")
+            # Vérifier la confirmation
+            confirmed = self.confirm_transaction(tx_sig, timeout=30)
+            if confirmed:
+                logger.info(f"[BUY] ✅ Achat CONFIRMÉ!")
+                return tx_sig
+            else:
+                logger.warning(f"[BUY] ⚠️ TX envoyée mais non confirmée: {tx_sig}")
+                return tx_sig  # On retourne quand même la signature
+        return None
 
-    def sell_token(self, token_mint: str, amount_tokens: int) -> Optional[str]:
-        """Vendre un token contre du SOL"""
+    def sell_token(self, token_mint: str, raw_amount: int) -> Optional[str]:
+        """Vendre un token contre du SOL (utilise raw_amount = unités atomiques)"""
         sol_mint = WalletManager.SOL_MINT
 
-        logger.info(f"Vente: {amount_tokens} tokens {token_mint[:12]}... -> SOL")
+        logger.info(f"[SELL] {raw_amount} raw tokens {token_mint[:16]}... -> SOL")
 
         # Obtenir le devis
-        quote = self.get_quote(token_mint, sol_mint, amount_tokens)
+        quote = self.get_quote(token_mint, sol_mint, raw_amount)
         if not quote:
-            logger.error("Impossible d'obtenir un devis pour la vente")
+            logger.error("[SELL] Impossible d'obtenir un devis")
             return None
 
         out_amount = int(quote.get("outAmount", 0))
         sol_received = out_amount / 1_000_000_000
-        logger.info(f"Devis: {amount_tokens} tokens -> {sol_received:.4f} SOL")
+        logger.info(f"[SELL] Devis: -> {sol_received:.4f} SOL")
 
         # Exécuter le swap
         tx_sig = self.execute_swap(quote)
         if tx_sig:
-            logger.info(f"✅ Vente réussie! TX: {tx_sig}")
-        return tx_sig
+            logger.info(f"[SELL] ✅ Vente envoyée! TX: {tx_sig}")
+            confirmed = self.confirm_transaction(tx_sig, timeout=30)
+            if confirmed:
+                logger.info(f"[SELL] ✅ Vente CONFIRMÉE!")
+            return tx_sig
+        return None
 
 
 # ============================================================
@@ -606,8 +678,8 @@ class TradingEngine:
 
         # Vérifier le solde
         balance = self.wallet.get_sol_balance()
-        if balance < amount_sol + 0.01:  # +0.01 pour les frais
-            logger.warning(f"Solde insuffisant: {balance:.4f} SOL < {amount_sol + 0.01}")
+        if balance < amount_sol + 0.005:  # +0.005 pour les frais
+            logger.warning(f"Solde insuffisant: {balance:.4f} SOL < {amount_sol + 0.005}")
             return None
 
         # Exécuter l'achat
@@ -619,8 +691,6 @@ class TradingEngine:
 
             # Estimer les tokens reçus (approximation basée sur le prix)
             price_usd = float(analysis.get("price_usd", 0) or 0)
-            # Note: le montant exact sera vérifié après confirmation
-            estimated_tokens = 0  # Sera mis à jour après confirmation
 
             # Ouvrir la position
             position = self.positions.open_position(
@@ -629,7 +699,7 @@ class TradingEngine:
                 token_symbol=analysis.get("symbol", "???"),
                 entry_price=price_usd,
                 amount_sol=amount_sol,
-                amount_tokens=estimated_tokens,
+                amount_tokens=0,  # Sera mis à jour après vérification on-chain
                 strategy=strategy,
             )
 
@@ -654,18 +724,17 @@ class TradingEngine:
         """Exécuter une vente"""
         token_mint = position.token_address
 
-        # Récupérer le solde réel du token
-        token_balance = self.wallet.get_token_balance(token_mint)
-        if token_balance <= 0:
+        # Récupérer le solde réel du token (ui_amount ET raw_amount)
+        ui_amount, raw_amount = self.wallet.get_token_balance(token_mint)
+        if raw_amount <= 0:
             logger.warning(f"Pas de tokens à vendre pour {position.token_name}")
             self.positions.close_position(token_mint)
             return None
 
-        # Convertir en unités atomiques (approximation - les décimales varient)
-        # Pour la plupart des meme coins sur Solana: 6 ou 9 décimales
-        amount_atomic = int(token_balance * 1_000_000)  # Assumant 6 décimales
+        logger.info(f"[SELL] Token balance: ui={ui_amount}, raw={raw_amount}")
 
-        tx_sig = self.swap.sell_token(token_mint, amount_atomic)
+        # Utiliser le raw_amount directement (unités atomiques correctes)
+        tx_sig = self.swap.sell_token(token_mint, raw_amount)
 
         if tx_sig:
             self.last_trade_time = time.time()
