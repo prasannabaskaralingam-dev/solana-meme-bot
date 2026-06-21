@@ -669,14 +669,29 @@ def main():
 
     # Charger le wallet (depuis env var WALLET_PRIVATE_KEY ou fichier)
     env_key = os.environ.get("WALLET_PRIVATE_KEY", "").strip()
-    if env_key or os.path.exists(WalletManager.WALLET_FILE):
+    print(f"[DEBUG] WALLET_PRIVATE_KEY env var present: {bool(env_key)}, length: {len(env_key)}")
+    print(f"[DEBUG] Wallet file exists: {os.path.exists(WalletManager.WALLET_FILE)}")
+    if env_key:
+        try:
+            pub_key = wallet.import_wallet(env_key)
+            init_trading()
+            print(f"💰 Wallet chargé depuis env: {pub_key}")
+            balance = wallet.get_sol_balance()
+            print(f"💰 Solde: {balance} SOL")
+            # Auto-activer le trading si wallet présent
+            global auto_trading_enabled
+            auto_trading_enabled = True
+            print("🚀 Trading automatique ACTIVÉ")
+        except Exception as e:
+            print(f"[ERROR] Impossible de charger wallet depuis env: {e}")
+    elif os.path.exists(WalletManager.WALLET_FILE):
         wallet.load_or_create_wallet()
         init_trading()
-        print(f"💰 Wallet chargé: {wallet.public_key}")
-        # Auto-activer le trading si wallet présent
-        global auto_trading_enabled
+        print(f"💰 Wallet chargé depuis fichier: {wallet.public_key}")
         auto_trading_enabled = True
         print("🚀 Trading automatique ACTIVÉ")
+    else:
+        print("⚠️  Aucun wallet configuré. Utilisez /wallet ou /import_wallet")
 
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")
