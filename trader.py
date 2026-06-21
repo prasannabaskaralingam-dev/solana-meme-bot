@@ -19,6 +19,9 @@ from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger(__name__)
 
+# Répertoire de base (même dossier que le script)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 # ============================================================
 # CONFIGURATION TRADING
@@ -104,7 +107,7 @@ class Position:
 class WalletManager:
     """Gestion du wallet Solana (keypair)"""
 
-    WALLET_FILE = "wallet.json"
+    WALLET_FILE = os.path.join(BASE_DIR, "wallet.json")
     SOL_MINT = "So11111111111111111111111111111111111111112"
 
     def __init__(self, rpc_url: str):
@@ -366,7 +369,7 @@ class JupiterSwap:
 class PositionManager:
     """Gestion des positions ouvertes"""
 
-    POSITIONS_FILE = "positions.json"
+    POSITIONS_FILE = os.path.join(BASE_DIR, "positions.json")
 
     def __init__(self):
         self.positions: dict[str, Position] = {}
@@ -464,13 +467,15 @@ class TradingEngine:
 
     def _load_history(self):
         """Charger l'historique des trades"""
-        if os.path.exists("trade_history.json"):
-            with open("trade_history.json", "r") as f:
+        history_file = os.path.join(BASE_DIR, "trade_history.json")
+        if os.path.exists(history_file):
+            with open(history_file, "r") as f:
                 self.trade_history = json.load(f)
 
     def _save_history(self):
         """Sauvegarder l'historique"""
-        with open("trade_history.json", "w") as f:
+        history_file = os.path.join(BASE_DIR, "trade_history.json")
+        with open(history_file, "w") as f:
             json.dump(self.trade_history, f, indent=2)
 
     def can_trade(self) -> Tuple[bool, str]:

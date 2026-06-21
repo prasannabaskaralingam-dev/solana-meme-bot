@@ -1,0 +1,14 @@
+/home/ubuntu/solana-meme-bot/bot.py:549: PTBUserWarning: No `JobQueue` set up. To use `JobQueue`, you must install PTB via `pip install "python-telegram-bot[job-queue]"`.
+  job_queue = app.job_queue
+🚀 Démarrage du Solana Meme Coin Tracker...
+⏱  Intervalle de scan: 45s
+📊 Filtres: MC $1,000-$10,000,000
+💧 Liquidité min: $1,000
+
+Traceback (most recent call last):
+  File "/home/ubuntu/solana-meme-bot/bot.py", line 564, in <module>
+    main()
+  File "/home/ubuntu/solana-meme-bot/bot.py", line 550, in main
+    job_queue.run_repeating(
+    ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'run_repeating'
