@@ -3,3 +3,7 @@ __pycache__/
 bot_data.json
 .env
 test_api.py
+wallet.json
+positions.json
+trade_history.json
+trading_config.json
