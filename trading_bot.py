@@ -667,11 +667,16 @@ def main():
         print("⚠️  Token Telegram non configuré dans config.py !")
         return
 
-    # Charger le wallet si existant
-    if os.path.exists(WalletManager.WALLET_FILE):
+    # Charger le wallet (depuis env var WALLET_PRIVATE_KEY ou fichier)
+    env_key = os.environ.get("WALLET_PRIVATE_KEY", "").strip()
+    if env_key or os.path.exists(WalletManager.WALLET_FILE):
         wallet.load_or_create_wallet()
         init_trading()
         print(f"💰 Wallet chargé: {wallet.public_key}")
+        # Auto-activer le trading si wallet présent
+        global auto_trading_enabled
+        auto_trading_enabled = True
+        print("🚀 Trading automatique ACTIVÉ")
 
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")

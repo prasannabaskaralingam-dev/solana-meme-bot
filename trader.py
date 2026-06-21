@@ -117,6 +117,14 @@ class WalletManager:
 
     def load_or_create_wallet(self) -> str:
         """Charger un wallet existant ou en créer un nouveau"""
+        # Priorité 1: Variable d'environnement (persistée sur Render)
+        env_key = os.environ.get("WALLET_PRIVATE_KEY", "").strip()
+        if env_key:
+            try:
+                return self.import_wallet(env_key)
+            except Exception as e:
+                logger.error(f"Erreur chargement wallet depuis env: {e}")
+        # Priorité 2: Fichier local
         if os.path.exists(self.WALLET_FILE):
             return self._load_wallet()
         else:
