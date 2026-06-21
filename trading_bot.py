@@ -693,10 +693,25 @@ def main():
     else:
         print("⚠️  Aucun wallet configuré. Utilisez /wallet ou /import_wallet")
 
+    # Nettoyer les positions fantômes (positions sans tokens réels)
+    if wallet.keypair and positions.count_positions() > 0:
+        print("🔍 Vérification des positions existantes...")
+        to_remove = []
+        for addr, pos in positions.positions.items():
+            _, raw_bal = wallet.get_token_balance(addr)
+            if raw_bal <= 0:
+                to_remove.append(addr)
+                print(f"  ❌ Position fantôme supprimée: {pos.token_name}")
+        for addr in to_remove:
+            positions.close_position(addr)
+        if to_remove:
+            print(f"  🧹 {len(to_remove)} positions fantômes nettoyées")
+
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")
     print(f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%")
     print(f"💰 Budget max: {trading_config.max_budget_sol} SOL")
+    print(f"🌐 Jupiter API: {trading_config.jupiter_api_url}")
 
     # Créer l'application Telegram
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
