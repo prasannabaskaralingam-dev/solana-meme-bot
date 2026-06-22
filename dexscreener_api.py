@@ -193,7 +193,8 @@ class DexScreenerAPI:
 
     def is_potential_gem(self, analysis: dict) -> tuple:
         """
-        Évaluer si un token est un potentiel gem basé sur les filtres.
+        Évaluer si un token est un potentiel gem basé sur les filtres améliorés.
+        Scoring pondéré pour privilégier les tokens avec momentum réel.
         Retourne (bool, list_of_reasons)
         """
         if not analysis:
@@ -202,46 +203,78 @@ class DexScreenerAPI:
         reasons = []
         score = 0
 
-        # Vérifier la liquidité minimum
+        # === FILTRES ELIMINATOIRES ===
+
+        # Liquidité minimum (augmentée pour éviter les scams)
         if analysis["liquidity_usd"] < FILTERS["min_liquidity_usd"]:
             return False, ["Liquidité trop faible"]
 
-        # Vérifier le market cap
+        # Market cap
         mc = analysis["market_cap"]
         if mc and mc < FILTERS["min_market_cap"]:
             return False, ["Market cap trop faible"]
         if mc and mc > FILTERS["max_market_cap"]:
             return False, ["Market cap trop élevé"]
 
-        # Pump sur 5 min
-        if analysis["price_change_5m"] >= FILTERS["min_price_change_5m"]:
-            reasons.append(f"🚀 Pump +{analysis['price_change_5m']:.1f}% en 5min")
-            score += 2
+        # NOUVEAU: Rejeter si le prix baisse sur 5min (on ne catch pas un couteau)
+        if analysis["price_change_5m"] < -10:
+            return False, ["Token en chute libre (-10% sur 5min)"]
+
+        # NOUVEAU: Rejeter si ratio sell > buy (distribution en cours)
+        if analysis["buy_sell_ratio_5m"] < 0.5:
+            return False, ["Plus de vendeurs que d'acheteurs"]
+
+        # === SCORING PONDÉRÉ ===
+
+        # Pump sur 5 min (signal fort si modéré, danger si trop fort)
+        pump_5m = analysis["price_change_5m"]
+        if 5 <= pump_5m <= 50:
+            reasons.append(f"🚀 Pump sain +{pump_5m:.1f}% en 5min")
+            score += 3
+        elif pump_5m > 50:
+            reasons.append(f"⚠️ Pump extrême +{pump_5m:.1f}% (risque de retrace)")
+            score += 1  # Moins de points car risque de retrace
 
         # Pump sur 1h
-        if analysis["price_change_1h"] >= FILTERS["min_price_change_1h"]:
-            reasons.append(f"📈 Hausse +{analysis['price_change_1h']:.1f}% en 1h")
+        pump_1h = analysis["price_change_1h"]
+        if 20 <= pump_1h <= 200:
+            reasons.append(f"📈 Hausse +{pump_1h:.1f}% en 1h")
             score += 2
 
-        # Volume élevé
+        # Volume élevé (signal de liquidité réelle)
         if analysis["volume_24h"] >= FILTERS["min_volume_24h"]:
             reasons.append(f"💰 Volume 24h: ${analysis['volume_24h']:,.0f}")
             score += 1
+        if analysis["volume_24h"] >= 50_000:
+            score += 1  # Bonus pour gros volume
 
-        # Beaucoup d'achats
-        if analysis["buys_5m"] >= FILTERS["min_buys_5m"]:
-            reasons.append(f"🛒 {analysis['buys_5m']} achats en 5min")
+        # Beaucoup d'achats (signal d'intérêt réel)
+        buys = analysis["buys_5m"]
+        if buys >= FILTERS["min_buys_5m"]:
+            reasons.append(f"🛒 {buys} achats en 5min")
+            score += 1
+        if buys >= 50:
+            reasons.append(f"🔥 {buys} achats en 5min (FOMO)")
+            score += 2  # Beaucoup d'acheteurs = signal fort
+
+        # Ratio buy/sell favorable (signal clé)
+        ratio = analysis["buy_sell_ratio_5m"]
+        if ratio >= 3:
+            reasons.append(f"⚡ Ratio achat/vente: {ratio:.1f}x (très bullish)")
+            score += 3
+        elif ratio >= 1.5:
+            reasons.append(f"⚡ Ratio achat/vente: {ratio:.1f}x")
             score += 1
 
-        # Ratio buy/sell favorable
-        if analysis["buy_sell_ratio_5m"] >= 2:
-            reasons.append(f"⚡ Ratio achat/vente: {analysis['buy_sell_ratio_5m']:.1f}x")
+        # Token récent (les nouveaux tokens ont plus de potentiel)
+        age = analysis["age_hours"]
+        if age and age <= 1:
+            reasons.append(f"🆕 Créé il y a {age:.1f}h (très frais)")
+            score += 3
+        elif age and age <= 6:
+            reasons.append(f"🆕 Créé il y a {age:.1f}h")
             score += 1
 
-        # Token récent
-        if analysis["age_hours"] and analysis["age_hours"] <= FILTERS["max_token_age_hours"]:
-            reasons.append(f"🆕 Créé il y a {analysis['age_hours']:.1f}h")
-            score += 1
-
-        is_gem = score >= 2 and len(reasons) >= 2
+        # Seuil: score minimum de 4 ET au moins 2 raisons
+        is_gem = score >= 4 and len(reasons) >= 2
         return is_gem, reasons

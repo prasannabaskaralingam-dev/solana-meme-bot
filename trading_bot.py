@@ -24,6 +24,7 @@ from trader import (
     TradingConfig, WalletManager, JupiterSwap,
     PositionManager, TradingEngine, Position
 )
+from token_security import TokenSecurityChecker
 
 # Logging
 logging.basicConfig(
@@ -46,6 +47,7 @@ TRADING_CONFIG_FILE = os.path.join(DATA_DIR, "trading_config.json")
 def load_trading_config() -> TradingConfig:
     """Charger la config de trading"""
     config = TradingConfig()
+    # Helius RPC (gratuit, 1M credits/mois, 10 req/s) - fallback sur public RPC
     config.rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     if os.path.exists(TRADING_CONFIG_FILE):
         with open(TRADING_CONFIG_FILE, "r") as f:
@@ -82,8 +84,13 @@ wallet = WalletManager(trading_config.rpc_url)
 swap_engine: JupiterSwap = None
 positions = PositionManager()
 trading_engine: TradingEngine = None
+security_checker: TokenSecurityChecker = None
 auto_trading_enabled = False
 subscribers = []
+
+# Déduplication: tokens déjà analysés/rejetés (évite de re-checker les mêmes)
+seen_tokens: set = set()  # Tokens déjà achetés ou rejetés
+MAX_SEEN_TOKENS = 500  # Limite pour éviter une fuite mémoire
 
 # Charger les subscribers
 SUBS_FILE = os.path.join(DATA_DIR, "bot_data.json")
@@ -95,9 +102,11 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine
+    global swap_engine, trading_engine, security_checker
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
+    security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
+    logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
 
 
 # ============================================================
@@ -591,8 +600,13 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
         for token_data in new_tokens[:10]:
             address = token_data["address"]
 
+            # Déjà vu/rejeté ?
+            if address in seen_tokens:
+                continue
+
             # Déjà en position ?
             if address in positions.positions:
+                seen_tokens.add(address)
                 continue
 
             # Analyser
@@ -601,17 +615,35 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             if not analysis:
                 continue
 
+            # 🛡️ FILTRE ANTI-RUG (avant toute décision d'achat)
+            if security_checker:
+                is_safe, security_reason = security_checker.quick_check(address)
+                if not is_safe:
+                    logger.info(f"❌ Token rejeté (sécurité): {analysis.get('name', address[:12])} - {security_reason}")
+                    seen_tokens.add(address)  # Ne plus re-checker ce token
+                    # Nettoyer le set si trop grand
+                    if len(seen_tokens) > MAX_SEEN_TOKENS:
+                        seen_tokens.clear()
+                    continue
+                logger.info(f"✅ Token sûr: {analysis.get('name', address[:12])} - {security_reason}")
+
             # Stratégie Sniper
             should_snipe, reason = trading_engine.should_snipe(analysis)
             if should_snipe:
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
+                    sec_info = ""
+                    if security_checker:
+                        sr = security_checker._cache.get(address)
+                        if sr:
+                            sec_info = f"\n🛡 Sécurité: {sr.risk_level} (score {sr.risk_score})"
                     msg = f"🎯 *SNIPE AUTO*\n\n"
                     msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
                     msg += f"💵 {result['amount_sol']} SOL\n"
                     msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}\n"
-                    msg += f"💧 Liq: ${analysis.get('liquidity_usd', 0):,.0f}\n"
-                    msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+                    msg += f"💧 Liq: ${analysis.get('liquidity_usd', 0):,.0f}"
+                    msg += sec_info
+                    msg += f"\n🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
                     for chat_id in subscribers:
                         try:
                             await context.bot.send_message(
@@ -629,12 +661,18 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             if should_buy:
                 result = trading_engine.execute_buy(analysis, "momentum")
                 if result:
+                    sec_info = ""
+                    if security_checker:
+                        sr = security_checker._cache.get(address)
+                        if sr:
+                            sec_info = f"\n🛡 Sécurité: {sr.risk_level} (score {sr.risk_score})"
                     msg = f"🚀 *ACHAT MOMENTUM*\n\n"
                     msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
                     msg += f"💵 {result['amount_sol']} SOL\n"
                     msg += f"📈 5m: {analysis['price_change_5m']:+.1f}% | 1h: {analysis['price_change_1h']:+.1f}%\n"
-                    msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}\n"
-                    msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+                    msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}"
+                    msg += sec_info
+                    msg += f"\n🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
                     for chat_id in subscribers:
                         try:
                             await context.bot.send_message(

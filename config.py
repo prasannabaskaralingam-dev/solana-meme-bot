@@ -33,16 +33,16 @@ ENDPOINTS = {
 # Intervalle de polling en secondes (60 = 1 requête/min, safe)
 POLLING_INTERVAL = 45
 
-# Filtres pour les meme coins
+# Filtres pour les meme coins (optimisés anti-rug)
 FILTERS = {
-    "min_liquidity_usd": 1000,       # Liquidité minimum en USD
-    "min_volume_24h": 500,           # Volume 24h minimum
-    "min_market_cap": 1000,          # Market cap minimum
-    "max_market_cap": 10_000_000,    # Market cap maximum (filtre les gros)
-    "min_price_change_5m": 10,       # % hausse min sur 5 min pour alerte pump
-    "min_price_change_1h": 30,       # % hausse min sur 1h pour alerte pump
-    "max_token_age_hours": 24,       # Âge max du token (nouveaux tokens)
-    "min_buys_5m": 5,                # Nombre min d'achats sur 5 min
+    "min_liquidity_usd": 5000,       # Liquidité minimum en USD (élevé = moins de scams)
+    "min_volume_24h": 5000,          # Volume 24h minimum (filtre les tokens morts)
+    "min_market_cap": 10_000,        # Market cap minimum ($10k = token réel)
+    "max_market_cap": 5_000_000,     # Market cap maximum (on veut les early)
+    "min_price_change_5m": 5,        # % hausse min sur 5 min (détection précoce)
+    "min_price_change_1h": 20,       # % hausse min sur 1h pour momentum
+    "max_token_age_hours": 12,       # Âge max du token (plus frais = mieux)
+    "min_buys_5m": 10,               # Nombre min d'achats sur 5 min (activité réelle)
 }
 
 # Nombre max d'alertes par cycle pour éviter le spam
