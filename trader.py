@@ -62,6 +62,11 @@ class TradingConfig:
     trailing_stop_pct: float = 15.0      # Trailing stop depuis le plus haut (défaut)
     trailing_activation_pct: float = 5.0 # Activer le trailing dès +5% de profit
 
+    # Time Stop (sortie forcée si pas de profit après X minutes)
+    time_stop_enabled: bool = True       # Activer le time stop
+    time_stop_minutes: float = 15.0      # Durée max avant sortie forcée
+    time_stop_min_profit: float = 5.0    # Profit min (%) pour éviter le time stop
+
     # Sécurité
     slippage_bps: int = 500              # 5% slippage max (meme coins = volatile)
     max_retries: int = 3                 # Nombre de tentatives par transaction
@@ -722,6 +727,20 @@ class TradingEngine:
                     # Calculer le PnL réel au moment de la vente
                     return True, (f"📉 Trailing Stop (chute {drop_from_high:.1f}% depuis ATH, "
                                   f"seuil: -{trailing_pct:.0f}%, profit max: +{pnl_at_high:.0f}%)")
+
+        # Time Stop : sortie forcée si le trade dure trop longtemps sans profit suffisant
+        if self.config.time_stop_enabled:
+            try:
+                entry_dt = datetime.fromisoformat(position.entry_time)
+                elapsed_minutes = (datetime.utcnow() - entry_dt).total_seconds() / 60.0
+
+                if elapsed_minutes >= self.config.time_stop_minutes:
+                    # Vérifier si le profit est en dessous du seuil minimum
+                    if pnl < self.config.time_stop_min_profit:
+                        return True, (f"⏰ Time Stop ({elapsed_minutes:.0f} min, "
+                                      f"PnL {pnl:+.1f}% < +{self.config.time_stop_min_profit:.0f}%)")
+            except (ValueError, TypeError):
+                pass  # Si entry_time est invalide, on ignore le time stop
 
         return False, "Hold"
 

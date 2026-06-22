@@ -76,6 +76,9 @@ def save_trading_config(config: TradingConfig):
         "stop_loss_pct": config.stop_loss_pct,
         "trailing_stop_pct": config.trailing_stop_pct,
         "trailing_activation_pct": config.trailing_activation_pct,
+        "time_stop_enabled": config.time_stop_enabled,
+        "time_stop_minutes": config.time_stop_minutes,
+        "time_stop_min_profit": config.time_stop_min_profit,
         "slippage_bps": config.slippage_bps,
     }
     with open(TRADING_CONFIG_FILE, "w") as f:
@@ -283,6 +286,7 @@ Bot de trading automatique pour meme coins Solana.
 /set\\_tp `<pct>` - Modifier Take Profit
 /set\\_sl `<pct>` - Modifier Stop Loss
 /set\\_trailing - Voir/modifier trailing stop
+/set\\_timestop - Time stop (sortie forcée)
 /set\\_size `<sol>` - Modifier taille position
 /config - Voir la configuration
 /sell\\_all - Vendre toutes les positions
@@ -528,6 +532,8 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"  🛑 Stop Loss: {trading_config.stop_loss_pct}%\n"
     msg += f"  📉 Trailing Stop: actif dès +{trading_config.trailing_activation_pct}%\n"
     msg += f"     (paliers: 12%/10%/8%/6%/5% selon profit)\n"
+    ts_status = '✅ Actif' if trading_config.time_stop_enabled else '❌ Désactivé'
+    msg += f"  ⏰ Time Stop: {ts_status} ({trading_config.time_stop_minutes:.0f} min, seuil: +{trading_config.time_stop_min_profit}%)\n"
     msg += f"  ⚡ Slippage: {trading_config.slippage_bps/100}%\n\n"
     msg += f"*Auto Trading:* {'🟢 ACTIF' if auto_trading_enabled else '🔴 INACTIF'}"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -589,6 +595,62 @@ async def set_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide")
+
+
+async def set_timestop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /set_timestop - Configurer le time stop"""
+    if not context.args:
+        ts_status = '✅ Actif' if trading_config.time_stop_enabled else '❌ Désactivé'
+        msg = f"⏰ *Time Stop*\n\n"
+        msg += f"Statut: {ts_status}\n"
+        msg += f"Durée: {trading_config.time_stop_minutes:.0f} minutes\n"
+        msg += f"Seuil: +{trading_config.time_stop_min_profit}% de profit\n\n"
+        msg += "*Règle:* Si un trade dure > {:.0f} min ".format(trading_config.time_stop_minutes)
+        msg += f"et PnL < +{trading_config.time_stop_min_profit}% \u2192 VENTE FORC\u00c9E\n\n"
+        msg += "*Commandes:*\n"
+        msg += "/set\\_timestop off \u2014 D\u00e9sactiver\n"
+        msg += "/set\\_timestop on \u2014 Activer\n"
+        msg += "/set\\_timestop 15 \u2014 D\u00e9lai en minutes\n"
+        msg += "/set\\_timestop 15 5 \u2014 D\u00e9lai + seuil profit"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    arg = context.args[0].lower()
+    if arg == "off":
+        trading_config.time_stop_enabled = False
+        save_trading_config(trading_config)
+        await update.message.reply_text("❌ Time Stop d\u00e9sactiv\u00e9")
+        return
+    elif arg == "on":
+        trading_config.time_stop_enabled = True
+        save_trading_config(trading_config)
+        await update.message.reply_text(
+            f"✅ Time Stop activ\u00e9 ({trading_config.time_stop_minutes:.0f} min, seuil +{trading_config.time_stop_min_profit}%)"
+        )
+        return
+
+    try:
+        minutes = float(arg)
+        if minutes < 5 or minutes > 120:
+            await update.message.reply_text("❌ Valeur entre 5 et 120 minutes")
+            return
+        trading_config.time_stop_minutes = minutes
+        trading_config.time_stop_enabled = True
+
+        # Optionnel: seuil de profit minimum
+        if len(context.args) >= 2:
+            min_profit = float(context.args[1])
+            if 0 <= min_profit <= 50:
+                trading_config.time_stop_min_profit = min_profit
+
+        save_trading_config(trading_config)
+        await update.message.reply_text(
+            f"✅ Time Stop mis \u00e0 jour!\n"
+            f"⏰ D\u00e9lai: {trading_config.time_stop_minutes:.0f} min\n"
+            f"🎯 Seuil: +{trading_config.time_stop_min_profit}% (en dessous = vente forc\u00e9e)"
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Valeur invalide. Usage: /set\\_timestop 15 5", parse_mode=ParseMode.MARKDOWN)
 
 
 async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1467,6 +1529,8 @@ def main():
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")
     print(f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}% | Trailing: dès +{trading_config.trailing_activation_pct}%")
+    ts_info = f"{trading_config.time_stop_minutes:.0f}min" if trading_config.time_stop_enabled else "OFF"
+    print(f"⏰ Time Stop: {ts_info} (seuil: +{trading_config.time_stop_min_profit}%)")
     print(f"💰 Budget max: {trading_config.max_budget_sol} SOL")
     print(f"🌐 Jupiter API: {trading_config.jupiter_api_url}")
 
@@ -1487,6 +1551,7 @@ def main():
     app.add_handler(CommandHandler("set_tp", set_tp))
     app.add_handler(CommandHandler("set_sl", set_sl))
     app.add_handler(CommandHandler("set_trailing", set_trailing))
+    app.add_handler(CommandHandler("set_timestop", set_timestop))
     app.add_handler(CommandHandler("set_size", set_size))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("sell", sell_cmd))
