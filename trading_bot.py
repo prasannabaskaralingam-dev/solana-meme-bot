@@ -28,6 +28,7 @@ from token_security import TokenSecurityChecker
 from price_monitor import PriceMonitor
 from copy_trading import CopyTradingEngine, CopyTradeSignal
 from smart_entry import SmartEntryEngine, EntrySignal
+from pnl_tracker import PnLTracker, DynamicPositionSizer
 
 # Logging
 logging.basicConfig(
@@ -92,6 +93,8 @@ security_checker: TokenSecurityChecker = None
 price_monitor: PriceMonitor = None
 copy_trader: CopyTradingEngine = None
 smart_entry: SmartEntryEngine = None
+pnl_tracker: PnLTracker = None
+position_sizer: DynamicPositionSizer = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -113,7 +116,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -121,10 +124,18 @@ def init_trading():
     copy_trader = CopyTradingEngine(rpc_url=trading_config.rpc_url)
     copy_trader.set_signal_callback(on_copy_trade_signal)
     smart_entry = SmartEntryEngine()
+    pnl_tracker = PnLTracker()
+    position_sizer = DynamicPositionSizer(
+        base_size_sol=trading_config.position_size_sol,
+        min_size_sol=0.02,
+        max_size_sol=0.15
+    )
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
     logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
     logger.info("🧠 Smart Entry Engine initialisé (double-check + volume spike)")
+    logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
+    logger.info(f"📊 PnL Tracker: {len(pnl_tracker.trade_results)} trades historiques")
 
 
 # ============================================================
@@ -172,6 +183,21 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     if should_sell:
         result = trading_engine.execute_sell(pos, reason)
         if result:
+            # Enregistrer dans le PnL tracker
+            if pnl_tracker:
+                pnl_tracker.record_trade(
+                    token_address=pos.token_address,
+                    token_symbol=pos.token_symbol,
+                    strategy=pos.strategy,
+                    entry_time=pos.entry_time,
+                    amount_sol=pos.amount_sol_invested,
+                    pnl_pct=pos.pnl_pct,
+                    exit_reason=reason,
+                )
+            # Mettre à jour le position sizer (streak)
+            if position_sizer:
+                position_sizer.record_result(pos.pnl_pct > 0)
+
             # Blacklister si SL
             if pos.pnl_pct < 0:
                 sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
@@ -225,11 +251,12 @@ Bot de trading automatique pour meme coins Solana.
 
 *💰 Trading :*
 /wallet - Voir votre wallet
-/import\\_wallet `<clé_privée>` - Importer wallet
+/import\_wallet `<clé_privée>` - Importer wallet
 /balance - Voir le solde
 /positions - Positions ouvertes
 /history - Historique des trades
 /stats - Statistiques
+/pnl - Rapport PnL détaillé (par stratégie)
 
 *⚙️ Contrôle :*
 /auto\\_on - Activer le trading auto
@@ -408,7 +435,7 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /stats - Statistiques"""
+    """Commande /stats - Statistiques détaillées"""
     if not trading_engine:
         await update.message.reply_text("❌ Trading non initialisé. Importez un wallet d'abord.")
         return
@@ -419,12 +446,46 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"📈 Positions ouvertes: {stats['open_positions']}\n\n"
     msg += f"*Trades:*\n"
     msg += f"  Total: {stats['total_trades']}\n"
-    msg += f"  Achats: {stats['buys']}\n"
-    msg += f"  Ventes: {stats['sells']}\n"
     msg += f"  ✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
     msg += f"  🎯 Win Rate: {stats['win_rate']:.1f}%\n"
     msg += f"  📊 PnL moyen: {stats['avg_pnl_pct']:+.1f}%\n"
-    msg += f"\n💼 Total investi: {stats['total_invested_sol']:.2f} SOL"
+    msg += f"\n💼 Total investi: {stats['total_invested_sol']:.2f} SOL\n"
+
+    # Stats PnL Tracker détaillées
+    if pnl_tracker and pnl_tracker.trade_results:
+        total = pnl_tracker.get_total_pnl()
+        msg += f"\n*📈 PnL Total:*\n"
+        msg += f"  💰 {total['total_pnl_sol']:+.4f} SOL\n"
+        msg += f"  🎯 Best: {total['best_trade']:+.1f}% | Worst: {total['worst_trade']:+.1f}%\n"
+
+        # Stats par stratégie
+        strat_stats = pnl_tracker.get_strategy_stats()
+        if strat_stats:
+            msg += f"\n*🎮 Par Stratégie:*\n"
+            for name, s in sorted(strat_stats.items(), key=lambda x: x[1].total_pnl_sol, reverse=True):
+                emoji = "🟢" if s.total_pnl_sol >= 0 else "🔴"
+                msg += f"  {emoji} {name}: WR {s.win_rate:.0f}% | PnL {s.total_pnl_sol:+.3f} SOL ({s.total_trades} trades)\n"
+
+        # PnL quotidien (3 derniers jours)
+        daily = pnl_tracker.get_daily_summary(3)
+        active_days = [d for d in daily if d['trades'] > 0]
+        if active_days:
+            msg += f"\n*📅 Derniers jours:*\n"
+            for d in active_days:
+                day_emoji = "🟢" if d['pnl_sol'] >= 0 else "🔴"
+                msg += f"  {day_emoji} {d['date']}: {d['pnl_sol']:+.4f} SOL ({d['trades']} trades, WR {d['win_rate']:.0f}%)\n"
+
+    # Position Sizer info
+    if position_sizer:
+        sizer_info = position_sizer.get_info()
+        streak = ""
+        if sizer_info['consecutive_wins'] >= 2:
+            streak = f"🔥 Série: {sizer_info['consecutive_wins']}W"
+        elif sizer_info['consecutive_losses'] >= 2:
+            streak = f"⚠️ Série: {sizer_info['consecutive_losses']}L"
+        if streak:
+            msg += f"\n{streak}"
+
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -892,6 +953,21 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             if should_sell:
                 result = trading_engine.execute_sell(pos, reason)
                 if result:
+                    # Enregistrer dans le PnL tracker
+                    if pnl_tracker:
+                        pnl_tracker.record_trade(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            strategy=pos.strategy,
+                            entry_time=pos.entry_time,
+                            amount_sol=pos.amount_sol_invested,
+                            pnl_pct=pos.pnl_pct,
+                            exit_reason=reason,
+                        )
+                    # Mettre à jour le position sizer (streak)
+                    if position_sizer:
+                        position_sizer.record_result(pos.pnl_pct > 0)
+
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
                         sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
@@ -899,9 +975,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                         logger.info(f"🚫 Blacklisté après SL: {pos.token_name} (1h)")
 
                     # Notifier
-                    msg = f"{'\u2705' if pos.pnl_pct > 0 else '\u274c'} *VENTE AUTO*\n\n"
+                    pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
+                    msg = f"{pnl_emoji} *VENTE AUTO*\n\n"
                     msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
-                    msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
+                    msg += f"📈 PnL: {pos.pnl_pct:+.1f}% ({pos.amount_sol_invested * pos.pnl_pct / 100:+.4f} SOL)\n"
                     msg += f"📝 Raison: {reason}\n"
                     msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
                     for chat_id in subscribers:
@@ -938,8 +1015,33 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 # Tenter la confirmation
                 signal = smart_entry.confirm_check(analysis)
                 if signal:
+                    # Calculer la taille dynamique
+                    if position_sizer:
+                        strat_stats = pnl_tracker.get_strategy_stats() if pnl_tracker else {}
+                        s_stats = strat_stats.get(signal.strategy)
+                        balance = trading_engine.wallet.get_sol_balance()
+                        dyn_size = position_sizer.calculate_size(
+                            strategy=signal.strategy,
+                            confidence=signal.confidence,
+                            strategy_stats=s_stats,
+                            balance_sol=balance
+                        )
+                        # Override temporaire de la taille de position
+                        original_size = trading_config.position_size_sol
+                        trading_config.position_size_sol = dyn_size
+                        if signal.strategy == "sniper":
+                            trading_config.sniper_position_sol = dyn_size
+                        else:
+                            trading_config.momentum_position_sol = dyn_size
+
                     # Signal confirmé ! Exécuter l'achat
                     result = trading_engine.execute_buy(analysis, signal.strategy)
+
+                    # Restaurer la taille originale
+                    if position_sizer:
+                        trading_config.position_size_sol = original_size
+                        trading_config.sniper_position_sol = original_size
+                        trading_config.momentum_position_sol = original_size
                     if result:
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)
@@ -1102,6 +1204,82 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Erreur scan_and_trade: {e}")
+
+
+# ============================================================
+# COMMANDE PNL TRACKER
+# ============================================================
+
+async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /pnl - Rapport PnL détaillé"""
+    if not pnl_tracker:
+        await update.message.reply_text("❌ PnL Tracker non initialisé.")
+        return
+
+    if not pnl_tracker.trade_results:
+        await update.message.reply_text("📊 Aucun trade terminé pour le moment.")
+        return
+
+    total = pnl_tracker.get_total_pnl()
+    msg = f"💰 *Rapport PnL Détaillé*\n\n"
+    msg += f"🎯 *Résumé Global:*\n"
+    pnl_emoji = "🟢" if total['total_pnl_sol'] >= 0 else "🔴"
+    msg += f"  {pnl_emoji} PnL total: {total['total_pnl_sol']:+.4f} SOL\n"
+    msg += f"  📊 Trades: {total['total_trades']} (✅{total['wins']} / ❌{total['losses']})\n"
+    msg += f"  🎯 Win Rate: {total['win_rate']:.1f}%\n"
+    msg += f"  📈 PnL moyen: {total['avg_pnl_pct']:+.1f}%\n"
+    msg += f"  🚀 Meilleur: {total['best_trade']:+.1f}%\n"
+    msg += f"  💥 Pire: {total['worst_trade']:+.1f}%\n"
+
+    # Par stratégie
+    strat_stats = pnl_tracker.get_strategy_stats()
+    if strat_stats:
+        msg += f"\n🎮 *Performance par Stratégie:*\n"
+        for name, s in sorted(strat_stats.items(), key=lambda x: x[1].total_pnl_sol, reverse=True):
+            emoji = "🟢" if s.total_pnl_sol >= 0 else "🔴"
+            msg += f"\n  {emoji} *{name.upper()}*\n"
+            msg += f"    Trades: {s.total_trades} | WR: {s.win_rate:.0f}%\n"
+            msg += f"    PnL: {s.total_pnl_sol:+.4f} SOL (moy: {s.avg_pnl_pct:+.1f}%)\n"
+            msg += f"    Best: {s.best_trade_pct:+.1f}% | Worst: {s.worst_trade_pct:+.1f}%\n"
+            msg += f"    Durée moy: {s.avg_hold_minutes:.0f} min\n"
+
+    # Par raison de sortie
+    exit_stats = pnl_tracker.get_exit_reason_stats()
+    if exit_stats:
+        msg += f"\n🚪 *Par Raison de Sortie:*\n"
+        reason_labels = {
+            "take_profit": "✅ Take Profit",
+            "trailing_stop": "📉 Trailing Stop",
+            "stop_loss": "❌ Stop Loss",
+            "other": "📝 Autre",
+        }
+        for reason, data in exit_stats.items():
+            label = reason_labels.get(reason, reason)
+            wr = (data['wins'] / max(data['count'], 1)) * 100
+            avg_pnl = data['total_pnl'] / max(data['count'], 1)
+            msg += f"  {label}: {data['count']}x (PnL moy: {avg_pnl:+.1f}%)\n"
+
+    # PnL quotidien (7 jours)
+    daily = pnl_tracker.get_daily_summary(7)
+    active_days = [d for d in daily if d['trades'] > 0]
+    if active_days:
+        msg += f"\n📅 *PnL Quotidien (7j):*\n"
+        for d in active_days:
+            bar = "█" * min(int(abs(d['pnl_sol']) * 20), 5)
+            day_emoji = "🟢" if d['pnl_sol'] >= 0 else "🔴"
+            msg += f"  {day_emoji} {d['date'][-5:]}: {d['pnl_sol']:+.4f} SOL {bar} ({d['trades']}t)\n"
+
+    # Position Sizer
+    if position_sizer:
+        info = position_sizer.get_info()
+        msg += f"\n💰 *Position Sizing:*\n"
+        msg += f"  Base: {info['base_size']} SOL | Range: {info['min_size']}-{info['max_size']} SOL\n"
+        if info['consecutive_wins'] >= 2:
+            msg += f"  🔥 Série gagnante: {info['consecutive_wins']} (↑ taille)\n"
+        elif info['consecutive_losses'] >= 2:
+            msg += f"  ⚠️ Série perdante: {info['consecutive_losses']} (↓ taille)\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 # ============================================================
@@ -1301,6 +1479,7 @@ def main():
     app.add_handler(CommandHandler("copy_add", copy_add_cmd))
     app.add_handler(CommandHandler("copy_remove", copy_remove_cmd))
     app.add_handler(CommandHandler("copy_history", copy_history_cmd))
+    app.add_handler(CommandHandler("pnl", pnl_cmd))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
