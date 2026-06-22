@@ -7,3 +7,9 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: PERSISTENT_DATA_DIR
+        value: /var/data/solana-bot
+    disk:
+      name: solana-bot-data
+      mountPath: /var/data/solana-bot
+      sizeGB: 1

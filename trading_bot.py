@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRADING_CONFIG_FILE = os.path.join(BASE_DIR, "trading_config.json")
+DATA_DIR = os.environ.get("PERSISTENT_DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+TRADING_CONFIG_FILE = os.path.join(DATA_DIR, "trading_config.json")
 
 
 def load_trading_config() -> TradingConfig:
@@ -84,7 +86,7 @@ auto_trading_enabled = False
 subscribers = []
 
 # Charger les subscribers
-SUBS_FILE = os.path.join(BASE_DIR, "bot_data.json")
+SUBS_FILE = os.path.join(DATA_DIR, "bot_data.json")
 if os.path.exists(SUBS_FILE):
     with open(SUBS_FILE, "r") as f:
         bot_data = json.load(f)
