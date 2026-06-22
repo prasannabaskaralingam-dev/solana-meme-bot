@@ -1071,6 +1071,17 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                         seen_tokens.add(pos.token_address)
                         logger.info(f"🚫 Blacklisté après SL: {pos.token_name} (1h)")
 
+                    # Détecter un RUG PULL (-80%+) et blacklister le créateur
+                    if pos.pnl_pct < -80 and security_checker:
+                        logger.warning(f"🚨 RUG PULL DÉTECTÉ: {pos.token_name} ({pos.pnl_pct:.0f}%)")
+                        # Récupérer le créateur depuis le cache RugCheck
+                        cached_report = security_checker._cache.get(pos.token_address)
+                        if cached_report:
+                            # Invalider le cache pour ce token
+                            del security_checker._cache[pos.token_address]
+                        # Blacklister le token pour 24h
+                        sl_blacklist[pos.token_address] = time.time() + 86400
+
                     # Notifier
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
                     msg = f"{pnl_emoji} *VENTE AUTO*\n\n"
@@ -1240,11 +1251,14 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             if not analysis:
                 continue
 
-            # 🛡️ FILTRE ANTI-RUG (avant toute décision d'achat)
+            # 🛡️ FILTRE ANTI-RUG RENFORCÉ (avant toute décision d'achat)
             if security_checker:
-                is_safe, security_reason = security_checker.quick_check(address)
+                # Déterminer la stratégie pour adapter la sévérité
+                token_age = analysis.get('age_hours', 999)
+                check_strategy = "sniper" if token_age < 1 else "momentum"
+                is_safe, security_reason = security_checker.quick_check(address, strategy=check_strategy)
                 if not is_safe:
-                    logger.info(f"❌ Token rejeté (sécurité): {analysis.get('name', address[:12])} - {security_reason}")
+                    logger.info(f"🚫 REJETÉ (anti-rug): {analysis.get('name', address[:12])} - {security_reason}")
                     seen_tokens.add(address)
                     if len(seen_tokens) > MAX_SEEN_TOKENS:
                         seen_tokens.clear()
