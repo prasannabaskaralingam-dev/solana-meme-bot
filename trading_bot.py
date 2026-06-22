@@ -82,6 +82,9 @@ def save_trading_config(config: TradingConfig):
         "time_stop_enabled": config.time_stop_enabled,
         "time_stop_minutes": config.time_stop_minutes,
         "time_stop_min_profit": config.time_stop_min_profit,
+        "momentum_stop_enabled": config.momentum_stop_enabled,
+        "momentum_stop_drop_pct": config.momentum_stop_drop_pct,
+        "momentum_stop_volume_drop": config.momentum_stop_volume_drop,
         "slippage_bps": config.slippage_bps,
     }
     with open(TRADING_CONFIG_FILE, "w") as f:
@@ -581,14 +584,18 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"  Liq min: ${trading_config.sniper_min_liquidity}\n"
     msg += f"  MC max: ${trading_config.sniper_max_mc:,}\n\n"
     msg += f"*Momentum:* ❌ Désactivé (mode Sniper Only)\n\n"
-    msg += f"*Risk Management:*\n"
-    msg += f"  🎯 Take Profit: +{trading_config.take_profit_pct}%\n"
-    msg += f"  🛑 Stop Loss: {trading_config.stop_loss_pct}%\n"
-    msg += f"  📉 Trailing Stop: actif dès +{trading_config.trailing_activation_pct}%\n"
-    msg += f"     (paliers: 12%/10%/8%/6%/5% selon profit)\n"
-    ts_status = '✅ Actif' if trading_config.time_stop_enabled else '❌ Désactivé'
-    msg += f"  ⏰ Time Stop: {ts_status} ({trading_config.time_stop_minutes:.0f} min, seuil: +{trading_config.time_stop_min_profit}%)\n"
-    msg += f"  ⚡ Slippage: {trading_config.slippage_bps/100}%\n\n"
+    msg += f"*4 RÈGLES DE SORTIE:*\n\n"
+    ts_status = '✅' if trading_config.time_stop_enabled else '❌'
+    msg += f"  {ts_status} *RÈGLE 1 — Time Stop*\n"
+    msg += f"     > {trading_config.time_stop_minutes:.0f} min sans +{trading_config.time_stop_min_profit:.0f}% → sortie\n\n"
+    msg += f"  ✅ *RÈGLE 2 — SL Universel*\n"
+    msg += f"     {trading_config.stop_loss_pct:.0f}% depuis l'achat → sortie TOUJOURS\n\n"
+    msg += f"  ✅ *RÈGLE 3 — Trailing Stop*\n"
+    msg += f"     Dès +{trading_config.trailing_activation_pct:.0f}% atteint → SL à -{trading_config.trailing_stop_pct:.0f}% du max\n\n"
+    ms_status = '✅' if trading_config.momentum_stop_enabled else '❌'
+    msg += f"  {ms_status} *RÈGLE 4 — Momentum Stop*\n"
+    msg += f"     Prix sous ATH -{trading_config.momentum_stop_drop_pct:.0f}% + volume chute → sortie\n\n"
+    msg += f"  🎯 TP: +{trading_config.take_profit_pct}% | ⚡ Slippage: {trading_config.slippage_bps/100}%\n\n"
     msg += f"*Auto Trading:* {'🟢 ACTIF' if auto_trading_enabled else '🔴 INACTIF'}"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 

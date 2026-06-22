@@ -58,14 +58,19 @@ class TradingConfig:
 
     # Take Profit & Stop Loss
     take_profit_pct: float = 20.0        # Vendre quand +20%
-    stop_loss_pct: float = -30.0         # Vendre quand -30%
-    trailing_stop_pct: float = 15.0      # Trailing stop depuis le plus haut (défaut)
-    trailing_activation_pct: float = 5.0 # Activer le trailing dès +5% de profit
+    stop_loss_pct: float = -25.0         # RÈGLE 2: SL universel -25% (évite les -100%)
+    trailing_stop_pct: float = 10.0      # RÈGLE 3: SL à -10% du max
+    trailing_activation_pct: float = 15.0 # RÈGLE 3: Trailing dès +15% atteint
 
     # Time Stop (sortie forcée si pas de profit après X minutes)
-    time_stop_enabled: bool = True       # Activer le time stop
-    time_stop_minutes: float = 15.0      # Durée max avant sortie forcée
-    time_stop_min_profit: float = 5.0    # Profit min (%) pour éviter le time stop
+    time_stop_enabled: bool = True       # RÈGLE 1: Time Stop actif
+    time_stop_minutes: float = 15.0      # RÈGLE 1: 15 min max
+    time_stop_min_profit: float = 20.0   # RÈGLE 1: sortie si pas +20% après 15 min
+
+    # Momentum Stop (RÈGLE 4: prix sous ATH -15% + volume en chute)
+    momentum_stop_enabled: bool = True
+    momentum_stop_drop_pct: float = 15.0  # Chute depuis ATH local (%)
+    momentum_stop_volume_drop: float = 50.0  # Volume doit chuter de 50%+
 
     # Sécurité
     slippage_bps: int = 500              # 5% slippage max (meme coins = volatile)
@@ -742,30 +747,42 @@ class TradingEngine:
             except (ValueError, TypeError):
                 pass  # Si entry_time est invalide, on ignore le time stop
 
+        # RÈGLE 4 - Momentum Stop: prix sous ATH -15% ET volume en chute
+        if self.config.momentum_stop_enabled:
+            if position.highest_price > 0 and position.entry_price_usd > 0:
+                # Calculer la chute depuis l'ATH local
+                drop_from_ath = ((position.current_price - position.highest_price)
+                                 / position.highest_price) * 100
+
+                # Si le prix a chuté de plus de 15% depuis l'ATH local
+                if drop_from_ath <= -self.config.momentum_stop_drop_pct:
+                    # Vérifier que le token a eu un pump (ATH > entry +5% au moins)
+                    pnl_at_ath = ((position.highest_price - position.entry_price_usd)
+                                  / position.entry_price_usd) * 100
+                    if pnl_at_ath >= 5.0:
+                        # Le token a pumpé puis est retombé = momentum mort
+                        return True, (f"📉 Momentum Stop (chute {drop_from_ath:.1f}% depuis ATH, "
+                                      f"ATH était +{pnl_at_ath:.0f}%, token mort)")
+
         return False, "Hold"
 
     def _get_dynamic_trailing(self, pnl_at_high: float) -> float:
         """
-        Trailing stop dynamique à paliers.
-        Plus le profit max est élevé, plus le trailing se resserre.
+        RÈGLE 3 - Trailing Stop simplifié:
+        Dès +15% atteint → SL remonte à -10% du max
+        Capture l'essentiel du pump sans couper trop tôt.
         
-        Paliers:
-        - Profit +5% à +10%  → trailing de 12% (laisser respirer)
-        - Profit +10% à +20% → trailing de 10% (commencer à protéger)
-        - Profit +20% à +50% → trailing de 8% (protéger les gains)
-        - Profit +50% à +100% → trailing de 6% (serrer fort)
-        - Profit > +100%     → trailing de 5% (verrouiller le moonshot)
+        Pour les moonshots, on resserre légèrement:
+        - Profit +15% à +50%  → trailing de 10%
+        - Profit +50% à +100% → trailing de 8%
+        - Profit > +100%      → trailing de 6%
         """
         if pnl_at_high >= 100:
-            return 5.0
-        elif pnl_at_high >= 50:
             return 6.0
-        elif pnl_at_high >= 20:
+        elif pnl_at_high >= 50:
             return 8.0
-        elif pnl_at_high >= 10:
-            return 10.0
         else:
-            return 12.0
+            return self.config.trailing_stop_pct  # 10% par défaut
 
     def execute_buy(self, analysis: dict, strategy: str) -> Optional[dict]:
         """Exécuter un achat"""
