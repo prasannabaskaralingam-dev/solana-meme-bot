@@ -74,8 +74,6 @@ def save_trading_config(config: TradingConfig):
         "max_open_positions": config.max_open_positions,
         "sniper_enabled": config.sniper_enabled,
         "sniper_position_sol": config.sniper_position_sol,
-        "momentum_enabled": config.momentum_enabled,
-        "momentum_position_sol": config.momentum_position_sol,
         "take_profit_pct": config.take_profit_pct,
         "stop_loss_pct": config.stop_loss_pct,
         "trailing_stop_pct": config.trailing_stop_pct,
@@ -478,9 +476,8 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = wallet.get_sol_balance()
     msg = f"✅ *Trading automatique ACTIVÉ*\n\n"
     msg += f"💵 Solde: {balance:.4f} SOL\n"
-    msg += f"📊 Stratégies:\n"
-    msg += f"  • Sniper: {'✅' if trading_config.sniper_enabled else '❌'} ({trading_config.sniper_position_sol} SOL/trade)\n"
-    msg += f"  • Momentum: {'✅' if trading_config.momentum_enabled else '❌'} ({trading_config.momentum_position_sol} SOL/trade)\n"
+    msg += f"📊 Stratégie:\n"
+    msg += f"  • Sniper Only: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
     msg += f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
     msg += f"\n⚠️ Le bot va acheter/vendre automatiquement !"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -604,7 +601,7 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"  Montant: {trading_config.sniper_position_sol} SOL\n"
     msg += f"  Liq min: ${trading_config.sniper_min_liquidity}\n"
     msg += f"  MC max: ${trading_config.sniper_max_mc:,}\n\n"
-    msg += f"*Momentum:* ❌ Désactivé (mode Sniper Only)\n\n"
+
     msg += f"*4 RÈGLES DE SORTIE:*\n\n"
     ts_status = '✅' if trading_config.time_stop_enabled else '❌'
     msg += f"  {ts_status} *RÈGLE 1 — Time Stop*\n"
@@ -743,7 +740,7 @@ async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         size = float(context.args[0])
         trading_config.position_size_sol = size
-        trading_config.momentum_position_sol = size
+        trading_config.sniper_position_sol = size
         save_trading_config(trading_config)
         await update.message.reply_text(f"✅ Taille de position: {size} SOL")
     except ValueError:
@@ -1350,10 +1347,7 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         # Override temporaire de la taille de position
                         original_size = trading_config.position_size_sol
                         trading_config.position_size_sol = dyn_size
-                        if signal.strategy == "sniper":
-                            trading_config.sniper_position_sol = dyn_size
-                        else:
-                            trading_config.momentum_position_sol = dyn_size
+                        trading_config.sniper_position_sol = dyn_size
 
                     # 💧 Vérifier la liquidité AVANT l'achat (protection illiquidité)
                     if liquidity_guard:
@@ -1368,7 +1362,6 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             if position_sizer:
                                 trading_config.position_size_sol = original_size
                                 trading_config.sniper_position_sol = original_size
-                                trading_config.momentum_position_sol = original_size
                             continue
 
                     # Vérifier la corrélation avant d'acheter
@@ -1387,7 +1380,6 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             if position_sizer:
                                 trading_config.position_size_sol = original_size
                                 trading_config.sniper_position_sol = original_size
-                                trading_config.momentum_position_sol = original_size
                             continue
 
                     # Signal confirmé ! Exécuter l'achat
@@ -1397,7 +1389,6 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                     if position_sizer:
                         trading_config.position_size_sol = original_size
                         trading_config.sniper_position_sol = original_size
-                        trading_config.momentum_position_sol = original_size
                     if result:
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)

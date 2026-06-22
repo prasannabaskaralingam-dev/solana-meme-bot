@@ -49,13 +49,6 @@ class TradingConfig:
     sniper_min_liquidity: float = 5000   # Liquidité min pour sniper ($)
     sniper_max_mc: float = 100_000       # MC max pour sniper ($)
 
-    # Stratégie Momentum (tokens en pump) - DÉSACTIVÉE (sniper only)
-    momentum_enabled: bool = False
-    momentum_position_sol: float = 0.05  # Montant par trade momentum
-    momentum_min_pump_5m: float = 15     # % hausse min sur 5min
-    momentum_min_pump_1h: float = 40     # % hausse min sur 1h
-    momentum_min_volume: float = 10_000  # Volume 24h min ($)
-    momentum_min_buys_ratio: float = 3.0 # Ratio achats/ventes min
 
     # Take Profit & Stop Loss
     take_profit_pct: float = 20.0        # Vendre quand +20%
@@ -97,7 +90,7 @@ class Position:
     highest_price: float = 0.0
     current_price: float = 0.0
     pnl_pct: float = 0.0
-    strategy: str = "momentum"  # "momentum" ou "sniper"
+    strategy: str = "sniper"  # Stratégie unique: sniper
 
     def to_dict(self) -> dict:
         return {
@@ -670,37 +663,6 @@ class TradingEngine:
 
         return True, "✅ Snipe validé"
 
-    def should_buy_momentum(self, analysis: dict) -> Tuple[bool, str]:
-        """Déterminer si on doit acheter en momentum"""
-        if not self.config.momentum_enabled:
-            return False, "Momentum désactivé"
-
-        # Déjà en position
-        if analysis["address"] in self.positions.positions:
-            return False, "Déjà en position"
-
-        # Vérifier le pump
-        pump_5m = analysis.get("price_change_5m", 0)
-        pump_1h = analysis.get("price_change_1h", 0)
-
-        has_pump = (pump_5m >= self.config.momentum_min_pump_5m or
-                    pump_1h >= self.config.momentum_min_pump_1h)
-        if not has_pump:
-            return False, "Pas assez de pump"
-
-        # Volume
-        if analysis.get("volume_24h", 0) < self.config.momentum_min_volume:
-            return False, "Volume insuffisant"
-
-        # Ratio buy/sell
-        if analysis.get("buy_sell_ratio_5m", 0) < self.config.momentum_min_buys_ratio:
-            return False, "Ratio buy/sell insuffisant"
-
-        # Liquidité minimum
-        if analysis.get("liquidity_usd", 0) < 5000:
-            return False, "Liquidité trop faible"
-
-        return True, "✅ Momentum validé"
 
     def should_sell(self, position: Position) -> Tuple[bool, str]:
         """Déterminer si on doit vendre une position"""
@@ -793,11 +755,8 @@ class TradingEngine:
             logger.info(f"Trade refusé: {reason}")
             return None
 
-        # Déterminer la taille de position
-        if strategy == "sniper":
-            amount_sol = self.config.sniper_position_sol
-        else:
-            amount_sol = self.config.momentum_position_sol
+        # Taille de position (stratégie sniper uniquement)
+        amount_sol = self.config.sniper_position_sol
 
         # Vérifier le solde
         balance = self.wallet.get_sol_balance()
