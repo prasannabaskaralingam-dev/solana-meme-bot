@@ -27,6 +27,7 @@ from trader import (
 from token_security import TokenSecurityChecker
 from price_monitor import PriceMonitor
 from copy_trading import CopyTradingEngine, CopyTradeSignal
+from smart_entry import SmartEntryEngine, EntrySignal
 
 # Logging
 logging.basicConfig(
@@ -90,6 +91,7 @@ trading_engine: TradingEngine = None
 security_checker: TokenSecurityChecker = None
 price_monitor: PriceMonitor = None
 copy_trader: CopyTradingEngine = None
+smart_entry: SmartEntryEngine = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -111,16 +113,18 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
     price_monitor = PriceMonitor(on_price_update=on_realtime_price_update)
     copy_trader = CopyTradingEngine(rpc_url=trading_config.rpc_url)
     copy_trader.set_signal_callback(on_copy_trade_signal)
+    smart_entry = SmartEntryEngine()
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
     logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
+    logger.info("🧠 Smart Entry Engine initialisé (double-check + volume spike)")
 
 
 # ============================================================
@@ -916,9 +920,72 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
-    """Scanner et trader automatiquement"""
+    """Scanner et trader automatiquement avec Smart Entry (double-check)"""
     try:
-        # Trouver les nouveaux tokens
+        # === PHASE 1: Confirmer les tokens en watchlist (prioritaire) ===
+        if smart_entry:
+            ready_tokens = smart_entry.get_watchlist_tokens()
+            for address in ready_tokens:
+                if address in seen_tokens or address in positions.positions:
+                    smart_entry.consume_signal(address)
+                    continue
+
+                await asyncio.sleep(1.5)
+                analysis = api.analyze_token(address)
+                if not analysis:
+                    continue
+
+                # Tenter la confirmation
+                signal = smart_entry.confirm_check(analysis)
+                if signal:
+                    # Signal confirmé ! Exécuter l'achat
+                    result = trading_engine.execute_buy(analysis, signal.strategy)
+                    if result:
+                        smart_entry.consume_signal(address)
+                        seen_tokens.add(address)
+
+                        # Notification enrichie
+                        sec_info = ""
+                        if security_checker:
+                            sr = security_checker._cache.get(address)
+                            if sr:
+                                sec_info = f"\n🛡 Sécurité: {sr.risk_level} (score {sr.risk_score})"
+
+                        confidence_bar = "█" * int(signal.confidence * 5) + "░" * (5 - int(signal.confidence * 5))
+                        msg = f"🧠 *SMART ENTRY* ({signal.strategy})\n\n"
+                        msg += f"🪙 {signal.token_name} (${signal.token_symbol})\n"
+                        msg += f"💵 {result['amount_sol']} SOL\n"
+                        msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}\n"
+                        msg += f"💧 Liq: ${analysis.get('liquidity_usd', 0):,.0f}\n"
+                        msg += f"🎯 Confiance: [{confidence_bar}] {signal.confidence:.0%}\n"
+                        if signal.volume_multiplier >= 2.0:
+                            msg += f"🔥 Volume spike: x{signal.volume_multiplier:.1f}\n"
+                        msg += f"📈 5m: {analysis['price_change_5m']:+.1f}% | 1h: {analysis['price_change_1h']:+.1f}%"
+                        msg += sec_info
+                        msg += f"\n\n✅ *Confirmé après double-check*"
+                        msg += f"\n🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+
+                        for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=msg,
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True
+                                )
+                            except:
+                                pass
+
+                        await asyncio.sleep(trading_config.cooldown_seconds)
+                        if price_monitor:
+                            try:
+                                await price_monitor.add_token(address)
+                            except Exception as e:
+                                logger.error(f"Erreur ajout WS monitoring: {e}")
+
+            # Nettoyage périodique
+            smart_entry.cleanup()
+
+        # === PHASE 2: Scanner les nouveaux tokens (premier check) ===
         new_tokens = api.find_new_meme_coins()
 
         for token_data in new_tokens[:10]:
@@ -933,7 +1000,7 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 if time.time() < sl_blacklist[address]:
                     continue
                 else:
-                    del sl_blacklist[address]  # Expiré, on peut re-considérer
+                    del sl_blacklist[address]
 
             # Déjà en position ?
             if address in positions.positions:
@@ -951,14 +1018,22 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 is_safe, security_reason = security_checker.quick_check(address)
                 if not is_safe:
                     logger.info(f"❌ Token rejeté (sécurité): {analysis.get('name', address[:12])} - {security_reason}")
-                    seen_tokens.add(address)  # Ne plus re-checker ce token
-                    # Nettoyer le set si trop grand
+                    seen_tokens.add(address)
                     if len(seen_tokens) > MAX_SEEN_TOKENS:
                         seen_tokens.clear()
                     continue
                 logger.info(f"✅ Token sûr: {analysis.get('name', address[:12])} - {security_reason}")
 
-            # Stratégie Sniper
+            # 🧠 SMART ENTRY: Premier check (ajouter à la watchlist si prometteur)
+            if smart_entry:
+                added, watch_reason = smart_entry.first_check(analysis)
+                if added:
+                    # Token ajouté à la watchlist, sera confirmé au prochain cycle
+                    logger.info(f"🧠 Watchlist: {analysis.get('name', address[:12])} - {watch_reason}")
+                    continue
+
+            # Fallback: stratégies classiques (si smart_entry n'est pas actif ou score trop bas)
+            # Stratégie Sniper (tokens très frais < 1h)
             should_snipe, reason = trading_engine.should_snipe(analysis)
             if should_snipe:
                 result = trading_engine.execute_buy(analysis, "sniper")
@@ -985,7 +1060,6 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         except:
                             pass
                     await asyncio.sleep(trading_config.cooldown_seconds)
-                    # Ajouter au monitoring WebSocket
                     if price_monitor:
                         try:
                             await price_monitor.add_token(address)
@@ -993,7 +1067,7 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             logger.error(f"Erreur ajout WS monitoring: {e}")
                 continue
 
-            # Stratégie Momentum
+            # Stratégie Momentum (fallback si pas dans watchlist)
             should_buy, reason = trading_engine.should_buy_momentum(analysis)
             if should_buy:
                 result = trading_engine.execute_buy(analysis, "momentum")
@@ -1020,7 +1094,6 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         except:
                             pass
                     await asyncio.sleep(trading_config.cooldown_seconds)
-                    # Ajouter au monitoring WebSocket
                     if price_monitor:
                         try:
                             await price_monitor.add_token(address)
