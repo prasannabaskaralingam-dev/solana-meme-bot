@@ -32,6 +32,7 @@ from pnl_tracker import PnLTracker, DynamicPositionSizer
 from correlation_filter import CorrelationFilter
 from liquidity_guard import LiquidityGuard
 from post_trade_analyzer import PostTradeAnalyzer
+from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_thread
 
 # Logging
 logging.basicConfig(
@@ -194,6 +195,10 @@ def init_trading():
     logger.info(f"📊 Post-Trade Analyzer: {len(post_trade_analyzer.analyses)} analyses, "
                 f"{len(post_trade_analyzer.pending_checks)} en suivi")
 
+    # Postmortem Tracker (SQLite)
+    init_postmortem_db()
+    logger.info("📋 Postmortem Tracker DB initialisée")
+
 
 # ============================================================
 # WEBSOCKET PRICE MONITOR - CALLBACKS
@@ -278,6 +283,22 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
                     highest_price=pos.highest_price,
                     amount_sol=pos.amount_sol_invested,
                 )
+
+            # Postmortem Tracker (thread dédié 30min)
+            if result and pos.entry_price_usd > 0:
+                try:
+                    helius_key = os.environ.get("HELIUS_API_KEY", "")
+                    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                    tg_chat = str(subscribers[0]) if subscribers else ""
+                    start_postmortem_thread(
+                        trade_record=result,
+                        entry_price_usd=pos.entry_price_usd,
+                        helius_api_key=helius_key,
+                        telegram_bot_token=tg_token,
+                        telegram_chat_id=tg_chat,
+                    )
+                except Exception as e:
+                    logger.error(f"Erreur postmortem thread: {e}")
 
             # Blacklister si SL
             if pos.pnl_pct < 0:
@@ -1240,6 +1261,22 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                             highest_price=pos.highest_price,
                             amount_sol=pos.amount_sol_invested,
                         )
+
+                    # Postmortem Tracker (thread dédié 30min)
+                    if result and pos.entry_price_usd > 0:
+                        try:
+                            helius_key = os.environ.get("HELIUS_API_KEY", "")
+                            tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                            tg_chat = str(subscribers[0]) if subscribers else ""
+                            start_postmortem_thread(
+                                trade_record=result,
+                                entry_price_usd=pos.entry_price_usd,
+                                helius_api_key=helius_key,
+                                telegram_bot_token=tg_token,
+                                telegram_chat_id=tg_chat,
+                            )
+                        except Exception as e:
+                            logger.error(f"Erreur postmortem thread: {e}")
 
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
