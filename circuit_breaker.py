@@ -1,16 +1,16 @@
 """
 CircuitBreaker — Module centralisé de gestion des sorties.
 
-Toutes les règles de sortie en un seul endroit :
+3 règles de sortie actives :
   RÈGLE 1 — Time Stop : > 15 min sans +20% → sortie
   RÈGLE 2 — SL Universel : -25% depuis l'achat → sortie TOUJOURS
   RÈGLE 3 — Trailing Stop : dès +15% atteint → SL à -10% du max
-  RÈGLE 4 — Momentum Stop : prix sous ATH -15% → sortie
+  BONUS  — Take Profit : +20% → vente immédiate
 
 Usage:
   cb = CircuitBreaker()              # 1 fois au démarrage
   pos = cb.open_position(...)        # à chaque achat
-  action = cb.check(pos, price)      # dans ta boucle de prix
+  action = cb.check(addr, price)     # dans ta boucle de prix (3s)
 """
 
 import time
@@ -46,8 +46,8 @@ class CBConfig:
     trailing_tight_pct: float = 8.0        # -8% si ATH > +50%
     trailing_ultra_tight_pct: float = 6.0  # -6% si ATH > +100%
 
-    # RÈGLE 4 — Momentum Stop
-    momentum_stop_enabled: bool = True
+    # RÈGLE 4 — Momentum Stop (DÉSACTIVÉ - redondant avec Trailing)
+    momentum_stop_enabled: bool = False
     momentum_stop_drop_pct: float = 15.0   # Chute de 15% depuis ATH
     momentum_stop_min_pump: float = 5.0    # Le token doit avoir pumpé au moins +5%
 
@@ -148,7 +148,7 @@ class CircuitBreaker:
                     f"TS={self.config.time_stop_minutes}min, "
                     f"SL={self.config.stop_loss_pct}%, "
                     f"Trailing=+{self.config.trailing_activation_pct}%/-{self.config.trailing_stop_pct}%, "
-                    f"MS=-{self.config.momentum_stop_drop_pct}%")
+                    f"TP=+{self.config.take_profit_pct}%")
 
     # ----------------------------------------------------------
     # GESTION DES POSITIONS

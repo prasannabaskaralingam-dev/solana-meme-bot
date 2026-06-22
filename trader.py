@@ -61,8 +61,8 @@ class TradingConfig:
     time_stop_minutes: float = 15.0      # RÈGLE 1: 15 min max
     time_stop_min_profit: float = 20.0   # RÈGLE 1: sortie si pas +20% après 15 min
 
-    # Momentum Stop (RÈGLE 4: prix sous ATH -15% + volume en chute)
-    momentum_stop_enabled: bool = True
+    # Momentum Stop (DÉSACTIVÉ - redondant avec Trailing Stop)
+    momentum_stop_enabled: bool = False
     momentum_stop_drop_pct: float = 15.0  # Chute depuis ATH local (%)
     momentum_stop_volume_drop: float = 50.0  # Volume doit chuter de 50%+
 

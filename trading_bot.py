@@ -82,9 +82,7 @@ def save_trading_config(config: TradingConfig):
         "time_stop_enabled": config.time_stop_enabled,
         "time_stop_minutes": config.time_stop_minutes,
         "time_stop_min_profit": config.time_stop_min_profit,
-        "momentum_stop_enabled": config.momentum_stop_enabled,
-        "momentum_stop_drop_pct": config.momentum_stop_drop_pct,
-        "momentum_stop_volume_drop": config.momentum_stop_volume_drop,
+        # momentum_stop DÉSACTIVÉ (ne plus sauvegarder)
         "slippage_bps": config.slippage_bps,
     }
     with open(TRADING_CONFIG_FILE, "w") as f:
@@ -210,8 +208,8 @@ def init_trading():
         stop_loss_pct=trading_config.stop_loss_pct,
         trailing_activation_pct=trading_config.trailing_activation_pct,
         trailing_stop_pct=trading_config.trailing_stop_pct,
-        momentum_stop_drop_pct=trading_config.momentum_stop_drop_pct,
         take_profit_pct=trading_config.take_profit_pct,
+        momentum_stop_enabled=False,  # DÉSACTIVÉ
     ))
     # Synchroniser les positions existantes
     existing_positions = []
@@ -1138,11 +1136,112 @@ async def copy_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# SNIPER MONITOR — POLLING 3s (UNIQUEMENT positions SNIPER)
+# ============================================================
+
+async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job ultra-rapide (3s): vérifier UNIQUEMENT les positions SNIPER.
+    Le SL universel (-25%) doit être réactif sur les tokens frais.
+    """
+    if not auto_trading_enabled or not trading_engine or not circuit_breaker:
+        return
+
+    sniper_positions = [p for p in positions.get_open_positions() if p.strategy == "sniper"]
+    if not sniper_positions:
+        return
+
+    for pos in sniper_positions:
+        try:
+            # Récupérer le prix actuel via DexScreener
+            analysis = api.analyze_token(pos.token_address)
+            if not analysis:
+                continue
+
+            current_price = float(analysis.get("price_usd", 0) or 0)
+            if current_price <= 0:
+                continue
+
+            # Mettre à jour la position
+            positions.update_position(pos.token_address, current_price)
+
+            # Vérifier via CircuitBreaker centralisé
+            cb_action = circuit_breaker.check(pos.token_address, current_price)
+
+            if cb_action.should_sell:
+                result = trading_engine.execute_sell(pos, cb_action.reason)
+                if result:
+                    # PnL tracker
+                    if pnl_tracker:
+                        pnl_tracker.record_trade(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            strategy=pos.strategy,
+                            entry_time=pos.entry_time,
+                            amount_sol=pos.amount_sol_invested,
+                            pnl_pct=pos.pnl_pct,
+                            exit_reason=cb_action.reason,
+                        )
+                    if position_sizer:
+                        position_sizer.record_result(pos.pnl_pct > 0)
+                    if correlation_filter:
+                        correlation_filter.unregister_position(pos.token_address)
+                    if liquidity_guard:
+                        liquidity_guard.unregister_position(pos.token_address)
+                    if circuit_breaker:
+                        circuit_breaker.close_position(pos.token_address)
+                    if post_trade_analyzer:
+                        post_trade_analyzer.record_trade_exit(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            token_name=pos.token_name,
+                            strategy=pos.strategy,
+                            entry_time=pos.entry_time,
+                            entry_price=pos.entry_price_usd,
+                            exit_price=pos.current_price,
+                            exit_pnl_pct=pos.pnl_pct,
+                            exit_reason=cb_action.reason,
+                            highest_price=pos.highest_price,
+                            amount_sol=pos.amount_sol_invested,
+                        )
+                    # Blacklister si perte
+                    if pos.pnl_pct < 0:
+                        sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                        seen_tokens.add(pos.token_address)
+                    # Retirer du WS
+                    if price_monitor:
+                        try:
+                            await price_monitor.remove_token(pos.token_address)
+                        except:
+                            pass
+                    # Notifier
+                    pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
+                    msg = f"{pnl_emoji} *VENTE SNIPER (3s)*\n\n"
+                    msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                    msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
+                    msg += f"📝 Raison: {cb_action.reason}\n"
+                    msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+                    for chat_id in subscribers:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id, text=msg,
+                                parse_mode=ParseMode.MARKDOWN,
+                                disable_web_page_preview=True
+                            )
+                        except:
+                            pass
+
+            await asyncio.sleep(0.5)  # Rate limit DexScreener
+        except Exception as e:
+            logger.error(f"Erreur sniper_monitor {pos.token_address[:12]}: {e}")
+
+
+# ============================================================
 # SCAN AUTOMATIQUE + TRADING
 # ============================================================
 
 async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job rapide: vérifier les positions toutes les 15s pour TP/SL réactif"""
+    """Job backup: vérifier les positions toutes les 15s (non-sniper + LP + post-trade)"""
     if not auto_trading_enabled or not trading_engine:
         return
 
@@ -1858,7 +1957,6 @@ async def cb_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"  ⏰ Time Stop: {stats['time_stop_triggered']}\n"
     msg += f"  🛑 Stop Loss: {stats['stop_loss_triggered']}\n"
     msg += f"  📉 Trailing: {stats['trailing_triggered']}\n"
-    msg += f"  📉 Momentum Stop: {stats['momentum_stop_triggered']}\n"
     msg += f"  🎯 Take Profit: {stats['take_profit_triggered']}\n\n"
 
     # Status des positions actives
@@ -2081,9 +2179,11 @@ def main():
     app.add_handler(CommandHandler("insights", insights_cmd))
     app.add_handler(CommandHandler("cb_stats", cb_stats_cmd))
 
-    # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
-    # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
+    # Job SNIPER ultra-rapide (3s) - SL/TP réactif pour positions sniper
     job_queue = app.job_queue
+    job_queue.run_repeating(sniper_monitor_job, interval=3, first=5)
+
+    # Job backup pour LP monitoring + post-trade analysis (15s)
     job_queue.run_repeating(position_monitor_job, interval=15, first=10)
 
     # Job de scan pour nouvelles opportunités (toutes les 45s)
