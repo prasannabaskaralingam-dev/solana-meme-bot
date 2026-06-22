@@ -59,7 +59,8 @@ class TradingConfig:
     # Take Profit & Stop Loss
     take_profit_pct: float = 20.0        # Vendre quand +20%
     stop_loss_pct: float = -30.0         # Vendre quand -30%
-    trailing_stop_pct: float = 20.0      # Trailing stop de 20% depuis le plus haut
+    trailing_stop_pct: float = 15.0      # Trailing stop depuis le plus haut (défaut)
+    trailing_activation_pct: float = 5.0 # Activer le trailing dès +5% de profit
 
     # Sécurité
     slippage_bps: int = 500              # 5% slippage max (meme coins = volatile)
@@ -693,22 +694,59 @@ class TradingEngine:
         """Déterminer si on doit vendre une position"""
         pnl = position.pnl_pct
 
-        # Take Profit
+        # Take Profit (fixe)
         if pnl >= self.config.take_profit_pct:
             return True, f"🎯 Take Profit atteint ({pnl:.1f}%)"
 
-        # Stop Loss
+        # Stop Loss (fixe - filet de sécurité)
         if pnl <= self.config.stop_loss_pct:
             return True, f"🛑 Stop Loss déclenché ({pnl:.1f}%)"
 
-        # Trailing Stop
+        # Trailing Stop Dynamique à paliers
+        # Plus le profit est élevé, plus le trailing se resserre
         if position.highest_price > 0 and position.current_price > 0:
-            drop_from_high = ((position.current_price - position.highest_price)
-                              / position.highest_price) * 100
-            if position.pnl_pct > 10 and drop_from_high <= -self.config.trailing_stop_pct:
-                return True, f"📉 Trailing Stop ({drop_from_high:.1f}% depuis le plus haut)"
+            # Calculer le PnL au plus haut (profit max atteint)
+            pnl_at_high = ((position.highest_price - position.entry_price_usd)
+                           / position.entry_price_usd) * 100 if position.entry_price_usd > 0 else 0
+
+            # Le trailing s'active dès que le profit a atteint le seuil d'activation
+            if pnl_at_high >= self.config.trailing_activation_pct:
+                # Calculer le trailing stop dynamique selon le palier de profit
+                trailing_pct = self._get_dynamic_trailing(pnl_at_high)
+
+                # Chute depuis le plus haut
+                drop_from_high = ((position.current_price - position.highest_price)
+                                  / position.highest_price) * 100
+
+                if drop_from_high <= -trailing_pct:
+                    # Calculer le PnL réel au moment de la vente
+                    return True, (f"📉 Trailing Stop (chute {drop_from_high:.1f}% depuis ATH, "
+                                  f"seuil: -{trailing_pct:.0f}%, profit max: +{pnl_at_high:.0f}%)")
 
         return False, "Hold"
+
+    def _get_dynamic_trailing(self, pnl_at_high: float) -> float:
+        """
+        Trailing stop dynamique à paliers.
+        Plus le profit max est élevé, plus le trailing se resserre.
+        
+        Paliers:
+        - Profit +5% à +10%  → trailing de 12% (laisser respirer)
+        - Profit +10% à +20% → trailing de 10% (commencer à protéger)
+        - Profit +20% à +50% → trailing de 8% (protéger les gains)
+        - Profit +50% à +100% → trailing de 6% (serrer fort)
+        - Profit > +100%     → trailing de 5% (verrouiller le moonshot)
+        """
+        if pnl_at_high >= 100:
+            return 5.0
+        elif pnl_at_high >= 50:
+            return 6.0
+        elif pnl_at_high >= 20:
+            return 8.0
+        elif pnl_at_high >= 10:
+            return 10.0
+        else:
+            return 12.0
 
     def execute_buy(self, analysis: dict, strategy: str) -> Optional[dict]:
         """Exécuter un achat"""

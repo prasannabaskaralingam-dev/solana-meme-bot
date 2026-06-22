@@ -73,6 +73,7 @@ def save_trading_config(config: TradingConfig):
         "take_profit_pct": config.take_profit_pct,
         "stop_loss_pct": config.stop_loss_pct,
         "trailing_stop_pct": config.trailing_stop_pct,
+        "trailing_activation_pct": config.trailing_activation_pct,
         "slippage_bps": config.slippage_bps,
     }
     with open(TRADING_CONFIG_FILE, "w") as f:
@@ -231,9 +232,16 @@ Bot de trading automatique pour meme coins Solana.
 /auto\\_off - Désactiver le trading auto
 /set\\_tp `<pct>` - Modifier Take Profit
 /set\\_sl `<pct>` - Modifier Stop Loss
+/set\\_trailing - Voir/modifier trailing stop
 /set\\_size `<sol>` - Modifier taille position
 /config - Voir la configuration
 /sell\\_all - Vendre toutes les positions
+
+*📋 Copy Trading :*
+/copy\\_wallets - Wallets suivis
+/copy\\_add `<addr>` - Ajouter un wallet
+/copy\\_remove `<addr>` - Retirer un wallet
+/copy\\_history - Historique copy trades
 
 *🔍 Manuel :*
 /buy `<adresse>` - Acheter un token
@@ -434,7 +442,8 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"*Risk Management:*\n"
     msg += f"  🎯 Take Profit: +{trading_config.take_profit_pct}%\n"
     msg += f"  🛑 Stop Loss: {trading_config.stop_loss_pct}%\n"
-    msg += f"  📉 Trailing Stop: {trading_config.trailing_stop_pct}%\n"
+    msg += f"  📉 Trailing Stop: actif dès +{trading_config.trailing_activation_pct}%\n"
+    msg += f"     (paliers: 12%/10%/8%/6%/5% selon profit)\n"
     msg += f"  ⚡ Slippage: {trading_config.slippage_bps/100}%\n\n"
     msg += f"*Auto Trading:* {'🟢 ACTIF' if auto_trading_enabled else '🔴 INACTIF'}"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -464,6 +473,36 @@ async def set_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trading_config.stop_loss_pct = -abs(sl)
         save_trading_config(trading_config)
         await update.message.reply_text(f"✅ Stop Loss mis à jour: {trading_config.stop_loss_pct}%")
+    except ValueError:
+        await update.message.reply_text("❌ Valeur invalide")
+
+
+async def set_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /set_trailing <activation_pct> - Configurer le trailing stop"""
+    if not context.args:
+        msg = "📉 *Trailing Stop Dynamique*\n\n"
+        msg += f"Activation: dès +{trading_config.trailing_activation_pct}% de profit\n\n"
+        msg += "*Paliers automatiques:*\n"
+        msg += "• Profit +5% à +10% → trailing 12%\n"
+        msg += "• Profit +10% à +20% → trailing 10%\n"
+        msg += "• Profit +20% à +50% → trailing 8%\n"
+        msg += "• Profit +50% à +100% → trailing 6%\n"
+        msg += "• Profit > +100% → trailing 5%\n\n"
+        msg += "Usage: /set\\_trailing 5 (activer dès +5%)"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        activation = float(context.args[0])
+        if activation < 1 or activation > 50:
+            await update.message.reply_text("❌ Valeur entre 1 et 50%")
+            return
+        trading_config.trailing_activation_pct = activation
+        save_trading_config(trading_config)
+        await update.message.reply_text(
+            f"✅ Trailing Stop mis à jour!\n"
+            f"📉 Activation: dès +{activation}% de profit\n"
+            f"Les paliers dynamiques s'appliquent automatiquement."
+        )
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide")
 
@@ -1157,7 +1196,7 @@ def main():
 
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")
-    print(f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%")
+    print(f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}% | Trailing: dès +{trading_config.trailing_activation_pct}%")
     print(f"💰 Budget max: {trading_config.max_budget_sol} SOL")
     print(f"🌐 Jupiter API: {trading_config.jupiter_api_url}")
 
@@ -1177,6 +1216,7 @@ def main():
     app.add_handler(CommandHandler("auto_off", auto_off))
     app.add_handler(CommandHandler("set_tp", set_tp))
     app.add_handler(CommandHandler("set_sl", set_sl))
+    app.add_handler(CommandHandler("set_trailing", set_trailing))
     app.add_handler(CommandHandler("set_size", set_size))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("sell", sell_cmd))
