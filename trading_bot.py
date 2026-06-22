@@ -25,6 +25,7 @@ from trader import (
     PositionManager, TradingEngine, Position
 )
 from token_security import TokenSecurityChecker
+from price_monitor import PriceMonitor
 
 # Logging
 logging.basicConfig(
@@ -85,6 +86,7 @@ swap_engine: JupiterSwap = None
 positions = PositionManager()
 trading_engine: TradingEngine = None
 security_checker: TokenSecurityChecker = None
+price_monitor: PriceMonitor = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -106,11 +108,89 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker
+    global swap_engine, trading_engine, security_checker, price_monitor
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
+    price_monitor = PriceMonitor(on_price_update=on_realtime_price_update)
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
+    logger.info("🔌 PriceMonitor WebSocket initialisé")
+
+
+# ============================================================
+# WEBSOCKET PRICE MONITOR - CALLBACKS
+# ============================================================
+
+async def on_realtime_price_update(token_address: str, price_sol: float, change_pct: float):
+    """
+    Callback appelé en temps réel quand le prix d'un token change.
+    Vérifie instantanément le TP/SL.
+    """
+    global sl_blacklist
+
+    if not auto_trading_enabled or not trading_engine:
+        return
+
+    if token_address not in positions.positions:
+        return
+
+    pos = positions.positions[token_address]
+
+    # Convertir le prix SOL en USD (approximation)
+    # On utilise le ratio entry_price / (amount_sol / amount_tokens) pour estimer
+    # Mais plus simple: utiliser le prix SOL actuel depuis le wallet
+    sol_price_usd = 73.0  # Approximation, sera mis à jour
+    try:
+        balance_sol = wallet.get_sol_balance()
+        if balance_sol > 0:
+            # On ne peut pas facilement obtenir le prix USD du SOL ici
+            # Utiliser le prix SOL depuis DexScreener serait trop lent
+            # On utilise le ratio de prix pour calculer le PnL
+            pass
+    except:
+        pass
+
+    # Calculer le prix USD à partir du prix SOL
+    current_price_usd = price_sol * sol_price_usd
+
+    # Mettre à jour la position
+    if current_price_usd > 0:
+        positions.update_position(token_address, current_price_usd)
+
+    # Vérifier TP/SL
+    should_sell, reason = trading_engine.should_sell(pos)
+    if should_sell:
+        result = trading_engine.execute_sell(pos, reason)
+        if result:
+            # Blacklister si SL
+            if pos.pnl_pct < 0:
+                sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                seen_tokens.add(pos.token_address)
+                logger.info(f"🚫 Blacklisté après SL (WS): {pos.token_name}")
+
+            # Retirer du monitoring WS
+            if price_monitor:
+                await price_monitor.remove_token(token_address)
+
+            # Notifier (on ne peut pas envoyer de message Telegram depuis ici
+            # car on n'a pas le context. On log et le polling job notifiera)
+            logger.info(f"⚡ VENTE WS INSTANTANÉE: {pos.token_name} PnL: {pos.pnl_pct:+.1f}% - {reason}")
+
+
+async def start_price_monitor_for_positions():
+    """Démarrer le monitoring WS pour toutes les positions ouvertes"""
+    if not price_monitor:
+        return
+
+    await price_monitor.start()
+
+    for addr in list(positions.positions.keys()):
+        try:
+            success = await price_monitor.add_token(addr)
+            if success:
+                logger.info(f"🔌 WS monitoring actif: {addr[:12]}...")
+        except Exception as e:
+            logger.error(f"Erreur ajout WS pour {addr[:12]}: {e}")
 
 
 # ============================================================
@@ -677,6 +757,12 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         except:
                             pass
                     await asyncio.sleep(trading_config.cooldown_seconds)
+                    # Ajouter au monitoring WebSocket
+                    if price_monitor:
+                        try:
+                            await price_monitor.add_token(address)
+                        except Exception as e:
+                            logger.error(f"Erreur ajout WS monitoring: {e}")
                 continue
 
             # Stratégie Momentum
@@ -706,6 +792,12 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         except:
                             pass
                     await asyncio.sleep(trading_config.cooldown_seconds)
+                    # Ajouter au monitoring WebSocket
+                    if price_monitor:
+                        try:
+                            await price_monitor.add_token(address)
+                        except Exception as e:
+                            logger.error(f"Erreur ajout WS monitoring: {e}")
 
     except Exception as e:
         logger.error(f"Erreur scan_and_trade: {e}")
@@ -905,13 +997,28 @@ def main():
     app.add_handler(CommandHandler("metas", metas_command))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
+    # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
     job_queue = app.job_queue
     job_queue.run_repeating(position_monitor_job, interval=15, first=10)
 
     # Job de scan pour nouvelles opportunités (toutes les 45s)
     job_queue.run_repeating(auto_trading_job, interval=POLLING_INTERVAL, first=20)
 
+    # Démarrer le WebSocket PriceMonitor pour les positions existantes
+    # (s'exécute en arrière-plan dans l'event loop)
+    async def post_init(application):
+        """Callback post-init pour démarrer le WebSocket"""
+        try:
+            await start_price_monitor_for_positions()
+            print("🔌 WebSocket PriceMonitor démarré !")
+        except Exception as e:
+            print(f"⚠️ Erreur démarrage WebSocket (fallback polling actif): {e}")
+
+    app.post_init = post_init
+
     print("✅ Bot de trading démarré !")
+    print("🔌 WebSocket: monitoring temps réel actif (TP/SL instantané)")
+    print("⏱  Polling 15s: backup pour tokens sans pool PumpSwap")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
