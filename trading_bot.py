@@ -159,7 +159,7 @@ def init_trading():
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
     logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
-    logger.info("🧠 Smart Entry Engine initialisé (double-check + volume spike)")
+    logger.info("🧠 Smart Entry Engine initialisé (SNIPER ONLY - tokens < 1h)")
     logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
     # Filtre anti-corrélation
     correlation_filter = CorrelationFilter(data_dir=DATA_DIR)
@@ -557,10 +557,7 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"  Montant: {trading_config.sniper_position_sol} SOL\n"
     msg += f"  Liq min: ${trading_config.sniper_min_liquidity}\n"
     msg += f"  MC max: ${trading_config.sniper_max_mc:,}\n\n"
-    msg += f"*Momentum:* {'✅ Activé' if trading_config.momentum_enabled else '❌ Désactivé'}\n"
-    msg += f"  Montant: {trading_config.momentum_position_sol} SOL\n"
-    msg += f"  Pump min 5m: {trading_config.momentum_min_pump_5m}%\n"
-    msg += f"  Pump min 1h: {trading_config.momentum_min_pump_1h}%\n\n"
+    msg += f"*Momentum:* ❌ Désactivé (mode Sniper Only)\n\n"
     msg += f"*Risk Management:*\n"
     msg += f"  🎯 Take Profit: +{trading_config.take_profit_pct}%\n"
     msg += f"  🛑 Stop Loss: {trading_config.stop_loss_pct}%\n"
@@ -1442,51 +1439,9 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             logger.error(f"Erreur ajout WS monitoring: {e}")
                 continue
 
-            # Stratégie Momentum (fallback si pas dans watchlist)
-            should_buy, reason = trading_engine.should_buy_momentum(analysis)
-            if should_buy:
-                # Vérifier la liquidité avant achat
-                if liquidity_guard:
-                    liq_usd = analysis.get("liquidity_usd", 0)
-                    can_buy_liq, liq_reason = liquidity_guard.can_buy(address, liq_usd, strategy="momentum")
-                    if not can_buy_liq:
-                        logger.info(f"{liq_reason} - Skip {analysis.get('name', address[:12])}")
-                        seen_tokens.add(address)
-                        continue
-                result = trading_engine.execute_buy(analysis, "momentum")
-                if result:
-                    # Enregistrer LP pour monitoring
-                    if liquidity_guard:
-                        liq_usd = analysis.get("liquidity_usd", 0)
-                        if liq_usd > 0:
-                            liquidity_guard.register_position(address, liq_usd)
-                    sec_info = ""
-                    if security_checker:
-                        sr = security_checker._cache.get(address)
-                        if sr:
-                            sec_info = f"\n🛡 Sécurité: {sr.risk_level} (score {sr.risk_score})"
-                    msg = f"🚀 *ACHAT MOMENTUM*\n\n"
-                    msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
-                    msg += f"💵 {result['amount_sol']} SOL\n"
-                    msg += f"📈 5m: {analysis['price_change_5m']:+.1f}% | 1h: {analysis['price_change_1h']:+.1f}%\n"
-                    msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}"
-                    msg += sec_info
-                    msg += f"\n🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
-                    for chat_id in subscribers:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id, text=msg,
-                                parse_mode=ParseMode.MARKDOWN,
-                                disable_web_page_preview=True
-                            )
-                        except:
-                            pass
-                    await asyncio.sleep(trading_config.cooldown_seconds)
-                    if price_monitor:
-                        try:
-                            await price_monitor.add_token(address)
-                        except Exception as e:
-                            logger.error(f"Erreur ajout WS monitoring: {e}")
+            # Stratégie Momentum - DÉSACTIVÉE (mode Sniper Only)
+            # Les tokens > 1h sont déjà filtrés par le Smart Entry
+            pass
 
     except Exception as e:
         logger.error(f"Erreur scan_and_trade: {e}")

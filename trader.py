@@ -48,8 +48,8 @@ class TradingConfig:
     sniper_min_liquidity: float = 5000   # Liquidité min pour sniper ($)
     sniper_max_mc: float = 100_000       # MC max pour sniper ($)
 
-    # Stratégie Momentum (tokens en pump)
-    momentum_enabled: bool = True
+    # Stratégie Momentum (tokens en pump) - DÉSACTIVÉE (sniper only)
+    momentum_enabled: bool = False
     momentum_position_sol: float = 0.05  # Montant par trade momentum
     momentum_min_pump_5m: float = 15     # % hausse min sur 5min
     momentum_min_pump_1h: float = 40     # % hausse min sur 1h

@@ -214,14 +214,18 @@ class SmartEntryEngine:
         # === DÉCISION ===
         # Score minimum de 4 pour confirmer
         if confirmation_score >= 4:
-            # Déterminer la stratégie
+            # Déterminer la stratégie - SNIPER ONLY MODE
             age = analysis.get("age_hours", 99)
             if age and age <= 1:
                 strategy = "sniper"
             elif volume_multiplier >= 3.0:
-                strategy = "volume_spike"
+                strategy = "sniper"  # Traité comme sniper (volume spike sur token frais)
             else:
-                strategy = "momentum"
+                # Rejeter les tokens > 1h (pas de momentum)
+                if age and age > 1:
+                    del self.watchlist[address]
+                    return None
+                strategy = "sniper"
 
             # Calculer la confiance (0-1)
             confidence = min(confirmation_score / 8.0, 1.0)
@@ -357,10 +361,12 @@ class SmartEntryEngine:
             score += 1
             reasons.append(f"⚡ Ratio {ratio:.1f}x")
 
-        # Token frais
+        # Token frais - SNIPER ONLY: rejeter si > 1h
         age = analysis.get("age_hours")
-        if age and age <= 2:
-            score += 1
+        if age and age > 1:
+            return 0, []  # Trop vieux pour le mode sniper
+        if age and age <= 1:
+            score += 2  # Bonus fort pour les tokens très frais
             reasons.append(f"🆕 {age:.1f}h")
 
         return score, reasons
