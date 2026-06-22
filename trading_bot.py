@@ -1372,8 +1372,9 @@ async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_positions(context: ContextTypes.DEFAULT_TYPE):
-    """Vérifier les positions ouvertes pour TP/SL"""
-    for pos in positions.get_open_positions():
+    """Vérifier les positions ouvertes pour TP/SL (exclut SNIPER, géré par job 3s)"""
+    non_sniper = [p for p in positions.get_open_positions() if p.strategy != "sniper"]
+    for pos in non_sniper:
         try:
             # Mettre à jour le prix
             analysis = api.analyze_token(pos.token_address)
