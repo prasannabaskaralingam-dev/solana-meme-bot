@@ -130,12 +130,31 @@ def init_trading():
         min_size_sol=0.02,
         max_size_sol=0.15
     )
+
+    # Importer l'historique existant dans le PnL Tracker (migration)
+    if not pnl_tracker.trade_results and trading_engine.trade_history:
+        imported = 0
+        for trade in trading_engine.trade_history:
+            if trade.get("type") == "SELL":
+                pnl_tracker.record_trade(
+                    token_address=trade.get("token_address", ""),
+                    token_symbol=trade.get("token", "???"),
+                    strategy=trade.get("strategy", "momentum"),
+                    entry_time=trade.get("timestamp", ""),
+                    amount_sol=trade.get("amount_sol_invested", 0.05),
+                    pnl_pct=trade.get("pnl_pct", 0),
+                    exit_reason=trade.get("reason", "unknown"),
+                )
+                imported += 1
+        if imported:
+            logger.info(f"📥 PnL Tracker: {imported} trades historiques importés")
+
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
     logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
     logger.info("🧠 Smart Entry Engine initialisé (double-check + volume spike)")
     logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
-    logger.info(f"📊 PnL Tracker: {len(pnl_tracker.trade_results)} trades historiques")
+    logger.info(f"📊 PnL Tracker: {len(pnl_tracker.trade_results)} trades chargés")
 
 
 # ============================================================

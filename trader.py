@@ -831,6 +831,7 @@ class TradingEngine:
             trade_record = {
                 "type": "SELL",
                 "reason": reason,
+                "strategy": position.strategy,
                 "token": position.token_symbol,
                 "token_address": token_mint,
                 "pnl_pct": position.pnl_pct,
