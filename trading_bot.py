@@ -30,6 +30,7 @@ from copy_trading import CopyTradingEngine, CopyTradeSignal
 from smart_entry import SmartEntryEngine, EntrySignal
 from pnl_tracker import PnLTracker, DynamicPositionSizer
 from correlation_filter import CorrelationFilter
+from liquidity_guard import LiquidityGuard
 
 # Logging
 logging.basicConfig(
@@ -100,6 +101,7 @@ smart_entry: SmartEntryEngine = None
 pnl_tracker: PnLTracker = None
 position_sizer: DynamicPositionSizer = None
 correlation_filter: CorrelationFilter = None
+liquidity_guard: LiquidityGuard = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -121,7 +123,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -165,6 +167,22 @@ def init_trading():
     logger.info(f"🎯 Filtre corrélation: {len(correlation_filter.active_narratives)} positions trackées")
 
     logger.info(f"📊 PnL Tracker: {len(pnl_tracker.trade_results)} trades chargés")
+
+    # Liquidity Guard (3 protections)
+    liquidity_guard = LiquidityGuard()
+    # Enregistrer les positions existantes pour le monitoring LP
+    for pos in positions.get_open_positions():
+        # Récupérer la liquidité actuelle pour le monitoring
+        liq = liquidity_guard._fetch_liquidity(pos.token_address)
+        if liq is not None and liq > 0:
+            liquidity_guard.register_position(pos.token_address, liq)
+    # Valider que toutes les positions ont un SL actif
+    issues = liquidity_guard.validate_positions_on_startup(positions.positions, trading_config)
+    if issues:
+        logger.warning(f"⚠️ SL Guard: {len(issues)} problèmes corrigés au démarrage")
+        for issue in issues:
+            logger.warning(f"  {issue}")
+    logger.info(f"💧 Liquidity Guard: {len(liquidity_guard.snapshots)} positions monitorées")
 
 
 # ============================================================
@@ -230,6 +248,10 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Retirer du filtre de corrélation
             if correlation_filter:
                 correlation_filter.unregister_position(pos.token_address)
+
+            # Retirer du monitoring LP
+            if liquidity_guard:
+                liquidity_guard.unregister_position(pos.token_address)
 
             # Blacklister si SL
             if pos.pnl_pct < 0:
@@ -1014,6 +1036,79 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Erreur position_monitor_job: {e}")
 
+    # === MONITORING LP (Protection anti-rug post-achat) ===
+    try:
+        if liquidity_guard and liquidity_guard.snapshots:
+            lp_actions = liquidity_guard.check_all_positions()
+            for action in lp_actions:
+                token_addr = action["token"]
+                pos = positions.get_position(token_addr)
+                if not pos:
+                    continue
+
+                if action["type"] == "emergency_sell":
+                    # VENTE D'URGENCE - LP effondrée (rug pull en cours)
+                    logger.warning(f"🚨 VENTE D'URGENCE LP: {pos.token_name}")
+                    # Utiliser le retry avec slippage progressif
+                    raw_amount = int(pos.amount_tokens)
+                    tx_sig = liquidity_guard.emergency_sell_with_retry(
+                        swap_engine, pos.token_address, raw_amount
+                    )
+                    if tx_sig:
+                        positions.close_position(token_addr)
+                        if correlation_filter:
+                            correlation_filter.unregister_position(token_addr)
+                        liquidity_guard.unregister_position(token_addr)
+                        # Blacklister le token 24h
+                        sl_blacklist[token_addr] = time.time() + 86400
+                        # Notifier
+                        msg = f"🚨 *VENTE D'URGENCE (Rug Pull)*\n\n"
+                        msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                        msg += f"💧 LP effondrée: {action['drop_pct']:.0f}%\n"
+                        msg += f"💰 ${action['entry_liq']:.0f} \u2192 ${action['current_liq']:.0f}\n"
+                        msg += f"🔗 [TX](https://solscan.io/tx/{tx_sig})"
+                        for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=msg,
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True
+                                )
+                            except:
+                                pass
+                    else:
+                        # Échec de vente - notifier quand même
+                        msg = f"🚨 *ALERTE: Impossible de vendre (illiquide)*\n\n"
+                        msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                        msg += f"💧 LP: ${action['current_liq']:.0f}\n"
+                        msg += f"⚠️ Token potentiellement bloqué"
+                        for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=msg,
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except:
+                                pass
+
+                elif action["type"] == "alert":
+                    # Alerte LP en chute (pas encore urgence)
+                    msg = f"⚠️ *ALERTE LP*\n\n"
+                    msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                    msg += f"💧 Liquidité en chute: -{action['drop_pct']:.0f}%\n"
+                    msg += f"💰 ${action['entry_liq']:.0f} \u2192 ${action['current_liq']:.0f}\n"
+                    msg += f"👀 Surveillance renforcée..."
+                    for chat_id in subscribers:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id, text=msg,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except:
+                            pass
+    except Exception as e:
+        logger.error(f"Erreur LP monitor: {e}")
+
 
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
     """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
@@ -1064,6 +1159,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Retirer du filtre de corrélation
                     if correlation_filter:
                         correlation_filter.unregister_position(pos.token_address)
+
+                    # Retirer du monitoring LP
+                    if liquidity_guard:
+                        liquidity_guard.unregister_position(pos.token_address)
 
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
@@ -1142,6 +1241,22 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         else:
                             trading_config.momentum_position_sol = dyn_size
 
+                    # 💧 Vérifier la liquidité AVANT l'achat (protection illiquidité)
+                    if liquidity_guard:
+                        liq_usd = analysis.get("liquidity_usd", 0)
+                        can_buy_liq, liq_reason = liquidity_guard.can_buy(
+                            address, liq_usd, strategy=signal.strategy
+                        )
+                        if not can_buy_liq:
+                            logger.info(f"{liq_reason} - Skip {signal.token_symbol}")
+                            smart_entry.consume_signal(address)
+                            seen_tokens.add(address)
+                            if position_sizer:
+                                trading_config.position_size_sol = original_size
+                                trading_config.sniper_position_sol = original_size
+                                trading_config.momentum_position_sol = original_size
+                            continue
+
                     # Vérifier la corrélation avant d'acheter
                     if correlation_filter:
                         can_buy, corr_reason = correlation_filter.can_buy(
@@ -1181,6 +1296,12 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 token_symbol=signal.token_symbol,
                                 age_hours=analysis.get("age_hours")
                             )
+
+                        # Enregistrer la liquidité pour monitoring post-achat
+                        if liquidity_guard:
+                            liq_usd = analysis.get("liquidity_usd", 0)
+                            if liq_usd > 0:
+                                liquidity_guard.register_position(address, liq_usd)
 
                         # Notification enrichie
                         sec_info = ""
@@ -1277,8 +1398,21 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             # Stratégie Sniper (tokens très frais < 1h)
             should_snipe, reason = trading_engine.should_snipe(analysis)
             if should_snipe:
+                # Vérifier la liquidité avant achat
+                if liquidity_guard:
+                    liq_usd = analysis.get("liquidity_usd", 0)
+                    can_buy_liq, liq_reason = liquidity_guard.can_buy(address, liq_usd, strategy="sniper")
+                    if not can_buy_liq:
+                        logger.info(f"{liq_reason} - Skip {analysis.get('name', address[:12])}")
+                        seen_tokens.add(address)
+                        continue
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
+                    # Enregistrer LP pour monitoring
+                    if liquidity_guard:
+                        liq_usd = analysis.get("liquidity_usd", 0)
+                        if liq_usd > 0:
+                            liquidity_guard.register_position(address, liq_usd)
                     sec_info = ""
                     if security_checker:
                         sr = security_checker._cache.get(address)
@@ -1311,8 +1445,21 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             # Stratégie Momentum (fallback si pas dans watchlist)
             should_buy, reason = trading_engine.should_buy_momentum(analysis)
             if should_buy:
+                # Vérifier la liquidité avant achat
+                if liquidity_guard:
+                    liq_usd = analysis.get("liquidity_usd", 0)
+                    can_buy_liq, liq_reason = liquidity_guard.can_buy(address, liq_usd, strategy="momentum")
+                    if not can_buy_liq:
+                        logger.info(f"{liq_reason} - Skip {analysis.get('name', address[:12])}")
+                        seen_tokens.add(address)
+                        continue
                 result = trading_engine.execute_buy(analysis, "momentum")
                 if result:
+                    # Enregistrer LP pour monitoring
+                    if liquidity_guard:
+                        liq_usd = analysis.get("liquidity_usd", 0)
+                        if liq_usd > 0:
+                            liquidity_guard.register_position(address, liq_usd)
                     sec_info = ""
                     if security_checker:
                         sr = security_checker._cache.get(address)
