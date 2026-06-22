@@ -34,6 +34,7 @@ from liquidity_guard import LiquidityGuard
 from post_trade_analyzer import PostTradeAnalyzer
 from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_thread
 from circuit_breaker import CircuitBreaker, CBConfig
+from capital_watchdog import CapitalWatchdog, WatchdogConfig
 
 # Logging
 logging.basicConfig(
@@ -106,6 +107,7 @@ correlation_filter: CorrelationFilter = None
 liquidity_guard: LiquidityGuard = None
 post_trade_analyzer: PostTradeAnalyzer = None
 circuit_breaker: CircuitBreaker = None
+capital_watchdog: CapitalWatchdog = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -127,7 +129,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -226,6 +228,23 @@ def init_trading():
         circuit_breaker.sync_from_existing_positions(existing_positions)
     logger.info(f"🔌 CircuitBreaker: {len(circuit_breaker.positions)} positions synchronisées")
 
+    # Capital Watchdog (surveillance de la santé du capital)
+    capital_watchdog = CapitalWatchdog(WatchdogConfig(
+        warn_gap_seconds=10.0,
+        critical_gap_seconds=20.0,
+        emergency_gap_seconds=30.0,
+    ))
+    # Enregistrer les positions existantes
+    for addr, pos in positions.positions.items():
+        capital_watchdog.register_position(
+            token_address=addr,
+            token_symbol=pos.token_symbol,
+            strategy=pos.strategy,
+            amount_sol=pos.amount_sol_invested,
+            entry_price=pos.entry_price_usd,
+        )
+    logger.info(f"🛡️ Capital Watchdog: {len(capital_watchdog.positions)} positions surveillées")
+
 
 # ============================================================
 # WEBSOCKET PRICE MONITOR - CALLBACKS
@@ -267,6 +286,10 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     if current_price_usd > 0:
         positions.update_position(token_address, current_price_usd)
 
+    # Heartbeat watchdog (cette position est surveillée)
+    if capital_watchdog:
+        capital_watchdog.heartbeat(token_address, current_price_usd)
+
     # Vérifier TP/SL via CircuitBreaker centralisé
     if circuit_breaker:
         cb_action = circuit_breaker.check(token_address, current_price_usd)
@@ -303,6 +326,8 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Retirer du CircuitBreaker
             if circuit_breaker:
                 circuit_breaker.close_position(pos.token_address)
+                if capital_watchdog:
+                    capital_watchdog.unregister_position(pos.token_address)
 
             # Enregistrer pour analyse post-trade
             if post_trade_analyzer:
@@ -822,6 +847,14 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 token_symbol=analysis.get("symbol", "???"),
                 entry_price=entry_price,
             )
+        if capital_watchdog:
+            capital_watchdog.register_position(
+                token_address=token_address,
+                token_symbol=analysis.get("symbol", "???"),
+                strategy="manual",
+                amount_sol=result['amount_sol'],
+                entry_price=float(analysis.get("price_usd", 0) or 0),
+            )
         msg = f"✅ *Achat réussi !*\n\n"
         msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
         msg += f"💵 Montant: {result['amount_sol']} SOL\n"
@@ -854,6 +887,8 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Retirer du CircuitBreaker
         if circuit_breaker:
             circuit_breaker.close_position(token_address)
+            if capital_watchdog:
+                capital_watchdog.unregister_position(token_address)
         msg = f"✅ *Vente réussie !*\n\n"
         msg += f"🪙 {position.token_name} (${position.token_symbol})\n"
         msg += f"📈 PnL: {result['pnl_pct']:+.1f}%\n"
@@ -901,6 +936,8 @@ async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Retirer du CircuitBreaker
                 if circuit_breaker:
                     circuit_breaker.close_position(mint)
+                    if capital_watchdog:
+                        capital_watchdog.unregister_position(mint)
                 # Fermer la position si elle existe dans le tracking
                 if mint in positions.positions:
                     pos = positions.positions[mint]
@@ -999,6 +1036,14 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
                 token_address=token_mint,
                 token_symbol=analysis.get("symbol", signal.token_symbol),
                 entry_price=entry_price,
+            )
+        if capital_watchdog:
+            capital_watchdog.register_position(
+                token_address=token_mint,
+                token_symbol=analysis.get("symbol", signal.token_symbol),
+                strategy="copy_trade",
+                amount_sol=result['amount_sol'],
+                entry_price=float(analysis.get("price_usd", 0) or 0),
             )
         # Notifier via Telegram
         msg = f"📋 *COPY TRADE*\n\n"
@@ -1136,6 +1181,115 @@ async def copy_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# CAPITAL WATCHDOG — SURVEILLANCE SANTÉ DU CAPITAL (5s)
+# ============================================================
+
+async def watchdog_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job watchdog (5s): vérifie que CHAQUE position est activement surveillée.
+    Alerte immédiatement si un gap de monitoring est détecté.
+    """
+    if not capital_watchdog or not auto_trading_enabled:
+        return
+
+    # Vérifier la santé de toutes les positions
+    alerts = capital_watchdog.check()
+
+    if not alerts:
+        return
+
+    for alert in alerts:
+        # Envoyer l'alerte Telegram
+        level_emoji = {
+            "warn": "⚠️",
+            "critical": "🚨",
+            "emergency": "💀",
+        }.get(alert["level"], "❓")
+
+        msg = f"{level_emoji} *WATCHDOG CAPITAL*\n\n"
+        msg += alert["message"]
+
+        for chat_id in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except:
+                pass
+
+        # VENTE D'URGENCE si emergency
+        if alert["action"] == "emergency_sell" and alert["token_address"] != "GLOBAL":
+            token_addr = alert["token_address"]
+            if token_addr in positions.positions:
+                pos = positions.positions[token_addr]
+                try:
+                    result = trading_engine.execute_sell(
+                        pos, f"💀 VENTE D'URGENCE WATCHDOG (non surveillé {alert['gap_seconds']:.0f}s)"
+                    )
+                    if result:
+                        if pnl_tracker:
+                            pnl_tracker.record_trade(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                strategy=pos.strategy,
+                                entry_time=pos.entry_time,
+                                amount_sol=pos.amount_sol_invested,
+                                pnl_pct=pos.pnl_pct,
+                                exit_reason="WATCHDOG_EMERGENCY",
+                            )
+                        if circuit_breaker:
+                            circuit_breaker.close_position(token_addr)
+                        if capital_watchdog:
+                            capital_watchdog.unregister_position(token_addr)
+                        if price_monitor:
+                            try:
+                                await price_monitor.remove_token(token_addr)
+                            except:
+                                pass
+                        # Notifier la vente d'urgence
+                        sell_msg = f"💀 *VENTE D'URGENCE*\n\n"
+                        sell_msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                        sell_msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
+                        sell_msg += f"📝 Raison: Non surveillé depuis {alert['gap_seconds']:.0f}s\n"
+                        sell_msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+                        for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=sell_msg,
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True,
+                                )
+                            except:
+                                pass
+                except Exception as e:
+                    logger.error(f"[Watchdog] Erreur vente d'urgence {token_addr[:12]}: {e}")
+
+
+async def watchdog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /watchdog - Afficher la santé du capital"""
+    if not capital_watchdog:
+        await update.message.reply_text("❌ Capital Watchdog non initialisé.")
+        return
+
+    stats = capital_watchdog.get_stats()
+    summary = capital_watchdog.get_health_summary()
+
+    msg = "🛡️ *Capital Watchdog*\n\n"
+    msg += f"{summary}\n\n"
+    msg += f"*Stats:*\n"
+    msg += f"  🔍 Checks: {stats['total_checks']}\n"
+    msg += f"  ⚠️ Warnings: {stats['warnings_sent']}\n"
+    msg += f"  🚨 Critiques: {stats['critical_alerts']}\n"
+    msg += f"  💀 Ventes urgence: {stats['emergency_sells']}\n"
+    msg += f"  ⏱️ Max gap vu: {stats['max_gap_seen']:.1f}s\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+# ============================================================
 # SNIPER MONITOR — POLLING 3s (UNIQUEMENT positions SNIPER)
 # ============================================================
 
@@ -1165,6 +1319,10 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             # Mettre à jour la position
             positions.update_position(pos.token_address, current_price)
 
+            # Heartbeat watchdog (cette position est surveillée)
+            if capital_watchdog:
+                capital_watchdog.heartbeat(pos.token_address, current_price)
+
             # Vérifier via CircuitBreaker centralisé
             cb_action = circuit_breaker.check(pos.token_address, current_price)
 
@@ -1190,6 +1348,8 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                         liquidity_guard.unregister_position(pos.token_address)
                     if circuit_breaker:
                         circuit_breaker.close_position(pos.token_address)
+                        if capital_watchdog:
+                            capital_watchdog.unregister_position(pos.token_address)
                     if post_trade_analyzer:
                         post_trade_analyzer.record_trade_exit(
                             token_address=pos.token_address,
@@ -1385,6 +1545,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             if current_price > 0:
                 positions.update_position(pos.token_address, current_price)
 
+            # Heartbeat watchdog
+            if capital_watchdog:
+                capital_watchdog.heartbeat(pos.token_address, current_price)
+
             # Vérifier si on doit vendre via CircuitBreaker centralisé
             if circuit_breaker:
                 cb_action = circuit_breaker.check(pos.token_address, current_price)
@@ -1421,6 +1585,8 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Retirer du CircuitBreaker
                     if circuit_breaker:
                         circuit_breaker.close_position(pos.token_address)
+                        if capital_watchdog:
+                            capital_watchdog.unregister_position(pos.token_address)
 
                     # Enregistrer pour analyse post-trade
                     if post_trade_analyzer:
@@ -1580,6 +1746,14 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 token_symbol=signal.token_symbol,
                                 entry_price=entry_price,
                             )
+                        if capital_watchdog:
+                            capital_watchdog.register_position(
+                                token_address=address,
+                                token_symbol=signal.token_symbol,
+                                strategy=signal.strategy,
+                                amount_sol=result['amount_sol'],
+                                entry_price=float(analysis.get("price_usd", 0) or 0),
+                            )
 
                         # Enregistrer dans le filtre de corrélation
                         if correlation_filter:
@@ -1708,6 +1882,14 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             token_address=address,
                             token_symbol=analysis.get("symbol", "???"),
                             entry_price=entry_price,
+                        )
+                    if capital_watchdog:
+                        capital_watchdog.register_position(
+                            token_address=address,
+                            token_symbol=analysis.get("symbol", "???"),
+                            strategy="sniper",
+                            amount_sol=result['amount_sol'],
+                            entry_price=float(analysis.get("price_usd", 0) or 0),
                         )
                     # Enregistrer LP pour monitoring
                     if liquidity_guard:
@@ -2179,10 +2361,14 @@ def main():
     app.add_handler(CommandHandler("set_corr", set_corr))
     app.add_handler(CommandHandler("insights", insights_cmd))
     app.add_handler(CommandHandler("cb_stats", cb_stats_cmd))
+    app.add_handler(CommandHandler("watchdog", watchdog_cmd))
 
     # Job SNIPER ultra-rapide (3s) - SL/TP réactif pour positions sniper
     job_queue = app.job_queue
     job_queue.run_repeating(sniper_monitor_job, interval=3, first=5)
+
+    # Job Capital Watchdog (5s) - surveille que le capital est sous contrôle
+    job_queue.run_repeating(watchdog_check_job, interval=5, first=8)
 
     # Job backup pour LP monitoring + post-trade analysis (15s)
     job_queue.run_repeating(position_monitor_job, interval=15, first=10)
