@@ -260,6 +260,19 @@ class PnLTracker:
                 })
         return summaries
 
+    def purge_strategies(self, strategies_to_remove: list[str]):
+        """Supprimer tous les trades d'une ou plusieurs stratégies"""
+        before = len(self.trade_results)
+        self.trade_results = [
+            t for t in self.trade_results
+            if t.strategy not in strategies_to_remove
+        ]
+        removed = before - len(self.trade_results)
+        if removed > 0:
+            self._save()
+            logger.info(f"[PNL] Purgé {removed} trades (stratégies: {strategies_to_remove})")
+        return removed
+
     def get_total_pnl(self) -> dict:
         """PnL total depuis le début"""
         total_sol = sum(t.pnl_sol for t in self.trade_results)

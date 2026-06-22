@@ -134,10 +134,14 @@ def init_trading():
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
     price_monitor = PriceMonitor(on_price_update=on_realtime_price_update)
-    copy_trader = CopyTradingEngine(rpc_url=trading_config.rpc_url)
-    copy_trader.set_signal_callback(on_copy_trade_signal)
+    # Copy Trading DÉSACTIVÉ (performances négatives)
+    copy_trader = None
     smart_entry = SmartEntryEngine()
     pnl_tracker = PnLTracker()
+    # Purger les trades MOMENTUM et COPY_TRADE de l'historique
+    purged = pnl_tracker.purge_strategies(["momentum", "copy_trade"])
+    if purged:
+        logger.info(f"🧹 Purgé {purged} trades (momentum + copy_trade) de l'historique PnL")
     position_sizer = DynamicPositionSizer(
         base_size_sol=trading_config.position_size_sol,
         min_size_sol=0.02,
@@ -164,7 +168,7 @@ def init_trading():
 
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
-    logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
+    logger.info("📋 Copy Trading: DÉSACTIVÉ")
     logger.info("🧠 Smart Entry Engine initialisé (SNIPER ONLY - tokens < 1h)")
     logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
     # Filtre anti-corrélation
@@ -406,11 +410,7 @@ Bot de trading automatique pour meme coins Solana.
 /config - Voir la configuration
 /sell\\_all - Vendre toutes les positions
 
-*📋 Copy Trading :*
-/copy\\_wallets - Wallets suivis
-/copy\\_add `<addr>` - Ajouter un wallet
-/copy\\_remove `<addr>` - Retirer un wallet
-/copy\\_history - Historique copy trades
+*📋 Copy Trading :* DÉSACTIVÉ
 
 *🔍 Manuel :*
 /buy `<adresse>` - Acheter un token
@@ -1038,7 +1038,7 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
 async def copy_wallets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /copy_wallets - Voir les wallets suivis"""
     if not copy_trader:
-        await update.message.reply_text("❌ Copy trading non initialisé.")
+        await update.message.reply_text("❌ Copy Trading DÉSACTIVÉ (performances négatives).")
         return
 
     wallets = copy_trader.smart_wallets
@@ -1061,7 +1061,7 @@ async def copy_wallets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def copy_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /copy_add <adresse> [label] - Ajouter un wallet à suivre"""
     if not copy_trader:
-        await update.message.reply_text("❌ Copy trading non initialisé.")
+        await update.message.reply_text("❌ Copy Trading DÉSACTIVÉ (performances négatives).")
         return
 
     if not context.args:
@@ -1097,7 +1097,7 @@ async def copy_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def copy_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /copy_remove <adresse> - Retirer un wallet"""
     if not copy_trader:
-        await update.message.reply_text("❌ Copy trading non initialisé.")
+        await update.message.reply_text("❌ Copy Trading DÉSACTIVÉ (performances négatives).")
         return
 
     if not context.args:
@@ -1118,7 +1118,7 @@ async def copy_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def copy_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /copy_history - Historique des copy trades"""
     if not copy_trader:
-        await update.message.reply_text("❌ Copy trading non initialisé.")
+        await update.message.reply_text("❌ Copy Trading DÉSACTIVÉ (performances négatives).")
         return
 
     history = copy_trader.copy_history
