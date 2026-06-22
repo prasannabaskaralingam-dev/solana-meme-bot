@@ -92,6 +92,10 @@ subscribers = []
 seen_tokens: set = set()  # Tokens déjà achetés ou rejetés
 MAX_SEEN_TOKENS = 500  # Limite pour éviter une fuite mémoire
 
+# Blacklist post-SL: tokens qui ont déclenché un Stop Loss (ne pas racheter)
+sl_blacklist: dict = {}  # {token_address: timestamp_expiry}
+SL_BLACKLIST_DURATION = 3600  # 1 heure de blacklist après un SL
+
 # Charger les subscribers
 SUBS_FILE = os.path.join(DATA_DIR, "bot_data.json")
 if os.path.exists(SUBS_FILE):
@@ -534,20 +538,26 @@ async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SCAN AUTOMATIQUE + TRADING
 # ============================================================
 
+async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job rapide: vérifier les positions toutes les 15s pour TP/SL réactif"""
+    if not auto_trading_enabled or not trading_engine:
+        return
+
+    try:
+        await check_positions(context)
+    except Exception as e:
+        logger.error(f"Erreur position_monitor_job: {e}")
+
+
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job automatique: scan + trading"""
+    """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
     global auto_trading_enabled
 
     if not auto_trading_enabled or not trading_engine:
         return
 
     try:
-        # 1. Vérifier les positions existantes (TP/SL)
-        await check_positions(context)
-
-        # 2. Scanner pour de nouvelles opportunités
         await scan_and_trade(context)
-
     except Exception as e:
         logger.error(f"Erreur auto_trading_job: {e}")
 
@@ -570,8 +580,14 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             if should_sell:
                 result = trading_engine.execute_sell(pos, reason)
                 if result:
+                    # Si c'est un Stop Loss, blacklister le token
+                    if pos.pnl_pct < 0:
+                        sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                        seen_tokens.add(pos.token_address)
+                        logger.info(f"🚫 Blacklisté après SL: {pos.token_name} (1h)")
+
                     # Notifier
-                    msg = f"{'✅' if pos.pnl_pct > 0 else '❌'} *VENTE AUTO*\n\n"
+                    msg = f"{'\u2705' if pos.pnl_pct > 0 else '\u274c'} *VENTE AUTO*\n\n"
                     msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                     msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
                     msg += f"📝 Raison: {reason}\n"
@@ -603,6 +619,13 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             # Déjà vu/rejeté ?
             if address in seen_tokens:
                 continue
+
+            # Blacklisté après un Stop Loss ?
+            if address in sl_blacklist:
+                if time.time() < sl_blacklist[address]:
+                    continue
+                else:
+                    del sl_blacklist[address]  # Expiré, on peut re-considérer
 
             # Déjà en position ?
             if address in positions.positions:
@@ -881,9 +904,12 @@ def main():
     app.add_handler(CommandHandler("trending", trending_command))
     app.add_handler(CommandHandler("metas", metas_command))
 
-    # Job automatique de trading
+    # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     job_queue = app.job_queue
-    job_queue.run_repeating(auto_trading_job, interval=POLLING_INTERVAL, first=15)
+    job_queue.run_repeating(position_monitor_job, interval=15, first=10)
+
+    # Job de scan pour nouvelles opportunités (toutes les 45s)
+    job_queue.run_repeating(auto_trading_job, interval=POLLING_INTERVAL, first=20)
 
     print("✅ Bot de trading démarré !")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
