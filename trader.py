@@ -51,7 +51,7 @@ class TradingConfig:
     momentum_min_buys_ratio: float = 3.0 # Ratio achats/ventes min
 
     # Take Profit & Stop Loss
-    take_profit_pct: float = 50.0        # Vendre quand +50%
+    take_profit_pct: float = 20.0        # Vendre quand +20%
     stop_loss_pct: float = -30.0         # Vendre quand -30%
     trailing_stop_pct: float = 20.0      # Trailing stop de 20% depuis le plus haut
 
