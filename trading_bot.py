@@ -26,6 +26,7 @@ from trader import (
 )
 from token_security import TokenSecurityChecker
 from price_monitor import PriceMonitor
+from copy_trading import CopyTradingEngine, CopyTradeSignal
 
 # Logging
 logging.basicConfig(
@@ -87,6 +88,7 @@ positions = PositionManager()
 trading_engine: TradingEngine = None
 security_checker: TokenSecurityChecker = None
 price_monitor: PriceMonitor = None
+copy_trader: CopyTradingEngine = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -108,13 +110,16 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
     price_monitor = PriceMonitor(on_price_update=on_realtime_price_update)
+    copy_trader = CopyTradingEngine(rpc_url=trading_config.rpc_url)
+    copy_trader.set_signal_callback(on_copy_trade_signal)
     logger.info("✅ Security checker (RugCheck + on-chain) initialisé")
     logger.info("🔌 PriceMonitor WebSocket initialisé")
+    logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
 
 
 # ============================================================
@@ -615,6 +620,190 @@ async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# COPY TRADING - CALLBACKS & COMMANDES
+# ============================================================
+
+async def on_copy_trade_signal(signal: CopyTradeSignal):
+    """
+    Callback appelé quand un smart wallet fait un trade.
+    Copie automatiquement l'achat si les conditions sont remplies.
+    """
+    global seen_tokens, sl_blacklist
+
+    if not auto_trading_enabled or not trading_engine:
+        return
+
+    # On ne copie que les achats (pas les ventes - le TP/SL gère les ventes)
+    if signal.action != "buy":
+        logger.info(f"[COPY] Signal SELL ignoré (TP/SL gère les ventes): {signal.token_symbol}")
+        return
+
+    token_mint = signal.token_mint
+
+    # Vérifier si déjà en position ou blacklisté
+    if token_mint in positions.positions:
+        logger.info(f"[COPY] Déjà en position sur {signal.token_symbol}, skip")
+        return
+    if token_mint in sl_blacklist and time.time() < sl_blacklist[token_mint]:
+        logger.info(f"[COPY] Token blacklisté (SL): {signal.token_symbol}, skip")
+        return
+    if token_mint in seen_tokens:
+        return
+
+    # Vérification sécurité rapide
+    if security_checker:
+        is_safe, sec_reason = security_checker.quick_check(token_mint)
+        if not is_safe:
+            logger.info(f"[COPY] Token rejeté (sécurité): {signal.token_symbol} - {sec_reason}")
+            seen_tokens.add(token_mint)
+            return
+
+    # Analyser le token
+    analysis = api.analyze_token(token_mint)
+    if not analysis:
+        logger.warning(f"[COPY] Impossible d'analyser {signal.token_symbol}")
+        return
+
+    # Exécuter l'achat (copy trade)
+    result = trading_engine.execute_buy(analysis, "copy_trade")
+    if result:
+        seen_tokens.add(token_mint)
+        # Notifier via Telegram
+        msg = f"📋 *COPY TRADE*\n\n"
+        msg += f"👤 Wallet: {signal.wallet_label}\n"
+        msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
+        msg += f"💵 {result['amount_sol']} SOL\n"
+        msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}\n"
+        msg += f"💧 Liq: ${analysis.get('liquidity_usd', 0):,.0f}\n"
+        msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})\n"
+        msg += f"👁 [Wallet source](https://solscan.io/tx/{signal.tx_signature})"
+        for chat_id in subscribers:
+            try:
+                from telegram import Bot
+                bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                await bot.send_message(
+                    chat_id=chat_id, text=msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Erreur notification copy trade: {e}")
+
+        # Ajouter au monitoring WebSocket
+        if price_monitor:
+            try:
+                await price_monitor.add_token(token_mint)
+            except:
+                pass
+
+        logger.info(f"✅ COPY TRADE exécuté: {signal.token_symbol} via {signal.wallet_label}")
+    else:
+        logger.warning(f"❌ COPY TRADE échoué: {signal.token_symbol}")
+
+
+async def copy_wallets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /copy_wallets - Voir les wallets suivis"""
+    if not copy_trader:
+        await update.message.reply_text("❌ Copy trading non initialisé.")
+        return
+
+    wallets = copy_trader.smart_wallets
+    if not wallets:
+        await update.message.reply_text("📋 Aucun wallet suivi. Ajoutez-en avec /copy\\_add")
+        return
+
+    msg = "📋 *Smart Wallets Suivis*\n\n"
+    for i, w in enumerate(wallets, 1):
+        status = "✅" if w.active else "❌"
+        msg += f"{i}. {status} *{w.label}*\n"
+        msg += f"   📍 `{w.address[:12]}...{w.address[-6:]}`\n"
+        msg += f"   📊 WR: {w.win_rate:.0f}% | ROI: {w.avg_roi:.0f}%\n"
+        msg += f"   📋 Trades copiés: {w.trades_copied}\n\n"
+
+    msg += f"\n💡 Commandes: /copy\\_add, /copy\\_remove, /copy\\_history"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def copy_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /copy_add <adresse> [label] - Ajouter un wallet à suivre"""
+    if not copy_trader:
+        await update.message.reply_text("❌ Copy trading non initialisé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /copy\\_add `<adresse_wallet>` `[label]`\n\n"
+            "Exemple: /copy\\_add 5Q544...4j1 TopTrader",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    address = context.args[0]
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else f"Wallet {len(copy_trader.smart_wallets) + 1}"
+
+    if len(address) < 32:
+        await update.message.reply_text("❌ Adresse invalide (trop courte)")
+        return
+
+    success = copy_trader.add_wallet(address, label)
+    if success:
+        msg = f"✅ *Wallet ajouté !*\n\n"
+        msg += f"👤 Label: {label}\n"
+        msg += f"📍 `{address}`\n\n"
+        msg += f"Le bot copiera automatiquement ses achats de meme coins."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        # Redémarrer le monitoring pour inclure le nouveau wallet
+        if copy_trader.running:
+            await copy_trader.stop_monitoring()
+            await copy_trader.start_monitoring()
+    else:
+        await update.message.reply_text("❌ Ce wallet est déjà dans la liste.")
+
+
+async def copy_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /copy_remove <adresse> - Retirer un wallet"""
+    if not copy_trader:
+        await update.message.reply_text("❌ Copy trading non initialisé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /copy\\_remove `<adresse_wallet>`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    address = context.args[0]
+    success = copy_trader.remove_wallet(address)
+    if success:
+        await update.message.reply_text(f"✅ Wallet retiré: `{address[:12]}...`", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("❌ Wallet non trouvé dans la liste.")
+
+
+async def copy_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /copy_history - Historique des copy trades"""
+    if not copy_trader:
+        await update.message.reply_text("❌ Copy trading non initialisé.")
+        return
+
+    history = copy_trader.copy_history
+    if not history:
+        await update.message.reply_text("📋 Aucun copy trade effectué.")
+        return
+
+    msg = "📋 *Historique Copy Trades* (derniers 10)\n\n"
+    for trade in history[-10:]:
+        emoji = "🟢" if trade["action"] == "buy" else "🔴"
+        msg += f"{emoji} {trade['action'].upper()} {trade['token']}\n"
+        msg += f"   👤 {trade['wallet']}\n"
+        msg += f"   💵 {trade['amount_sol']:.4f} SOL\n"
+        msg += f"   📅 {trade['timestamp'][:16]}\n\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+# ============================================================
 # SCAN AUTOMATIQUE + TRADING
 # ============================================================
 
@@ -995,6 +1184,10 @@ def main():
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("trending", trending_command))
     app.add_handler(CommandHandler("metas", metas_command))
+    app.add_handler(CommandHandler("copy_wallets", copy_wallets_cmd))
+    app.add_handler(CommandHandler("copy_add", copy_add_cmd))
+    app.add_handler(CommandHandler("copy_remove", copy_remove_cmd))
+    app.add_handler(CommandHandler("copy_history", copy_history_cmd))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
@@ -1007,12 +1200,19 @@ def main():
     # Démarrer le WebSocket PriceMonitor pour les positions existantes
     # (s'exécute en arrière-plan dans l'event loop)
     async def post_init(application):
-        """Callback post-init pour démarrer le WebSocket"""
+        """Callback post-init pour démarrer le WebSocket et le copy trading"""
         try:
             await start_price_monitor_for_positions()
             print("🔌 WebSocket PriceMonitor démarré !")
         except Exception as e:
             print(f"⚠️ Erreur démarrage WebSocket (fallback polling actif): {e}")
+        # Démarrer le copy trading
+        if copy_trader and auto_trading_enabled:
+            try:
+                await copy_trader.start_monitoring()
+                print(f"📋 Copy Trading démarré: {len(copy_trader.get_active_wallets())} wallets suivis")
+            except Exception as e:
+                print(f"⚠️ Erreur démarrage copy trading (polling fallback actif): {e}")
 
     app.post_init = post_init
 
