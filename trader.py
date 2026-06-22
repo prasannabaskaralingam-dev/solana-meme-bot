@@ -220,6 +220,47 @@ class WalletManager:
             logger.error(f"Erreur getTokenBalance: {e}")
             return 0.0, 0
 
+    def get_all_token_balances(self) -> list[dict]:
+        """Scanner tous les tokens détenus dans le wallet (SPL + Token-2022)"""
+        all_tokens = []
+        # Scanner les deux programmes de tokens
+        programs = [
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   # Token-2022
+        ]
+        for program_id in programs:
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        self.public_key,
+                        {"programId": program_id},
+                        {"encoding": "jsonParsed"}
+                    ]
+                }
+                response = httpx.post(self.rpc_url, json=payload, timeout=15)
+                result = response.json()
+                accounts = result.get("result", {}).get("value", [])
+                for account in accounts:
+                    info = account["account"]["data"]["parsed"]["info"]
+                    mint = info["mint"]
+                    token_amount = info["tokenAmount"]
+                    ui_amount = float(token_amount.get("uiAmount") or 0)
+                    raw_amount = int(token_amount.get("amount", "0"))
+                    if raw_amount > 0:
+                        all_tokens.append({
+                            "mint": mint,
+                            "ui_amount": ui_amount,
+                            "raw_amount": raw_amount,
+                            "decimals": token_amount.get("decimals", 6),
+                        })
+            except Exception as e:
+                logger.error(f"Erreur scan tokens ({program_id[:8]}...): {e}")
+        logger.info(f"Wallet scan: {len(all_tokens)} tokens avec solde > 0")
+        return all_tokens
+
     def export_private_key(self) -> str:
         """Exporter la clé privée en base58 (ATTENTION: sensible !)"""
         if self.keypair:

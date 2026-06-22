@@ -446,26 +446,78 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /sell_all - Vendre toutes les positions"""
-    if not trading_engine:
+    """Commande /sell_all - Vendre TOUS les tokens du wallet (scan blockchain)"""
+    if not trading_engine or not wallet.keypair:
         await update.message.reply_text("❌ Trading non initialisé.")
         return
 
-    open_pos = positions.get_open_positions()
-    if not open_pos:
-        await update.message.reply_text("📋 Aucune position à vendre.")
+    await update.message.reply_text("🔄 Scan du wallet et vente de tous les tokens en cours...")
+
+    # Scanner TOUS les tokens réels dans le wallet
+    IGNORE_MINTS = {
+        "So11111111111111111111111111111111111111112",   # Wrapped SOL
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    }
+
+    all_tokens = wallet.get_all_token_balances()
+    tokens_to_sell = [t for t in all_tokens if t["mint"] not in IGNORE_MINTS]
+
+    if not tokens_to_sell:
+        await update.message.reply_text("📋 Aucun token à vendre dans le wallet.")
         return
 
-    await update.message.reply_text(f"🔄 Vente de {len(open_pos)} positions en cours...")
+    await update.message.reply_text(f"💰 {len(tokens_to_sell)} tokens trouvés. Vente en cours...")
 
-    results = []
-    for pos in open_pos:
-        result = trading_engine.execute_sell(pos, "Sell All")
-        if result:
-            results.append(result)
-        await asyncio.sleep(2)  # Pause entre les ventes
+    sold = 0
+    failed = 0
+    for token_info in tokens_to_sell:
+        mint = token_info["mint"]
+        raw_amount = token_info["raw_amount"]
+        try:
+            # Vendre via Jupiter
+            tx_sig = swap_engine.sell_token(mint, raw_amount)
+            if tx_sig:
+                sold += 1
+                # Fermer la position si elle existe dans le tracking
+                if mint in positions.positions:
+                    pos = positions.positions[mint]
+                    trading_engine.trade_history.append({
+                        "type": "SELL",
+                        "reason": "Sell All",
+                        "token": pos.token_symbol,
+                        "token_address": mint,
+                        "pnl_pct": pos.pnl_pct,
+                        "amount_sol_invested": pos.amount_sol_invested,
+                        "tx_signature": tx_sig,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    positions.close_position(mint)
+                else:
+                    trading_engine.trade_history.append({
+                        "type": "SELL",
+                        "reason": "Sell All (orphan)",
+                        "token": mint[:8],
+                        "token_address": mint,
+                        "pnl_pct": 0,
+                        "amount_sol_invested": 0.05,
+                        "tx_signature": tx_sig,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                trading_engine._save_history()
+            else:
+                failed += 1
+        except Exception as e:
+            logger.error(f"Erreur vente {mint[:12]}...: {e}")
+            failed += 1
+        await asyncio.sleep(3)  # Pause entre les ventes
 
-    msg = f"✅ *{len(results)}/{len(open_pos)} positions vendues*"
+    msg = f"✅ *Vente terminée*\n\n"
+    msg += f"💰 Vendus: {sold}/{len(tokens_to_sell)}\n"
+    if failed:
+        msg += f"❌ Échoués: {failed}\n"
+    balance = wallet.get_sol_balance()
+    msg += f"\n💵 Nouveau solde: {balance:.4f} SOL"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -708,6 +760,58 @@ def main():
             positions.close_position(addr)
         if to_remove:
             print(f"  🧹 {len(to_remove)} positions fantômes nettoyées")
+
+    # Scanner le wallet pour récupérer les positions orphelines
+    # (tokens achetés mais perdus du tracking après un redémarrage)
+    if wallet.keypair:
+        print("🔍 Scan du wallet pour positions orphelines...")
+        try:
+            all_tokens = wallet.get_all_token_balances()
+            # Tokens connus à ignorer (stablecoins, wrapped SOL, etc.)
+            IGNORE_MINTS = {
+                "So11111111111111111111111111111111111111112",   # Wrapped SOL
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+                "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+            }
+            orphans_found = 0
+            for token_info in all_tokens:
+                mint = token_info["mint"]
+                # Ignorer les tokens déjà suivis ou connus
+                if mint in IGNORE_MINTS:
+                    continue
+                if mint in positions.positions:
+                    continue
+                # C'est un token orphelin ! Récupérer ses infos
+                try:
+                    analysis = api.analyze_token(mint)
+                    if analysis:
+                        token_name = analysis.get("name", "Unknown")
+                        token_symbol = analysis.get("symbol", "???")
+                        price_usd = float(analysis.get("price_usd", 0) or 0)
+                    else:
+                        token_name = f"Token {mint[:8]}..."
+                        token_symbol = "???"
+                        price_usd = 0
+                    # Estimer le SOL investi (on utilise 0.05 par défaut)
+                    positions.open_position(
+                        token_address=mint,
+                        token_name=token_name,
+                        token_symbol=token_symbol,
+                        entry_price=price_usd,  # On utilise le prix actuel comme référence
+                        amount_sol=0.05,  # Estimation
+                        amount_tokens=token_info["ui_amount"],
+                        strategy="recovered",
+                    )
+                    orphans_found += 1
+                    print(f"  ✅ Position récupérée: {token_name} ({token_symbol}) - {token_info['ui_amount']:.0f} tokens")
+                except Exception as e:
+                    print(f"  ⚠️ Erreur récupération {mint[:12]}...: {e}")
+            if orphans_found:
+                print(f"  📦 {orphans_found} positions orphelines récupérées !")
+            else:
+                print("  ✅ Aucune position orpheline")
+        except Exception as e:
+            print(f"  ⚠️ Erreur scan wallet: {e}")
 
     print("🤖 Démarrage du Solana Trading Bot...")
     print(f"⏱  Intervalle: {POLLING_INTERVAL}s")
