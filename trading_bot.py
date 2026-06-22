@@ -29,6 +29,7 @@ from price_monitor import PriceMonitor
 from copy_trading import CopyTradingEngine, CopyTradeSignal
 from smart_entry import SmartEntryEngine, EntrySignal
 from pnl_tracker import PnLTracker, DynamicPositionSizer
+from correlation_filter import CorrelationFilter
 
 # Logging
 logging.basicConfig(
@@ -98,6 +99,7 @@ copy_trader: CopyTradingEngine = None
 smart_entry: SmartEntryEngine = None
 pnl_tracker: PnLTracker = None
 position_sizer: DynamicPositionSizer = None
+correlation_filter: CorrelationFilter = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -119,7 +121,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -157,6 +159,11 @@ def init_trading():
     logger.info(f"📋 Copy Trading: {len(copy_trader.get_active_wallets())} wallets suivis")
     logger.info("🧠 Smart Entry Engine initialisé (double-check + volume spike)")
     logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
+    # Filtre anti-corrélation
+    correlation_filter = CorrelationFilter(data_dir=DATA_DIR)
+    correlation_filter.sync_with_positions(positions.get_open_positions())
+    logger.info(f"🎯 Filtre corrélation: {len(correlation_filter.active_narratives)} positions trackées")
+
     logger.info(f"📊 PnL Tracker: {len(pnl_tracker.trade_results)} trades chargés")
 
 
@@ -220,6 +227,10 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             if position_sizer:
                 position_sizer.record_result(pos.pnl_pct > 0)
 
+            # Retirer du filtre de corrélation
+            if correlation_filter:
+                correlation_filter.unregister_position(pos.token_address)
+
             # Blacklister si SL
             if pos.pnl_pct < 0:
                 sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
@@ -279,6 +290,7 @@ Bot de trading automatique pour meme coins Solana.
 /history - Historique des trades
 /stats - Statistiques
 /pnl - Rapport PnL détaillé (par stratégie)
+/diversity - Diversification portefeuille
 
 *⚙️ Contrôle :*
 /auto\\_on - Activer le trading auto
@@ -1049,6 +1061,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     if position_sizer:
                         position_sizer.record_result(pos.pnl_pct > 0)
 
+                    # Retirer du filtre de corrélation
+                    if correlation_filter:
+                        correlation_filter.unregister_position(pos.token_address)
+
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
                         sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
@@ -1115,6 +1131,25 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         else:
                             trading_config.momentum_position_sol = dyn_size
 
+                    # Vérifier la corrélation avant d'acheter
+                    if correlation_filter:
+                        can_buy, corr_reason = correlation_filter.can_buy(
+                            token_address=address,
+                            token_name=signal.token_name,
+                            token_symbol=signal.token_symbol,
+                            age_hours=analysis.get("age_hours")
+                        )
+                        if not can_buy:
+                            logger.info(f"{corr_reason} - Skip {signal.token_symbol}")
+                            smart_entry.consume_signal(address)
+                            seen_tokens.add(address)
+                            # Restaurer la taille
+                            if position_sizer:
+                                trading_config.position_size_sol = original_size
+                                trading_config.sniper_position_sol = original_size
+                                trading_config.momentum_position_sol = original_size
+                            continue
+
                     # Signal confirmé ! Exécuter l'achat
                     result = trading_engine.execute_buy(analysis, signal.strategy)
 
@@ -1126,6 +1161,15 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                     if result:
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)
+
+                        # Enregistrer dans le filtre de corrélation
+                        if correlation_filter:
+                            correlation_filter.register_position(
+                                token_address=address,
+                                token_name=signal.token_name,
+                                token_symbol=signal.token_symbol,
+                                age_hours=analysis.get("age_hours")
+                            )
 
                         # Notification enrichie
                         sec_info = ""
@@ -1363,6 +1407,58 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+async def diversity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /diversity - Voir la diversification du portefeuille"""
+    if not correlation_filter:
+        await update.message.reply_text("❌ Filtre corrélation non initialisé.")
+        return
+
+    # Synchroniser avec les positions actuelles
+    correlation_filter.sync_with_positions(positions.get_open_positions())
+
+    # Générer le rapport
+    msg = correlation_filter.get_status_message()
+
+    # Ajouter les commandes
+    msg += "\n*Commandes:*\n"
+    msg += "/set\\_corr off \u2014 Désactiver le filtre\n"
+    msg += "/set\\_corr on \u2014 Activer le filtre\n"
+    msg += "/set\\_corr 3 \u2014 Max 3 tokens par narratif"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def set_corr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /set_corr - Configurer le filtre anti-corrélation"""
+    if not correlation_filter:
+        await update.message.reply_text("❌ Filtre corrélation non initialisé.")
+        return
+
+    if not context.args:
+        await diversity_cmd(update, context)
+        return
+
+    arg = context.args[0].lower()
+    if arg == "off":
+        correlation_filter.config.enabled = False
+        await update.message.reply_text("❌ Filtre anti-corrélation désactivé")
+    elif arg == "on":
+        correlation_filter.config.enabled = True
+        await update.message.reply_text("✅ Filtre anti-corrélation activé")
+    else:
+        try:
+            max_per = int(arg)
+            if 1 <= max_per <= 5:
+                correlation_filter.config.max_per_narrative = max_per
+                await update.message.reply_text(
+                    f"✅ Max tokens par narratif: {max_per}"
+                )
+            else:
+                await update.message.reply_text("❌ Valeur entre 1 et 5")
+        except ValueError:
+            await update.message.reply_text("❌ Usage: /set\\_corr on|off|<1-5>", parse_mode=ParseMode.MARKDOWN)
+
+
 # ============================================================
 # COMMANDES MONITORING (reprises du bot v1)
 # ============================================================
@@ -1564,6 +1660,8 @@ def main():
     app.add_handler(CommandHandler("copy_remove", copy_remove_cmd))
     app.add_handler(CommandHandler("copy_history", copy_history_cmd))
     app.add_handler(CommandHandler("pnl", pnl_cmd))
+    app.add_handler(CommandHandler("diversity", diversity_cmd))
+    app.add_handler(CommandHandler("set_corr", set_corr))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
