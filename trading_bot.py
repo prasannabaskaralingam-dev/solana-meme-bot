@@ -31,6 +31,7 @@ from smart_entry import SmartEntryEngine, EntrySignal
 from pnl_tracker import PnLTracker, DynamicPositionSizer
 from correlation_filter import CorrelationFilter
 from liquidity_guard import LiquidityGuard
+from post_trade_analyzer import PostTradeAnalyzer
 
 # Logging
 logging.basicConfig(
@@ -102,6 +103,7 @@ pnl_tracker: PnLTracker = None
 position_sizer: DynamicPositionSizer = None
 correlation_filter: CorrelationFilter = None
 liquidity_guard: LiquidityGuard = None
+post_trade_analyzer: PostTradeAnalyzer = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -123,7 +125,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -183,6 +185,11 @@ def init_trading():
         for issue in issues:
             logger.warning(f"  {issue}")
     logger.info(f"💧 Liquidity Guard: {len(liquidity_guard.snapshots)} positions monitorées")
+
+    # Post-Trade Analyzer
+    post_trade_analyzer = PostTradeAnalyzer()
+    logger.info(f"📊 Post-Trade Analyzer: {len(post_trade_analyzer.analyses)} analyses, "
+                f"{len(post_trade_analyzer.pending_checks)} en suivi")
 
 
 # ============================================================
@@ -252,6 +259,22 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Retirer du monitoring LP
             if liquidity_guard:
                 liquidity_guard.unregister_position(pos.token_address)
+
+            # Enregistrer pour analyse post-trade
+            if post_trade_analyzer:
+                post_trade_analyzer.record_trade_exit(
+                    token_address=pos.token_address,
+                    token_symbol=pos.token_symbol,
+                    token_name=pos.token_name,
+                    strategy=pos.strategy,
+                    entry_time=pos.entry_time,
+                    entry_price=pos.entry_price_usd,
+                    exit_price=pos.current_price,
+                    exit_pnl_pct=pos.pnl_pct,
+                    exit_reason=reason,
+                    highest_price=pos.highest_price,
+                    amount_sol=pos.amount_sol_invested,
+                )
 
             # Blacklister si SL
             if pos.pnl_pct < 0:
@@ -1106,6 +1129,40 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Erreur LP monitor: {e}")
 
+    # === POST-TRADE ANALYSIS (checks post-vente) ===
+    try:
+        if post_trade_analyzer and post_trade_analyzer.pending_checks:
+            completed = post_trade_analyzer.run_pending_checks()
+            for result in completed:
+                # Notifier quand une analyse post-trade est complète
+                verdict_emoji = {
+                    "hold": "📈 Tu aurais dû garder",
+                    "perfect": "✅ Vente parfaite",
+                    "good": "👍 Bonne vente",
+                    "neutral": "➖ Neutre",
+                    "sell_earlier": "⚠️ Vendre plus tôt",
+                }.get(result["verdict"], "❓")
+
+                msg = f"📊 *POST-TRADE: {result['token_symbol']}*\n\n"
+                msg += f"Vendu à: {result['exit_pnl']:+.1f}%\n"
+                msg += f"1h après: {result['pnl_1h_after']:+.1f}%\n"
+                if result['post_max'] > result['exit_pnl']:
+                    msg += f"Max post-vente: {result['post_max']:+.1f}%\n"
+                if result['missed'] > 0:
+                    msg += f"Profit raté: {result['missed']:.0f}%\n"
+                msg += f"\n{verdict_emoji}"
+
+                for chat_id in subscribers:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id, text=msg,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except:
+                        pass
+    except Exception as e:
+        logger.error(f"Erreur post-trade analysis: {e}")
+
 
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
     """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
@@ -1160,6 +1217,22 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Retirer du monitoring LP
                     if liquidity_guard:
                         liquidity_guard.unregister_position(pos.token_address)
+
+                    # Enregistrer pour analyse post-trade
+                    if post_trade_analyzer:
+                        post_trade_analyzer.record_trade_exit(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            token_name=pos.token_name,
+                            strategy=pos.strategy,
+                            entry_time=pos.entry_time,
+                            entry_price=pos.entry_price_usd,
+                            exit_price=pos.current_price,
+                            exit_pnl_pct=pos.pnl_pct,
+                            exit_reason=reason,
+                            highest_price=pos.highest_price,
+                            amount_sol=pos.amount_sol_invested,
+                        )
 
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
@@ -1575,6 +1648,70 @@ async def set_corr(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Usage: /set\\_corr on|off|<1-5>", parse_mode=ParseMode.MARKDOWN)
 
 
+async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /insights - Analyse post-trade et recommandations"""
+    if not post_trade_analyzer:
+        await update.message.reply_text("❌ Post-Trade Analyzer non initialisé.")
+        return
+
+    insights = post_trade_analyzer.get_insights()
+
+    if insights["status"] == "no_data":
+        pending = len(post_trade_analyzer.pending_checks)
+        total = len(post_trade_analyzer.analyses)
+        msg = "📊 *Post-Trade Insights*\n\n"
+        msg += "Pas encore assez de données complètes.\n\n"
+        msg += f"Trades enregistrés: {total}\n"
+        msg += f"En cours de suivi: {pending}\n\n"
+        msg += "Les insights seront disponibles après que les premiers\n"
+        msg += "trades aient été suivis pendant 1h post-vente."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    msg = "📊 *POST-TRADE INSIGHTS*\n\n"
+
+    msg += f"🎯 *Résumé ({insights['total_analyzed']} trades analysés):*\n"
+    msg += f"  ATH moyen pendant hold: +{insights['avg_ath_during_hold']:.0f}%\n"
+    msg += f"  Profit raté moyen: {insights['avg_missed_profit']:.0f}%\n"
+    msg += f"  Temps moyen avant pump: {insights['avg_time_to_peak']:.0f} min\n\n"
+
+    msg += f"📈 *Après la vente:*\n"
+    msg += f"  Token continue à monter: {insights['continued_up_after_sell']}x\n"
+    msg += f"  Token crash après vente: {insights['crashed_after_sell']}x\n\n"
+
+    msg += f"🏆 *Verdicts:*\n"
+    verdicts = insights['verdicts']
+    verdict_labels = {
+        "hold": "📈 Garder plus longtemps",
+        "perfect": "✅ Vente parfaite",
+        "good": "👍 Bonne vente",
+        "neutral": "➖ Neutre",
+        "sell_earlier": "⚠️ Vendre plus tôt",
+    }
+    for v, count in sorted(verdicts.items(), key=lambda x: x[1], reverse=True):
+        label = verdict_labels.get(v, v)
+        msg += f"  {label}: {count}x\n"
+
+    msg += f"\n🎯 Ventes parfaites/bonnes: {insights['pct_perfect_exit']:.0f}%\n"
+    msg += f"📈 Hold trop court: {insights['pct_hold_too_short']:.0f}%\n\n"
+
+    # Recommandations
+    if insights['recommendations']:
+        msg += "*💡 Recommandations:*\n"
+        for rec in insights['recommendations']:
+            msg += f"  {rec}\n"
+
+    # Derniers trades analysés
+    recent = post_trade_analyzer.get_recent_analyses(3)
+    if recent:
+        msg += "\n*🔬 Derniers trades analysés:*\n"
+        for a in recent:
+            v_emoji = {"hold": "📈", "perfect": "✅", "good": "👍", "neutral": "➖", "sell_earlier": "⚠️"}.get(a.would_have_been_better, "❓")
+            msg += f"  {v_emoji} {a.token_symbol}: vendu {a.exit_pnl_pct:+.1f}% | 1h après: {a.pnl_1h_after:+.1f}%\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 # ============================================================
 # COMMANDES MONITORING (reprises du bot v1)
 # ============================================================
@@ -1778,6 +1915,7 @@ def main():
     app.add_handler(CommandHandler("pnl", pnl_cmd))
     app.add_handler(CommandHandler("diversity", diversity_cmd))
     app.add_handler(CommandHandler("set_corr", set_corr))
+    app.add_handler(CommandHandler("insights", insights_cmd))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
