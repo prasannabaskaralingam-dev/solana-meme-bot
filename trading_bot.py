@@ -33,6 +33,7 @@ from correlation_filter import CorrelationFilter
 from liquidity_guard import LiquidityGuard
 from post_trade_analyzer import PostTradeAnalyzer
 from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_thread
+from circuit_breaker import CircuitBreaker, CBConfig
 
 # Logging
 logging.basicConfig(
@@ -106,6 +107,7 @@ position_sizer: DynamicPositionSizer = None
 correlation_filter: CorrelationFilter = None
 liquidity_guard: LiquidityGuard = None
 post_trade_analyzer: PostTradeAnalyzer = None
+circuit_breaker: CircuitBreaker = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -127,7 +129,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -197,6 +199,31 @@ def init_trading():
     init_postmortem_db()
     logger.info("📋 Postmortem Tracker DB initialisée")
 
+    # CircuitBreaker centralisé (4 règles de sortie)
+    circuit_breaker = CircuitBreaker(CBConfig(
+        time_stop_minutes=trading_config.time_stop_minutes,
+        time_stop_min_profit=trading_config.time_stop_min_profit,
+        stop_loss_pct=trading_config.stop_loss_pct,
+        trailing_activation_pct=trading_config.trailing_activation_pct,
+        trailing_stop_pct=trading_config.trailing_stop_pct,
+        momentum_stop_drop_pct=trading_config.momentum_stop_drop_pct,
+        take_profit_pct=trading_config.take_profit_pct,
+    ))
+    # Synchroniser les positions existantes
+    existing_positions = []
+    for addr, pos in positions.positions.items():
+        existing_positions.append({
+            "token_address": addr,
+            "token_symbol": pos.token_symbol,
+            "entry_price_usd": pos.entry_price_usd,
+            "entry_time": pos.entry_time,
+            "highest_price": pos.highest_price,
+            "current_price": pos.current_price,
+        })
+    if existing_positions:
+        circuit_breaker.sync_from_existing_positions(existing_positions)
+    logger.info(f"🔌 CircuitBreaker: {len(circuit_breaker.positions)} positions synchronisées")
+
 
 # ============================================================
 # WEBSOCKET PRICE MONITOR - CALLBACKS
@@ -238,8 +265,13 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     if current_price_usd > 0:
         positions.update_position(token_address, current_price_usd)
 
-    # Vérifier TP/SL
-    should_sell, reason = trading_engine.should_sell(pos)
+    # Vérifier TP/SL via CircuitBreaker centralisé
+    if circuit_breaker:
+        cb_action = circuit_breaker.check(token_address, current_price_usd)
+        should_sell = cb_action.should_sell
+        reason = cb_action.reason
+    else:
+        should_sell, reason = trading_engine.should_sell(pos)
     if should_sell:
         result = trading_engine.execute_sell(pos, reason)
         if result:
@@ -265,6 +297,10 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Retirer du monitoring LP
             if liquidity_guard:
                 liquidity_guard.unregister_position(pos.token_address)
+
+            # Retirer du CircuitBreaker
+            if circuit_breaker:
+                circuit_breaker.close_position(pos.token_address)
 
             # Enregistrer pour analyse post-trade
             if post_trade_analyzer:
@@ -627,6 +663,8 @@ async def set_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tp = float(context.args[0])
         trading_config.take_profit_pct = tp
         save_trading_config(trading_config)
+        if circuit_breaker:
+            circuit_breaker.update_config(take_profit_pct=tp)
         await update.message.reply_text(f"✅ Take Profit mis à jour: +{tp}%")
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide")
@@ -641,6 +679,8 @@ async def set_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sl = float(context.args[0])
         trading_config.stop_loss_pct = -abs(sl)
         save_trading_config(trading_config)
+        if circuit_breaker:
+            circuit_breaker.update_config(stop_loss_pct=-abs(sl))
         await update.message.reply_text(f"✅ Stop Loss mis à jour: {trading_config.stop_loss_pct}%")
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide")
@@ -667,6 +707,8 @@ async def set_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         trading_config.trailing_activation_pct = activation
         save_trading_config(trading_config)
+        if circuit_breaker:
+            circuit_breaker.update_config(trailing_activation_pct=activation)
         await update.message.reply_text(
             f"✅ Trailing Stop mis à jour!\n"
             f"📉 Activation: dès +{activation}% de profit\n"
@@ -723,10 +765,16 @@ async def set_timestop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trading_config.time_stop_min_profit = min_profit
 
         save_trading_config(trading_config)
+        if circuit_breaker:
+            circuit_breaker.update_config(
+                time_stop_minutes=trading_config.time_stop_minutes,
+                time_stop_min_profit=trading_config.time_stop_min_profit,
+                time_stop_enabled=trading_config.time_stop_enabled,
+            )
         await update.message.reply_text(
-            f"✅ Time Stop mis \u00e0 jour!\n"
-            f"⏰ D\u00e9lai: {trading_config.time_stop_minutes:.0f} min\n"
-            f"🎯 Seuil: +{trading_config.time_stop_min_profit}% (en dessous = vente forc\u00e9e)"
+            f"✅ Time Stop mis à jour!\n"
+            f"⏰ Délai: {trading_config.time_stop_minutes:.0f} min\n"
+            f"🎯 Seuil: +{trading_config.time_stop_min_profit}% (en dessous = vente forcée)"
         )
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide. Usage: /set\\_timestop 15 5", parse_mode=ParseMode.MARKDOWN)
@@ -768,6 +816,14 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Exécuter l'achat
     result = trading_engine.execute_buy(analysis, "manual")
     if result:
+        # Enregistrer dans le CircuitBreaker
+        if circuit_breaker:
+            entry_price = float(analysis.get("price_usd", 0) or 0)
+            circuit_breaker.open_position(
+                token_address=token_address,
+                token_symbol=analysis.get("symbol", "???"),
+                entry_price=entry_price,
+            )
         msg = f"✅ *Achat réussi !*\n\n"
         msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
         msg += f"💵 Montant: {result['amount_sol']} SOL\n"
@@ -797,6 +853,9 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     result = trading_engine.execute_sell(position, "Vente manuelle")
     if result:
+        # Retirer du CircuitBreaker
+        if circuit_breaker:
+            circuit_breaker.close_position(token_address)
         msg = f"✅ *Vente réussie !*\n\n"
         msg += f"🪙 {position.token_name} (${position.token_symbol})\n"
         msg += f"📈 PnL: {result['pnl_pct']:+.1f}%\n"
@@ -841,6 +900,9 @@ async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tx_sig = swap_engine.sell_token(mint, raw_amount)
             if tx_sig:
                 sold += 1
+                # Retirer du CircuitBreaker
+                if circuit_breaker:
+                    circuit_breaker.close_position(mint)
                 # Fermer la position si elle existe dans le tracking
                 if mint in positions.positions:
                     pos = positions.positions[mint]
@@ -932,6 +994,14 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
     result = trading_engine.execute_buy(analysis, "copy_trade")
     if result:
         seen_tokens.add(token_mint)
+        # Enregistrer dans le CircuitBreaker
+        if circuit_breaker:
+            entry_price = float(analysis.get("price_usd", 0) or 0)
+            circuit_breaker.open_position(
+                token_address=token_mint,
+                token_symbol=analysis.get("symbol", signal.token_symbol),
+                entry_price=entry_price,
+            )
         # Notifier via Telegram
         msg = f"📋 *COPY TRADE*\n\n"
         msg += f"👤 Wallet: {signal.wallet_label}\n"
@@ -1215,9 +1285,14 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             if current_price > 0:
                 positions.update_position(pos.token_address, current_price)
 
-            # Vérifier si on doit vendre
-            should_sell, reason = trading_engine.should_sell(pos)
-            if should_sell:
+            # Vérifier si on doit vendre via CircuitBreaker centralisé
+            if circuit_breaker:
+                cb_action = circuit_breaker.check(pos.token_address, current_price)
+                should_sell_now = cb_action.should_sell
+                reason = cb_action.reason
+            else:
+                should_sell_now, reason = trading_engine.should_sell(pos)
+            if should_sell_now:
                 result = trading_engine.execute_sell(pos, reason)
                 if result:
                     # Enregistrer dans le PnL tracker
@@ -1242,6 +1317,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Retirer du monitoring LP
                     if liquidity_guard:
                         liquidity_guard.unregister_position(pos.token_address)
+
+                    # Retirer du CircuitBreaker
+                    if circuit_breaker:
+                        circuit_breaker.close_position(pos.token_address)
 
                     # Enregistrer pour analyse post-trade
                     if post_trade_analyzer:
@@ -1393,6 +1472,15 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)
 
+                        # Enregistrer dans le CircuitBreaker
+                        if circuit_breaker:
+                            entry_price = float(analysis.get("price_usd", 0) or 0)
+                            circuit_breaker.open_position(
+                                token_address=address,
+                                token_symbol=signal.token_symbol,
+                                entry_price=entry_price,
+                            )
+
                         # Enregistrer dans le filtre de corrélation
                         if correlation_filter:
                             correlation_filter.register_position(
@@ -1513,6 +1601,14 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
+                    # Enregistrer dans le CircuitBreaker
+                    if circuit_breaker:
+                        entry_price = float(analysis.get("price_usd", 0) or 0)
+                        circuit_breaker.open_position(
+                            token_address=address,
+                            token_symbol=analysis.get("symbol", "???"),
+                            entry_price=entry_price,
+                        )
                     # Enregistrer LP pour monitoring
                     if liquidity_guard:
                         liq_usd = analysis.get("liquidity_usd", 0)
@@ -1747,6 +1843,38 @@ async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+async def cb_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /cb_stats - Stats du CircuitBreaker"""
+    if not circuit_breaker:
+        await update.message.reply_text("❌ CircuitBreaker non initialisé.")
+        return
+
+    stats = circuit_breaker.get_stats()
+    msg = "🔌 *CircuitBreaker Stats*\n\n"
+    msg += f"📊 Checks effectués: {stats['total_checks']}\n"
+    msg += f"🟢 Positions actives: {stats['active_positions']}\n"
+    msg += f"📈 Trailing actif: {stats['trailing_active']}\n\n"
+    msg += "*Déclenchements:*\n"
+    msg += f"  ⏰ Time Stop: {stats['time_stop_triggered']}\n"
+    msg += f"  🛑 Stop Loss: {stats['stop_loss_triggered']}\n"
+    msg += f"  📉 Trailing: {stats['trailing_triggered']}\n"
+    msg += f"  📉 Momentum Stop: {stats['momentum_stop_triggered']}\n"
+    msg += f"  🎯 Take Profit: {stats['take_profit_triggered']}\n\n"
+
+    # Status des positions actives
+    if circuit_breaker.positions:
+        msg += "*Positions actives:*\n"
+        for addr, pos in circuit_breaker.positions.items():
+            status = circuit_breaker.get_position_status(addr)
+            if status:
+                emoji = "🟢" if status['pnl_pct'] >= 0 else "🔴"
+                trail = " 📉" if status['trailing_activated'] else ""
+                msg += f"  {emoji} {status['symbol']}: {status['pnl_pct']:+.1f}%{trail}\n"
+                msg += f"     ATH: {status['highest_pnl']:+.1f}% | Age: {status['age_minutes']:.0f}min\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 # ============================================================
 # COMMANDES MONITORING (reprises du bot v1)
 # ============================================================
@@ -1951,6 +2079,7 @@ def main():
     app.add_handler(CommandHandler("diversity", diversity_cmd))
     app.add_handler(CommandHandler("set_corr", set_corr))
     app.add_handler(CommandHandler("insights", insights_cmd))
+    app.add_handler(CommandHandler("cb_stats", cb_stats_cmd))
 
     # Job de monitoring des positions (rapide, toutes les 15s pour SL/TP réactif)
     # Le polling reste en backup au cas où le WebSocket ne couvre pas tous les tokens
