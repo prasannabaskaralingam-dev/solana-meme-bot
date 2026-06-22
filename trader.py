@@ -16,6 +16,7 @@ from datetime import datetime
 
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
+from postmortem_tracker import start_postmortem_thread, init_db as init_postmortem_db
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +603,7 @@ class TradingEngine:
         self.last_trade_time = 0
         self.trade_history: list[dict] = []
         self._load_history()
+        init_postmortem_db()
 
     def _load_history(self):
         """Charger l'historique des trades"""
@@ -877,6 +879,18 @@ class TradingEngine:
             }
             self.trade_history.append(trade_record)
             self._save_history()
+
+            # Postmortem Tracker — thread dédié 30min post-vente
+            try:
+                start_postmortem_thread(
+                    trade_record=trade_record,
+                    entry_price_usd=position.entry_price_usd,
+                    helius_api_key=os.environ.get("HELIUS_API_KEY", ""),
+                    telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                    telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                )
+            except Exception as e:
+                logger.error(f"Postmortem thread error: {e}")
 
             return trade_record
         return None
