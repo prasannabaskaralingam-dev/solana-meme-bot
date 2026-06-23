@@ -1309,15 +1309,19 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             # Récupérer le prix actuel via DexScreener
             analysis = api.analyze_token(pos.token_address)
-            if not analysis:
-                continue
+            current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
 
-            current_price = float(analysis.get("price_usd", 0) or 0)
+            # Si prix indisponible, utiliser le dernier prix connu
+            # (le Time Stop doit pouvoir agir même sans prix frais)
             if current_price <= 0:
-                continue
-
-            # Mettre à jour la position
-            positions.update_position(pos.token_address, current_price)
+                current_price = pos.current_price or pos.entry_price_usd
+                if current_price <= 0:
+                    continue  # Aucun prix connu, impossible de vérifier
+                logger.warning(f"[SNIPER 3s] Prix indisponible pour {pos.token_symbol}, "
+                              f"utilise last_price=${current_price:.8f}")
+            else:
+                # Mettre à jour la position avec le prix frais
+                positions.update_position(pos.token_address, current_price)
 
             # Heartbeat watchdog (cette position est surveillée)
             if capital_watchdog:
@@ -1538,11 +1542,17 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
         try:
             # Mettre à jour le prix
             analysis = api.analyze_token(pos.token_address)
-            if not analysis:
-                continue
+            current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
 
-            current_price = float(analysis.get("price_usd", 0) or 0)
-            if current_price > 0:
+            # Si prix indisponible, utiliser le dernier prix connu
+            # (le Time Stop doit pouvoir agir même sans prix frais)
+            if current_price <= 0:
+                current_price = pos.current_price or pos.entry_price_usd
+                if current_price <= 0:
+                    continue
+                logger.warning(f"[CHECK 15s] Prix indisponible pour {pos.token_symbol}, "
+                              f"utilise last_price=${current_price:.8f}")
+            else:
                 positions.update_position(pos.token_address, current_price)
 
             # Heartbeat watchdog
