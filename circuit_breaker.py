@@ -1,11 +1,11 @@
 """
 CircuitBreaker — Module centralisé de gestion des sorties.
 
-3 règles de sortie actives :
-  RÈGLE 1 — Time Stop : > 15 min sans +20% → sortie
-  RÈGLE 2 — SL Universel : -25% depuis l'achat → sortie TOUJOURS
+4 règles de sortie (ordre de priorité) :
+  RÈGLE 1 — SL Universel : -25% depuis l'achat → sortie TOUJOURS (PRIORITÉ ABSOLUE)
+  RÈGLE 2 — Take Profit : +20% → vente immédiate
   RÈGLE 3 — Trailing Stop : dès +15% atteint → SL à -10% du max
-  BONUS  — Take Profit : +20% → vente immédiate
+  RÈGLE 4 — Time Stop : > 15 min sans +20% → sortie
 
 Usage:
   cb = CircuitBreaker()              # 1 fois au démarrage
@@ -213,25 +213,25 @@ class CircuitBreaker:
         # VÉRIFICATION DES RÈGLES (ordre de priorité)
         # ============================================================
 
-        # 🎯 TAKE PROFIT — +20% = vente immédiate
-        if pos.pnl_pct >= self.config.take_profit_pct:
-            self._stats["take_profit_triggered"] += 1
-            return CBAction(
-                should_sell=True,
-                reason=f"🎯 Take Profit ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
-                rule="take_profit",
-                pnl_pct=pos.pnl_pct,
-                age_minutes=pos.age_minutes,
-                highest_pnl=pos.pnl_at_high,
-            )
-
-        # 🛑 RÈGLE 2 — SL Universel (-25% → sortie TOUJOURS)
+        # 🛑 RÈGLE 1 — SL Universel (-25% → sortie TOUJOURS, PRIORITÉ ABSOLUE)
         if pos.pnl_pct <= self.config.stop_loss_pct:
             self._stats["stop_loss_triggered"] += 1
             return CBAction(
                 should_sell=True,
                 reason=f"🛑 SL Universel ({pos.pnl_pct:.1f}% ≤ {self.config.stop_loss_pct}%)",
                 rule="stop_loss",
+                pnl_pct=pos.pnl_pct,
+                age_minutes=pos.age_minutes,
+                highest_pnl=pos.pnl_at_high,
+            )
+
+        # 🎯 RÈGLE 2 — Take Profit (+20% = vente immédiate)
+        if pos.pnl_pct >= self.config.take_profit_pct:
+            self._stats["take_profit_triggered"] += 1
+            return CBAction(
+                should_sell=True,
+                reason=f"🎯 Take Profit ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
+                rule="take_profit",
                 pnl_pct=pos.pnl_pct,
                 age_minutes=pos.age_minutes,
                 highest_pnl=pos.pnl_at_high,
