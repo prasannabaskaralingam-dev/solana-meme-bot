@@ -1312,13 +1312,13 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
 
             # Si prix indisponible, utiliser le dernier prix connu
-            # (le Time Stop doit pouvoir agir même sans prix frais)
+            # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
             if current_price <= 0:
-                current_price = pos.current_price or pos.entry_price_usd
+                current_price = pos.current_price  # dernier prix connu
                 if current_price <= 0:
-                    continue  # Aucun prix connu, impossible de vérifier
+                    current_price = pos.entry_price_usd * 0.01  # assumer -99% si jamais vu
                 logger.warning(f"[SNIPER 3s] Prix indisponible pour {pos.token_symbol}, "
-                              f"utilise last_price=${current_price:.8f}")
+                              f"utilise fallback=${current_price:.8f}")
             else:
                 # Mettre à jour la position avec le prix frais
                 positions.update_position(pos.token_address, current_price)
@@ -1545,13 +1545,13 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
 
             # Si prix indisponible, utiliser le dernier prix connu
-            # (le Time Stop doit pouvoir agir même sans prix frais)
+            # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
             if current_price <= 0:
-                current_price = pos.current_price or pos.entry_price_usd
+                current_price = pos.current_price  # dernier prix connu
                 if current_price <= 0:
-                    continue
+                    current_price = pos.entry_price_usd * 0.01  # assumer -99% si jamais vu
                 logger.warning(f"[CHECK 15s] Prix indisponible pour {pos.token_symbol}, "
-                              f"utilise last_price=${current_price:.8f}")
+                              f"utilise fallback=${current_price:.8f}")
             else:
                 positions.update_position(pos.token_address, current_price)
 
