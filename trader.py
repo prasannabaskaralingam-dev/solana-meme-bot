@@ -802,8 +802,8 @@ class TradingEngine:
             return trade_record
         return None
 
-    def execute_sell(self, position: Position, reason: str) -> Optional[dict]:
-        """Exécuter une vente"""
+    def execute_sell(self, position: Position, reason: str, sell_pct: float = 100.0) -> Optional[dict]:
+        """Exécuter une vente (sell_pct: 100=tout, 50=partial TP)"""
         token_mint = position.token_address
 
         # Récupérer le solde réel du token (ui_amount ET raw_amount)
@@ -813,25 +813,38 @@ class TradingEngine:
             self.positions.close_position(token_mint)
             return None
 
-        logger.info(f"[SELL] Token balance: ui={ui_amount}, raw={raw_amount}")
+        # Partial sell: vendre seulement un % de la position
+        sell_amount = int(raw_amount * (sell_pct / 100.0))
+        if sell_amount <= 0:
+            sell_amount = raw_amount
+        is_partial = sell_pct < 100.0
 
-        # Utiliser le raw_amount directement (unités atomiques correctes)
-        tx_sig = self.swap.sell_token(token_mint, raw_amount)
+        logger.info(f"[SELL] Token balance: ui={ui_amount}, raw={raw_amount}, "
+                    f"selling {sell_pct}% = {sell_amount}")
+
+        # Utiliser le sell_amount (partiel ou total)
+        tx_sig = self.swap.sell_token(token_mint, sell_amount)
 
         if tx_sig:
             self.last_trade_time = time.time()
 
-            # Fermer la position
-            closed_position = self.positions.close_position(token_mint)
+            # Fermer la position SEULEMENT si vente totale
+            if not is_partial:
+                closed_position = self.positions.close_position(token_mint)
+            else:
+                # Partial: mettre à jour le montant investi
+                position.amount_sol_invested *= (1 - sell_pct / 100.0)
+                closed_position = None
 
             # Enregistrer
             trade_record = {
-                "type": "SELL",
+                "type": "SELL" if not is_partial else "PARTIAL_SELL",
                 "reason": reason,
                 "strategy": position.strategy,
                 "token": position.token_symbol,
                 "token_address": token_mint,
                 "pnl_pct": position.pnl_pct,
+                "sell_pct": sell_pct,
                 "amount_sol_invested": position.amount_sol_invested,
                 "tx_signature": tx_sig,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -839,17 +852,18 @@ class TradingEngine:
             self.trade_history.append(trade_record)
             self._save_history()
 
-            # Postmortem Tracker — thread dédié 30min post-vente
-            try:
-                start_postmortem_thread(
-                    trade_record=trade_record,
-                    entry_price_usd=position.entry_price_usd,
-                    helius_api_key=os.environ.get("HELIUS_API_KEY", ""),
-                    telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-                    telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
-                )
-            except Exception as e:
-                logger.error(f"Postmortem thread error: {e}")
+            # Postmortem Tracker — seulement pour ventes totales
+            if not is_partial:
+                try:
+                    start_postmortem_thread(
+                        trade_record=trade_record,
+                        entry_price_usd=position.entry_price_usd,
+                        helius_api_key=os.environ.get("HELIUS_API_KEY", ""),
+                        telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                        telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                    )
+                except Exception as e:
+                    logger.error(f"Postmortem thread error: {e}")
 
             return trade_record
         return None

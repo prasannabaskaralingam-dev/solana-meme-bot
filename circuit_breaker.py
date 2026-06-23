@@ -32,8 +32,9 @@ class CBConfig:
 
     # RÈGLE 1 — Time Stop
     time_stop_enabled: bool = True
-    time_stop_minutes: float = 15.0       # Max 15 min
-    time_stop_min_profit: float = 20.0    # Sortie si pas +20% après 15 min
+    time_stop_minutes: float = 15.0       # Max 15 min (sniper)
+    time_stop_minutes_recovered: float = 30.0  # Max 30 min (recovered)
+    time_stop_min_profit: float = 20.0    # Sortie si pas +20% après X min
 
     # RÈGLE 2 — SL Universel
     stop_loss_pct: float = -25.0          # -25% = sortie TOUJOURS
@@ -41,18 +42,21 @@ class CBConfig:
     # RÈGLE 3 — Trailing Stop
     trailing_enabled: bool = True
     trailing_activation_pct: float = 20.0  # Dès +20% atteint
-    trailing_stop_pct: float = 10.0        # SL à -10% du max
+    trailing_stop_pct: float = 15.0        # SL à -15% du max (base)
     # Paliers pour moonshots
-    trailing_tight_pct: float = 8.0        # -8% si ATH > +50%
-    trailing_ultra_tight_pct: float = 6.0  # -6% si ATH > +100%
+    trailing_tight_pct: float = 10.0       # -10% si ATH > +50%
+    trailing_ultra_tight_pct: float = 8.0  # -8% si ATH > +100%
 
     # RÈGLE 4 — Momentum Stop (DÉSACTIVÉ - redondant avec Trailing)
     momentum_stop_enabled: bool = False
-    momentum_stop_drop_pct: float = 15.0   # Chute de 15% depuis ATH
-    momentum_stop_min_pump: float = 5.0    # Le token doit avoir pumpé au moins +5%
+    momentum_stop_drop_pct: float = 15.0
+    momentum_stop_min_pump: float = 5.0
 
-    # Take Profit (bonus)
-    take_profit_pct: float = 20.0          # +20% = vente immédiate
+    # Take Profit
+    take_profit_pct: float = 20.0          # +20% = déclenche la vente
+    partial_tp_enabled: bool = True        # Vendre 50% au TP, garder 50%
+    partial_tp_sell_pct: float = 50.0      # % de la position à vendre au TP
+    partial_tp_done: bool = False          # Track si partial TP déjà fait (par position)
 
 
 # ============================================================
@@ -66,9 +70,11 @@ class CBPosition:
     token_symbol: str
     entry_price: float
     entry_time: float          # timestamp Unix
+    strategy: str = "sniper"    # sniper, recovered, manual
     highest_price: float = 0.0  # ATH depuis l'achat
     current_price: float = 0.0
     trailing_activated: bool = False
+    partial_tp_done: bool = False  # True si 50% déjà vendu au TP
 
     @property
     def age_minutes(self) -> float:
@@ -155,13 +161,15 @@ class CircuitBreaker:
     # ----------------------------------------------------------
 
     def open_position(self, token_address: str, token_symbol: str,
-                      entry_price: float, entry_time: Optional[float] = None) -> CBPosition:
+                      entry_price: float, entry_time: Optional[float] = None,
+                      strategy: str = "sniper") -> CBPosition:
         """Enregistrer une nouvelle position à surveiller"""
         pos = CBPosition(
             token_address=token_address,
             token_symbol=token_symbol,
             entry_price=entry_price,
             entry_time=entry_time or time.time(),
+            strategy=strategy,
             highest_price=entry_price,
             current_price=entry_price,
         )
@@ -227,19 +235,37 @@ class CircuitBreaker:
                 highest_pnl=pos.pnl_at_high,
             )
 
-        # 🎯 RÈGLE 2 — Take Profit (+20% = vente immédiate)
+        # 🎯 RÈGLE 2 — Take Profit (+20%)
+        # Partial TP: vendre 50% au TP, laisser 50% courir avec trailing
         if pos.pnl_pct >= self.config.take_profit_pct:
-            self._stats["take_profit_triggered"] += 1
-            logger.warning(f"\n{'='*50}\n🎯 TAKE PROFIT DÉCLENCHÉ: {pos.token_symbol} "
-                          f"({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)\n{'='*50}")
-            return CBAction(
-                should_sell=True,
-                reason=f"🎯 Take Profit ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
-                rule="take_profit",
-                pnl_pct=pos.pnl_pct,
-                age_minutes=pos.age_minutes,
-                highest_pnl=pos.pnl_at_high,
-            )
+            if self.config.partial_tp_enabled and not pos.partial_tp_done:
+                # Premier TP: vendre 50% seulement
+                pos.partial_tp_done = True
+                self._stats["take_profit_triggered"] += 1
+                logger.warning(f"\n{'='*50}\n🎯 PARTIAL TP (50%): {pos.token_symbol} "
+                              f"({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)\n{'='*50}")
+                return CBAction(
+                    should_sell=True,
+                    reason=f"🎯 Partial TP 50% ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
+                    rule="partial_take_profit",
+                    pnl_pct=pos.pnl_pct,
+                    age_minutes=pos.age_minutes,
+                    highest_pnl=pos.pnl_at_high,
+                )
+            elif not self.config.partial_tp_enabled:
+                # Pas de partial: vendre 100%
+                self._stats["take_profit_triggered"] += 1
+                logger.warning(f"\n{'='*50}\n🎯 TAKE PROFIT DÉCLENCHÉ: {pos.token_symbol} "
+                              f"({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)\n{'='*50}")
+                return CBAction(
+                    should_sell=True,
+                    reason=f"🎯 Take Profit ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
+                    rule="take_profit",
+                    pnl_pct=pos.pnl_pct,
+                    age_minutes=pos.age_minutes,
+                    highest_pnl=pos.pnl_at_high,
+                )
+            # Si partial_tp_done = True, on laisse courir → trailing gère la suite
 
         # 📉 RÈGLE 3 — Trailing Stop (dès +15% → SL à -10% du max)
         if self.config.trailing_enabled:
@@ -313,8 +339,14 @@ class CircuitBreaker:
         return None
 
     def _check_time_stop(self, pos: CBPosition) -> Optional[CBAction]:
-        """RÈGLE 1 — Time Stop (> 15 min sans +20%)"""
-        if pos.age_minutes < self.config.time_stop_minutes:
+        """RÈGLE 4 — Time Stop (> 15 min sniper / > 30 min recovered sans +20%)"""
+        # Time stop adapté par stratégie
+        if pos.strategy == "recovered":
+            time_limit = self.config.time_stop_minutes_recovered
+        else:
+            time_limit = self.config.time_stop_minutes
+
+        if pos.age_minutes < time_limit:
             return None
 
         # Si le PnL est sous le seuil (+20%), sortie forcée
@@ -397,6 +429,7 @@ class CircuitBreaker:
                 token_symbol=p.get("token_symbol", "???"),
                 entry_price=p.get("entry_price_usd", 0),
                 entry_time=entry_time or time.time(),
+                strategy=p.get("strategy", "sniper"),
                 highest_price=p.get("highest_price", p.get("entry_price_usd", 0)),
                 current_price=p.get("current_price", p.get("entry_price_usd", 0)),
             )

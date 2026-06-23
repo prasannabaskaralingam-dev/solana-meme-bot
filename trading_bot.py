@@ -35,6 +35,7 @@ from post_trade_analyzer import PostTradeAnalyzer
 from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_thread
 from circuit_breaker import CircuitBreaker, CBConfig
 from capital_watchdog import CapitalWatchdog, WatchdogConfig
+from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
 
 # Logging
 logging.basicConfig(
@@ -108,6 +109,7 @@ liquidity_guard: LiquidityGuard = None
 post_trade_analyzer: PostTradeAnalyzer = None
 circuit_breaker: CircuitBreaker = None
 capital_watchdog: CapitalWatchdog = None
+daily_pnl_guard: DailyPnLGuard = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -116,8 +118,31 @@ seen_tokens: set = set()  # Tokens déjà achetés ou rejetés
 MAX_SEEN_TOKENS = 500  # Limite pour éviter une fuite mémoire
 
 # Blacklist post-SL: tokens qui ont déclenché un Stop Loss (ne pas racheter)
-sl_blacklist: dict = {}  # {token_address: timestamp_expiry}
 SL_BLACKLIST_DURATION = 3600  # 1 heure de blacklist après un SL
+BLACKLIST_FILE = os.path.join(DATA_DIR, "sl_blacklist.json")
+
+def _load_blacklist() -> dict:
+    """Charger la blacklist depuis le disque (supprimer les entrées expirées)"""
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            with open(BLACKLIST_FILE, "r") as f:
+                data = json.load(f)
+            # Nettoyer les entrées expirées
+            now = time.time()
+            return {k: v for k, v in data.items() if v > now}
+        except:
+            pass
+    return {}
+
+def _save_blacklist():
+    """Sauvegarder la blacklist sur disque"""
+    try:
+        with open(BLACKLIST_FILE, "w") as f:
+            json.dump(sl_blacklist, f)
+    except:
+        pass
+
+sl_blacklist: dict = _load_blacklist()  # {token_address: timestamp_expiry}
 
 # Charger les subscribers
 SUBS_FILE = os.path.join(DATA_DIR, "bot_data.json")
@@ -129,7 +154,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog, daily_pnl_guard
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -223,6 +248,7 @@ def init_trading():
             "entry_time": pos.entry_time,
             "highest_price": pos.highest_price,
             "current_price": pos.current_price,
+            "strategy": pos.strategy,
         })
     if existing_positions:
         circuit_breaker.sync_from_existing_positions(existing_positions)
@@ -244,6 +270,14 @@ def init_trading():
             entry_price=pos.entry_price_usd,
         )
     logger.info(f"🛡️ Capital Watchdog: {len(capital_watchdog.positions)} positions surveillées")
+
+    # Daily PnL Guard (circuit breaker global)
+    daily_pnl_guard = DailyPnLGuard(DailyPnLGuardConfig(
+        max_daily_loss_sol=-0.05,
+        max_consecutive_sl=3,
+        pause_duration_minutes=60.0,
+    ))
+    logger.info("⛔ Daily PnL Guard: actif (pause après -0.05 SOL/jour ou 3 SL consécutifs)")
 
 
 # ============================================================
@@ -312,6 +346,10 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Mettre à jour le position sizer (streak)
             if position_sizer:
                 position_sizer.record_result(pos.pnl_pct > 0)
+            # Daily PnL Guard
+            if daily_pnl_guard:
+                pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
+                daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(reason and "SL" in reason))
 
             # Retirer du filtre de corrélation
             if correlation_filter:
@@ -362,6 +400,7 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
             # Blacklister si SL
             if pos.pnl_pct < 0:
                 sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                _save_blacklist()
                 seen_tokens.add(pos.token_address)
                 logger.info(f"🚫 Blacklisté après SL (WS): {pos.token_name}")
 
@@ -1332,59 +1371,75 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             cb_action = circuit_breaker.check(pos.token_address, current_price)
 
             if cb_action.should_sell:
-                result = trading_engine.execute_sell(pos, cb_action.reason)
+                # Partial TP: vendre 50% seulement, garder la position ouverte
+                is_partial = cb_action.rule == "partial_take_profit"
+                sell_pct = 50.0 if is_partial else 100.0
+
+                result = trading_engine.execute_sell(pos, cb_action.reason, sell_pct=sell_pct)
                 if result:
-                    # PnL tracker
-                    if pnl_tracker:
-                        pnl_tracker.record_trade(
-                            token_address=pos.token_address,
-                            token_symbol=pos.token_symbol,
-                            strategy=pos.strategy,
-                            entry_time=pos.entry_time,
-                            amount_sol=pos.amount_sol_invested,
-                            pnl_pct=pos.pnl_pct,
-                            exit_reason=cb_action.reason,
-                        )
-                    if position_sizer:
-                        position_sizer.record_result(pos.pnl_pct > 0)
-                    if correlation_filter:
-                        correlation_filter.unregister_position(pos.token_address)
-                    if liquidity_guard:
-                        liquidity_guard.unregister_position(pos.token_address)
-                    if circuit_breaker:
-                        circuit_breaker.close_position(pos.token_address)
-                        if capital_watchdog:
-                            capital_watchdog.unregister_position(pos.token_address)
-                    if post_trade_analyzer:
-                        post_trade_analyzer.record_trade_exit(
-                            token_address=pos.token_address,
-                            token_symbol=pos.token_symbol,
-                            token_name=pos.token_name,
-                            strategy=pos.strategy,
-                            entry_time=pos.entry_time,
-                            entry_price=pos.entry_price_usd,
-                            exit_price=pos.current_price,
-                            exit_pnl_pct=pos.pnl_pct,
-                            exit_reason=cb_action.reason,
-                            highest_price=pos.highest_price,
-                            amount_sol=pos.amount_sol_invested,
-                        )
-                    # Blacklister si perte
-                    if pos.pnl_pct < 0:
-                        sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
-                        seen_tokens.add(pos.token_address)
-                    # Retirer du WS
-                    if price_monitor:
+                    if is_partial:
+                        # Partial TP: ne PAS fermer la position, le trailing gère la suite
+                        logger.info(f"[SNIPER 3s] Partial TP 50% exécuté pour {pos.token_symbol}")
+                    else:
+                        # Vente totale: fermer tout
+                        if pnl_tracker:
+                            pnl_tracker.record_trade(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                strategy=pos.strategy,
+                                entry_time=pos.entry_time,
+                                amount_sol=pos.amount_sol_invested,
+                                pnl_pct=pos.pnl_pct,
+                                exit_reason=cb_action.reason,
+                            )
+                        if position_sizer:
+                            position_sizer.record_result(pos.pnl_pct > 0)
+                        # Daily PnL Guard
+                        if daily_pnl_guard:
+                            pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
+                            daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(cb_action.rule == "stop_loss"))
+                        if correlation_filter:
+                            correlation_filter.unregister_position(pos.token_address)
+                        if liquidity_guard:
+                            liquidity_guard.unregister_position(pos.token_address)
+                        if circuit_breaker:
+                            circuit_breaker.close_position(pos.token_address)
+                            if capital_watchdog:
+                                capital_watchdog.unregister_position(pos.token_address)
+                        if post_trade_analyzer:
+                            post_trade_analyzer.record_trade_exit(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                token_name=pos.token_name,
+                                strategy=pos.strategy,
+                                entry_time=pos.entry_time,
+                                entry_price=pos.entry_price_usd,
+                                exit_price=pos.current_price,
+                                exit_pnl_pct=pos.pnl_pct,
+                                exit_reason=cb_action.reason,
+                                highest_price=pos.highest_price,
+                                amount_sol=pos.amount_sol_invested,
+                            )
+                        # Blacklister si perte
+                        if pos.pnl_pct < 0:
+                            sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                            _save_blacklist()
+                            seen_tokens.add(pos.token_address)
+                    # Retirer du WS seulement si vente totale
+                    if not is_partial and price_monitor:
                         try:
                             await price_monitor.remove_token(pos.token_address)
                         except:
                             pass
                     # Notifier
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
-                    msg = f"{pnl_emoji} *VENTE SNIPER (3s)*\n\n"
+                    sell_type = "PARTIAL TP 50%" if is_partial else "VENTE SNIPER (3s)"
+                    msg = f"{pnl_emoji} *{sell_type}*\n\n"
                     msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                     msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
                     msg += f"📝 Raison: {cb_action.reason}\n"
+                    if is_partial:
+                        msg += f"📊 50% vendu, 50% court avec trailing\n"
                     msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
                     for chat_id in subscribers:
                         try:
@@ -1440,6 +1495,7 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                         liquidity_guard.unregister_position(token_addr)
                         # Blacklister le token 24h
                         sl_blacklist[token_addr] = time.time() + 86400
+                        _save_blacklist()
                         # Notifier
                         msg = f"🚨 *VENTE D'URGENCE (Rug Pull)*\n\n"
                         msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
@@ -1582,6 +1638,10 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Mettre à jour le position sizer (streak)
                     if position_sizer:
                         position_sizer.record_result(pos.pnl_pct > 0)
+                    # Daily PnL Guard
+                    if daily_pnl_guard:
+                        pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
+                        daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(cb_action.rule == "stop_loss"))
 
                     # Retirer du filtre de corrélation
                     if correlation_filter:
@@ -1632,6 +1692,7 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                     # Si c'est un Stop Loss, blacklister le token
                     if pos.pnl_pct < 0:
                         sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                        _save_blacklist()
                         seen_tokens.add(pos.token_address)
                         logger.info(f"🚫 Blacklisté après SL: {pos.token_name} (1h)")
 
@@ -1645,6 +1706,7 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                             del security_checker._cache[pos.token_address]
                         # Blacklister le token pour 24h
                         sl_blacklist[pos.token_address] = time.time() + 86400
+                        _save_blacklist()
 
                     # Notifier
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
@@ -1673,6 +1735,11 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
     # SNIPER DÉSACTIVÉ — plus de nouveaux achats auto
     # Le monitoring des positions existantes reste actif (sniper_monitor_job 3s)
     return
+
+    # Daily PnL Guard: ne pas trader si en pause
+    if daily_pnl_guard and daily_pnl_guard.is_paused():
+        logger.info(f"[SCAN] Trading en pause: {daily_pnl_guard.get_pause_reason()}")
+        return
     try:
         # === PHASE 1: Confirmer les tokens en watchlist (prioritaire) ===
         if smart_entry:
@@ -2169,6 +2236,103 @@ async def cb_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# HEARTBEAT + STATUS UNIFIÉ + UNPAUSE
+# ============================================================
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    """Heartbeat Telegram toutes les 30 min — confirme que le bot est actif"""
+    open_pos = len(positions.get_open_positions()) if positions else 0
+    cb_checks = circuit_breaker._stats["total_checks"] if circuit_breaker else 0
+    
+    # Daily PnL Guard status
+    guard_status = ""
+    if daily_pnl_guard:
+        stats = daily_pnl_guard.get_stats()
+        if stats["is_paused"]:
+            guard_status = f"\n⛔ {stats['pause_reason']}"
+        else:
+            guard_status = f"\n💰 PnL jour: {stats['daily_pnl_sol']:+.4f} SOL ({stats['trades_today']} trades)"
+    
+    msg = f"💚 *Bot Actif*\n"
+    msg += f"📊 Positions: {open_pos}\n"
+    msg += f"🔍 Checks CB: {cb_checks}\n"
+    msg += guard_status
+    
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            pass
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status — Vue unifiée de tout le système"""
+    msg = "📊 *STATUS COMPLET*\n\n"
+    
+    # 1. Solde
+    if wallet:
+        sol_balance = wallet.get_sol_balance()
+        msg += f"💰 *Solde:* {sol_balance:.4f} SOL\n\n"
+    
+    # 2. Positions ouvertes
+    open_pos = positions.get_open_positions() if positions else []
+    msg += f"🟢 *Positions ouvertes:* {len(open_pos)}\n"
+    for pos in open_pos:
+        emoji = '🟢' if pos.pnl_pct >= 0 else '🔴'
+        msg += f"  {emoji} {pos.token_symbol}: {pos.pnl_pct:+.1f}% ({pos.age_minutes:.0f}min)\n"
+    msg += "\n"
+    
+    # 3. CircuitBreaker
+    if circuit_breaker:
+        stats = circuit_breaker.get_stats()
+        msg += f"🔌 *CircuitBreaker:*\n"
+        msg += f"  Checks: {stats['total_checks']} | "
+        msg += f"SL: {stats['stop_loss_triggered']} | "
+        msg += f"TP: {stats['take_profit_triggered']} | "
+        msg += f"Trail: {stats['trailing_triggered']} | "
+        msg += f"TS: {stats['time_stop_triggered']}\n\n"
+    
+    # 4. Daily PnL Guard
+    if daily_pnl_guard:
+        guard = daily_pnl_guard.get_stats()
+        status_emoji = '⛔' if guard['is_paused'] else '✅'
+        msg += f"{status_emoji} *Daily Guard:*\n"
+        msg += f"  PnL jour: {guard['daily_pnl_sol']:+.4f} SOL\n"
+        msg += f"  Trades: {guard['trades_today']} | SL consécutifs: {guard['consecutive_sl']}/{guard['max_consecutive_sl']}\n"
+        if guard['is_paused']:
+            msg += f"  {guard['pause_reason']}\n"
+        msg += "\n"
+    
+    # 5. Watchdog
+    if capital_watchdog:
+        wd_stats = capital_watchdog.get_stats()
+        msg += f"🛡️ *Watchdog:*\n"
+        msg += f"  Checks: {wd_stats.get('total_checks', 0)} | "
+        msg += f"Max gap: {wd_stats.get('max_gap_seen', 0):.1f}s\n\n"
+    
+    # 6. Config active
+    msg += f"⚙️ *Config:*\n"
+    msg += f"  TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
+    msg += f"  Trailing: dès +20% / -{circuit_breaker.config.trailing_stop_pct}%\n" if circuit_breaker else ""
+    msg += f"  Time Stop: {trading_config.time_stop_minutes}min (sniper) / 30min (recovered)\n"
+    msg += f"  Partial TP: 50% au TP, 50% trailing\n"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def unpause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unpause — Forcer la reprise du trading après une pause Daily Guard"""
+    if daily_pnl_guard:
+        daily_pnl_guard.force_unpause()
+        await update.message.reply_text("✅ Pause levée. Trading repris.")
+    else:
+        await update.message.reply_text("❌ Daily PnL Guard non initialisé.")
+
+
+# ============================================================
 # COMMANDES MONITORING (reprises du bot v1)
 # ============================================================
 
@@ -2306,6 +2470,17 @@ def main():
                         token_name = analysis.get("name", "Unknown")
                         token_symbol = analysis.get("symbol", "???")
                         price_usd = float(analysis.get("price_usd", 0) or 0)
+                        # Filtre qualité Recovered: vérifier volume et liquidité
+                        volume_24h = float(analysis.get("volume_24h", 0) or 0)
+                        liquidity = float(analysis.get("liquidity_usd", 0) or 0)
+                        buy_sell_ratio = float(analysis.get("buy_sell_ratio", 1.0) or 1.0)
+                        # Minimum: $500 volume 24h ET $1000 liquidité
+                        if volume_24h < 500:
+                            print(f"  ⚠️ Skip {token_symbol}: volume trop faible (${volume_24h:.0f} < $500)")
+                            continue
+                        if liquidity < 1000:
+                            print(f"  ⚠️ Skip {token_symbol}: liquidité trop faible (${liquidity:.0f} < $1000)")
+                            continue
                     else:
                         token_name = f"Token {mint[:8]}..."
                         token_symbol = "???"
@@ -2374,6 +2549,8 @@ def main():
     app.add_handler(CommandHandler("insights", insights_cmd))
     app.add_handler(CommandHandler("cb_stats", cb_stats_cmd))
     app.add_handler(CommandHandler("watchdog", watchdog_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("unpause", unpause_cmd))
 
     # Job SNIPER ultra-rapide (3s) - SL/TP réactif pour positions sniper
     job_queue = app.job_queue
@@ -2387,6 +2564,9 @@ def main():
 
     # Job de scan pour nouvelles opportunités (toutes les 45s)
     job_queue.run_repeating(auto_trading_job, interval=POLLING_INTERVAL, first=20)
+
+    # Heartbeat Telegram (30min) - confirme que le bot est actif
+    job_queue.run_repeating(heartbeat_job, interval=1800, first=60)
 
     # Démarrer le WebSocket PriceMonitor pour les positions existantes
     # (s'exécute en arrière-plan dans l'event loop)
