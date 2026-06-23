@@ -40,7 +40,7 @@ class CBConfig:
 
     # RÈGLE 3 — Trailing Stop
     trailing_enabled: bool = True
-    trailing_activation_pct: float = 15.0  # Dès +15% atteint
+    trailing_activation_pct: float = 20.0  # Dès +20% atteint
     trailing_stop_pct: float = 10.0        # SL à -10% du max
     # Paliers pour moonshots
     trailing_tight_pct: float = 8.0        # -8% si ATH > +50%
