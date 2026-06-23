@@ -1669,6 +1669,9 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
     """Scanner et trader automatiquement avec Smart Entry (double-check)"""
+    # SNIPER DÉSACTIVÉ — plus de nouveaux achats auto
+    # Le monitoring des positions existantes reste actif (sniper_monitor_job 3s)
+    return
     try:
         # === PHASE 1: Confirmer les tokens en watchlist (prioritaire) ===
         if smart_entry:
