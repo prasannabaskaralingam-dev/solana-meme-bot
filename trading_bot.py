@@ -534,9 +534,10 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"✅ *Trading automatique ACTIVÉ*\n\n"
     msg += f"💵 Solde: {balance:.4f} SOL\n"
     msg += f"📊 Stratégie:\n"
-    msg += f"  • Sniper Only: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
+    msg += f"  • Recovered Only: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
+    msg += f"  • Sniper: ❌ Désactivé\n"
     msg += f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
-    msg += f"\n⚠️ Le bot va acheter/vendre automatiquement !"
+    msg += f"\n⚠️ Le bot surveille et protège le capital automatiquement !"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
