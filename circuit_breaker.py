@@ -216,6 +216,8 @@ class CircuitBreaker:
         # 🛑 RÈGLE 1 — SL Universel (-25% → sortie TOUJOURS, PRIORITÉ ABSOLUE)
         if pos.pnl_pct <= self.config.stop_loss_pct:
             self._stats["stop_loss_triggered"] += 1
+            logger.warning(f"\n{'='*50}\n🛑 SL UNIVERSEL DÉCLENCHÉ: {pos.token_symbol} "
+                          f"({pos.pnl_pct:.1f}% ≤ {self.config.stop_loss_pct}%)\n{'='*50}")
             return CBAction(
                 should_sell=True,
                 reason=f"🛑 SL Universel ({pos.pnl_pct:.1f}% ≤ {self.config.stop_loss_pct}%)",
@@ -228,6 +230,8 @@ class CircuitBreaker:
         # 🎯 RÈGLE 2 — Take Profit (+20% = vente immédiate)
         if pos.pnl_pct >= self.config.take_profit_pct:
             self._stats["take_profit_triggered"] += 1
+            logger.warning(f"\n{'='*50}\n🎯 TAKE PROFIT DÉCLENCHÉ: {pos.token_symbol} "
+                          f"({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)\n{'='*50}")
             return CBAction(
                 should_sell=True,
                 reason=f"🎯 Take Profit ({pos.pnl_pct:+.1f}% ≥ +{self.config.take_profit_pct}%)",
@@ -242,6 +246,8 @@ class CircuitBreaker:
             action = self._check_trailing(pos)
             if action and action.should_sell:
                 self._stats["trailing_triggered"] += 1
+                logger.warning(f"\n{'='*50}\n📉 TRAILING STOP DÉCLENCHÉ: {pos.token_symbol} "
+                              f"(ATH {pos.pnl_at_high:+.1f}%, now {pos.pnl_pct:+.1f}%)\n{'='*50}")
                 return action
 
         # ⏰ RÈGLE 1 — Time Stop (> 15 min sans +20%)
@@ -249,6 +255,8 @@ class CircuitBreaker:
             action = self._check_time_stop(pos)
             if action and action.should_sell:
                 self._stats["time_stop_triggered"] += 1
+                logger.warning(f"\n{'='*50}\n⏰ TIME STOP DÉCLENCHÉ: {pos.token_symbol} "
+                              f"({pos.age_minutes:.0f}min, PnL {pos.pnl_pct:+.1f}%)\n{'='*50}")
                 return action
 
         # 📉 RÈGLE 4 — Momentum Stop (ATH -15% + token avait pumpé)

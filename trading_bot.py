@@ -257,7 +257,7 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     """
     global sl_blacklist
 
-    if not auto_trading_enabled or not trading_engine:
+    if not trading_engine:
         return
 
     if token_address not in positions.positions:
@@ -1188,8 +1188,9 @@ async def watchdog_check_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Job watchdog (5s): vérifie que CHAQUE position est activement surveillée.
     Alerte immédiatement si un gap de monitoring est détecté.
+    TOURNE TOUJOURS, même si auto_trading est off (protège le capital).
     """
-    if not capital_watchdog or not auto_trading_enabled:
+    if not capital_watchdog:
         return
 
     # Vérifier la santé de toutes les positions
@@ -1297,8 +1298,9 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Job ultra-rapide (3s): vérifier UNIQUEMENT les positions SNIPER.
     Le SL universel (-25%) doit être réactif sur les tokens frais.
+    TOURNE TOUJOURS, même si auto_trading est off (protège le capital).
     """
-    if not auto_trading_enabled or not trading_engine or not circuit_breaker:
+    if not trading_engine or not circuit_breaker:
         return
 
     sniper_positions = [p for p in positions.get_open_positions() if p.strategy == "sniper"]
@@ -1402,7 +1404,7 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     """Job backup: vérifier les positions toutes les 15s (non-sniper + LP + post-trade)"""
-    if not auto_trading_enabled or not trading_engine:
+    if not trading_engine:
         return
 
     try:
