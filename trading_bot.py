@@ -573,8 +573,8 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"✅ *Trading automatique ACTIVÉ*\n\n"
     msg += f"💵 Solde: {balance:.4f} SOL\n"
     msg += f"📊 Stratégie:\n"
-    msg += f"  • Recovered Only: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
-    msg += f"  • Sniper: ❌ Désactivé\n"
+    msg += f"  • Sniper: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
+    msg += f"  • Recovered: ✅\n"
     msg += f"🎯 TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
     msg += f"\n⚠️ Le bot surveille et protège le capital automatiquement !"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -1042,6 +1042,73 @@ async def sell_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+async def close_position_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/close_position <symbol> - Fermer une position dans le tracker SANS vendre (token mort)"""
+    if not context.args:
+        await update.message.reply_text(
+            "❓ Usage: /close_position <symbol>\n"
+            "Ex: /close_position PUMPNOTFUN\n\n"
+            "Ferme la position dans le tracker sans essayer de vendre (pour les tokens morts)."
+        )
+        return
+
+    symbol = context.args[0].upper()
+
+    # Trouver la position par symbole
+    target_pos = None
+    target_addr = None
+    for addr, pos in positions.positions.items():
+        if pos.token_symbol.upper() == symbol:
+            target_pos = pos
+            target_addr = addr
+            break
+
+    if not target_pos:
+        await update.message.reply_text(f"❌ Position '{symbol}' non trouvée.")
+        return
+
+    # Fermer dans tous les systèmes
+    pnl = target_pos.pnl_pct
+    try:
+        # Enregistrer comme perte dans l'historique
+        if pnl_tracker:
+            pnl_tracker.record_trade(
+                token_address=target_addr,
+                token_symbol=target_pos.token_symbol,
+                strategy=target_pos.strategy,
+                pnl_pct=-100.0,  # Considéré comme perte totale
+                pnl_sol=-(target_pos.amount_sol_invested),
+                reason="Token mort (close_position)",
+                duration_minutes=(datetime.now() - datetime.fromisoformat(target_pos.entry_time)).total_seconds() / 60
+            )
+        # Fermer dans le CircuitBreaker
+        if circuit_breaker:
+            circuit_breaker.close_position(target_addr)
+        # Fermer dans le Watchdog
+        if capital_watchdog:
+            capital_watchdog.unregister_position(target_addr)
+        # Retirer du WebSocket
+        try:
+            if price_monitor:
+                asyncio.create_task(price_monitor.remove_token(target_addr))
+        except:
+            pass
+        # Fermer la position dans le tracker
+        positions.close_position(target_addr)
+        # Blacklister le token
+        sl_blacklist[target_addr] = time.time() + 86400  # 24h
+        _save_blacklist()
+
+        msg = f"🗑️ *Position fermée (sans vente)*\n\n"
+        msg += f"🪙 {target_pos.token_name} (${target_pos.token_symbol})\n"
+        msg += f"📉 PnL final: {pnl:+.1f}% (enregistré comme -100%)\n"
+        msg += f"💰 Perte: -{target_pos.amount_sol_invested:.4f} SOL\n"
+        msg += f"🚫 Blacklisté 24h"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur: {e}")
+
+
 # ============================================================
 # COPY TRADING - CALLBACKS & COMMANDES
 # ============================================================
@@ -1356,12 +1423,16 @@ async def watchdog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SNIPER MONITOR — POLLING 3s (UNIQUEMENT positions SNIPER)
 # ============================================================
 
+# Compteur d'échecs de vente par token (si 3 échecs → fermer la position)
+sell_fail_counter: dict = {}
+
 async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Job ultra-rapide (3s): vérifier UNIQUEMENT les positions SNIPER.
     Le SL universel (-25%) doit être réactif sur les tokens frais.
     TOURNE TOUJOURS, même si auto_trading est off (protège le capital).
     """
+    global sell_fail_counter
     if not trading_engine or not circuit_breaker:
         return
 
@@ -1400,6 +1471,53 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 sell_pct = 50.0 if is_partial else 100.0
 
                 result = trading_engine.execute_sell(pos, cb_action.reason, sell_pct=sell_pct)
+                if not result:
+                    # Vente échouée — incrémenter le compteur
+                    sell_fail_counter[pos.token_address] = sell_fail_counter.get(pos.token_address, 0) + 1
+                    fails = sell_fail_counter[pos.token_address]
+                    logger.warning(f"[SNIPER 3s] Vente échouée pour {pos.token_symbol} ({fails}/3)")
+                    if fails >= 3:
+                        # Token mort — fermer la position sans vente
+                        logger.warning(f"[SNIPER 3s] 🗑️ {pos.token_symbol}: 3 échecs de vente → fermeture forcée")
+                        if pnl_tracker:
+                            pnl_tracker.record_trade(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                strategy=pos.strategy,
+                                entry_time=pos.entry_time,
+                                amount_sol=pos.amount_sol_invested,
+                                pnl_pct=-100.0,
+                                exit_reason="Token mort (3 échecs vente)",
+                            )
+                        if daily_pnl_guard:
+                            daily_pnl_guard.record_trade(-pos.amount_sol_invested, is_stop_loss=True)
+                        circuit_breaker.close_position(pos.token_address)
+                        if capital_watchdog:
+                            capital_watchdog.unregister_position(pos.token_address)
+                        if price_monitor:
+                            try:
+                                await price_monitor.remove_token(pos.token_address)
+                            except:
+                                pass
+                        positions.close_position(pos.token_address)
+                        sl_blacklist[pos.token_address] = time.time() + 86400  # 24h
+                        _save_blacklist()
+                        del sell_fail_counter[pos.token_address]
+                        # Notifier
+                        dead_msg = f"🗑️ *TOKEN MORT*\n\n"
+                        dead_msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                        dead_msg += f"📉 3 tentatives de vente échouées\n"
+                        dead_msg += f"💰 Perte: -{pos.amount_sol_invested:.4f} SOL\n"
+                        dead_msg += f"🚫 Blacklisté 24h"
+                        for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=dead_msg,
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except:
+                                pass
+                    continue
                 if result:
                     if is_partial:
                         # Partial TP: ne PAS fermer la position, le trailing gère la suite
@@ -1756,10 +1874,6 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
     """Scanner et trader automatiquement avec Smart Entry (double-check)"""
-    # SNIPER DÉSACTIVÉ — plus de nouveaux achats auto
-    # Le monitoring des positions existantes reste actif (sniper_monitor_job 3s)
-    return
-
     # Daily PnL Guard: ne pas trader si en pause
     if daily_pnl_guard and daily_pnl_guard.is_paused():
         logger.info(f"[SCAN] Trading en pause: {daily_pnl_guard.get_pause_reason()}")
@@ -2365,7 +2479,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"⚙️ *Config:*\n"
             msg += f"  TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
             if circuit_breaker:
-                msg += f"  Trailing: dès +{circuit_breaker.config.trailing_activation_pct}% / -{circuit_breaker.config.trailing_stop_pct}%\n"
+                msg += f"  Trailing: activation +{circuit_breaker.config.trailing_activation_pct}% | SL -{circuit_breaker.config.trailing_stop_pct}% du max\n"
             msg += f"  Time Stop: {trading_config.time_stop_minutes}min (sniper) / 30min (recovered)\n"
             msg += f"  Partial TP: 50% au TP, 50% trailing\n"
         except Exception:
@@ -2590,6 +2704,7 @@ def main():
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("sell", sell_cmd))
     app.add_handler(CommandHandler("sell_all", sell_all_cmd))
+    app.add_handler(CommandHandler("close_position", close_position_cmd))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("trending", trending_command))
     app.add_handler(CommandHandler("metas", metas_command))
