@@ -2294,57 +2294,86 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/status — Vue unifiée de tout le système"""
-    msg = "📊 *STATUS COMPLET*\n\n"
-    
-    # 1. Solde
-    if wallet:
-        sol_balance = wallet.get_sol_balance()
-        msg += f"💰 *Solde:* {sol_balance:.4f} SOL\n\n"
-    
-    # 2. Positions ouvertes
-    open_pos = positions.get_open_positions() if positions else []
-    msg += f"🟢 *Positions ouvertes:* {len(open_pos)}\n"
-    for pos in open_pos:
-        emoji = '🟢' if pos.pnl_pct >= 0 else '🔴'
-        msg += f"  {emoji} {pos.token_symbol}: {pos.pnl_pct:+.1f}% ({pos.age_minutes:.0f}min)\n"
-    msg += "\n"
-    
-    # 3. CircuitBreaker
-    if circuit_breaker:
-        stats = circuit_breaker.get_stats()
-        msg += f"🔌 *CircuitBreaker:*\n"
-        msg += f"  Checks: {stats['total_checks']} | "
-        msg += f"SL: {stats['stop_loss_triggered']} | "
-        msg += f"TP: {stats['take_profit_triggered']} | "
-        msg += f"Trail: {stats['trailing_triggered']} | "
-        msg += f"TS: {stats['time_stop_triggered']}\n\n"
-    
-    # 4. Daily PnL Guard
-    if daily_pnl_guard:
-        guard = daily_pnl_guard.get_stats()
-        status_emoji = '⛔' if guard['is_paused'] else '✅'
-        msg += f"{status_emoji} *Daily Guard:*\n"
-        msg += f"  PnL jour: {guard['daily_pnl_sol']:+.4f} SOL\n"
-        msg += f"  Trades: {guard['trades_today']} | SL consécutifs: {guard['consecutive_sl']}/{guard['max_consecutive_sl']}\n"
-        if guard['is_paused']:
-            msg += f"  {guard['pause_reason']}\n"
-        msg += "\n"
-    
-    # 5. Watchdog
-    if capital_watchdog:
-        wd_stats = capital_watchdog.get_stats()
-        msg += f"🛡️ *Watchdog:*\n"
-        msg += f"  Checks: {wd_stats.get('total_checks', 0)} | "
-        msg += f"Max gap: {wd_stats.get('max_gap_seen', 0):.1f}s\n\n"
-    
-    # 6. Config active
-    msg += f"⚙️ *Config:*\n"
-    msg += f"  TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
-    msg += f"  Trailing: dès +20% / -{circuit_breaker.config.trailing_stop_pct}%\n" if circuit_breaker else ""
-    msg += f"  Time Stop: {trading_config.time_stop_minutes}min (sniper) / 30min (recovered)\n"
-    msg += f"  Partial TP: 50% au TP, 50% trailing\n"
-    
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    try:
+        msg = "📊 *STATUS COMPLET*\n\n"
+
+        # 1. Solde
+        try:
+            if wallet:
+                sol_balance = wallet.get_sol_balance()
+                msg += f"💰 *Solde:* {sol_balance:.4f} SOL\n\n"
+        except Exception:
+            msg += "💰 *Solde:* indisponible\n\n"
+
+        # 2. Positions ouvertes
+        try:
+            open_pos = positions.get_open_positions() if positions else []
+            msg += f"🟢 *Positions ouvertes:* {len(open_pos)}\n"
+            for pos in open_pos:
+                emoji = '🟢' if pos.pnl_pct >= 0 else '🔴'
+                # Calculer l'âge depuis entry_time (str ISO)
+                try:
+                    from datetime import datetime
+                    entry_dt = datetime.fromisoformat(pos.entry_time)
+                    age_min = (datetime.now() - entry_dt).total_seconds() / 60
+                except Exception:
+                    age_min = 0
+                msg += f"  {emoji} {pos.token_symbol}: {pos.pnl_pct:+.1f}% ({age_min:.0f}min)\n"
+            msg += "\n"
+        except Exception as e:
+            msg += f"🟢 *Positions:* erreur ({e})\n\n"
+
+        # 3. CircuitBreaker
+        try:
+            if circuit_breaker:
+                stats = circuit_breaker.get_stats()
+                msg += f"🔌 *CircuitBreaker:*\n"
+                msg += f"  Checks: {stats['total_checks']} | "
+                msg += f"SL: {stats['stop_loss_triggered']} | "
+                msg += f"TP: {stats['take_profit_triggered']} | "
+                msg += f"Trail: {stats['trailing_triggered']} | "
+                msg += f"TS: {stats['time_stop_triggered']}\n\n"
+        except Exception as e:
+            msg += f"🔌 *CB:* erreur ({e})\n\n"
+
+        # 4. Daily PnL Guard
+        try:
+            if daily_pnl_guard:
+                guard = daily_pnl_guard.get_stats()
+                status_emoji = '⛔' if guard['is_paused'] else '✅'
+                msg += f"{status_emoji} *Daily Guard:*\n"
+                msg += f"  PnL jour: {guard['daily_pnl_sol']:+.4f} SOL\n"
+                msg += f"  Trades: {guard['trades_today']} | SL consécutifs: {guard['consecutive_sl']}/{guard['max_consecutive_sl']}\n"
+                if guard['is_paused']:
+                    msg += f"  {guard['pause_reason']}\n"
+                msg += "\n"
+        except Exception as e:
+            msg += f"*Daily Guard:* erreur ({e})\n\n"
+
+        # 5. Watchdog
+        try:
+            if capital_watchdog:
+                wd_stats = capital_watchdog.get_stats()
+                msg += f"🛡️ *Watchdog:*\n"
+                msg += f"  Checks: {wd_stats.get('total_checks', 0)} | "
+                msg += f"Max gap: {wd_stats.get('max_gap_seen', 0):.1f}s\n\n"
+        except Exception as e:
+            msg += f"🛡️ *Watchdog:* erreur ({e})\n\n"
+
+        # 6. Config active
+        try:
+            msg += f"⚙️ *Config:*\n"
+            msg += f"  TP: +{trading_config.take_profit_pct}% | SL: {trading_config.stop_loss_pct}%\n"
+            if circuit_breaker:
+                msg += f"  Trailing: dès +{circuit_breaker.config.trailing_activation_pct}% / -{circuit_breaker.config.trailing_stop_pct}%\n"
+            msg += f"  Time Stop: {trading_config.time_stop_minutes}min (sniper) / 30min (recovered)\n"
+            msg += f"  Partial TP: 50% au TP, 50% trailing\n"
+        except Exception:
+            pass
+
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur /status: {e}")
 
 
 async def unpause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
