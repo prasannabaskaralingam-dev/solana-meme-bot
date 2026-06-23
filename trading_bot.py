@@ -290,14 +290,12 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     if capital_watchdog:
         capital_watchdog.heartbeat(token_address, current_price_usd)
 
-    # Vérifier TP/SL via CircuitBreaker centralisé
-    if circuit_breaker:
-        cb_action = circuit_breaker.check(token_address, current_price_usd)
-        should_sell = cb_action.should_sell
+    # Vérifier TP/SL via CircuitBreaker centralisé (SEUL chemin de décision)
+    if not circuit_breaker:
+        return
+    cb_action = circuit_breaker.check(token_address, current_price_usd)
+    if cb_action.should_sell:
         reason = cb_action.reason
-    else:
-        should_sell, reason = trading_engine.should_sell(pos)
-    if should_sell:
         result = trading_engine.execute_sell(pos, reason)
         if result:
             # Enregistrer dans le PnL tracker
@@ -1551,14 +1549,12 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
             if capital_watchdog:
                 capital_watchdog.heartbeat(pos.token_address, current_price)
 
-            # Vérifier si on doit vendre via CircuitBreaker centralisé
-            if circuit_breaker:
-                cb_action = circuit_breaker.check(pos.token_address, current_price)
-                should_sell_now = cb_action.should_sell
+            # Vérifier si on doit vendre via CircuitBreaker centralisé (SEUL chemin de décision)
+            if not circuit_breaker:
+                continue
+            cb_action = circuit_breaker.check(pos.token_address, current_price)
+            if cb_action.should_sell:
                 reason = cb_action.reason
-            else:
-                should_sell_now, reason = trading_engine.should_sell(pos)
-            if should_sell_now:
                 result = trading_engine.execute_sell(pos, reason)
                 if result:
                     # Enregistrer dans le PnL tracker
