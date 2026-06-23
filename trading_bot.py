@@ -747,6 +747,30 @@ async def set_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Valeur invalide")
 
 
+async def set_slippage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /set_slippage <pct> - Modifier le slippage (en %)"""
+    if not context.args:
+        current_bps = trading_config.slippage_bps if hasattr(trading_config, 'slippage_bps') else trading_engine.config.slippage_bps
+        current_pct = current_bps / 100
+        await update.message.reply_text(
+            f"💧 *Slippage actuel:* {current_pct:.0f}%\n\n"
+            f"Usage: /set\\_slippage 50 (pour 50%)\n"
+            f"Normal: 5-15% | Forcer vente: 50-80%",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    try:
+        pct = float(context.args[0])
+        if pct < 1 or pct > 99:
+            await update.message.reply_text("❌ Valeur entre 1 et 99%")
+            return
+        bps = int(pct * 100)  # Convertir % en basis points
+        trading_engine.config.slippage_bps = bps
+        await update.message.reply_text(f"✅ Slippage mis à jour: {pct:.0f}% ({bps} bps)")
+    except ValueError:
+        await update.message.reply_text("❌ Valeur invalide")
+
+
 async def set_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /set_trailing <activation_pct> - Configurer le trailing stop"""
     if not context.args:
@@ -2530,6 +2554,7 @@ def main():
     app.add_handler(CommandHandler("auto_off", auto_off))
     app.add_handler(CommandHandler("set_tp", set_tp))
     app.add_handler(CommandHandler("set_sl", set_sl))
+    app.add_handler(CommandHandler("set_slippage", set_slippage_cmd))
     app.add_handler(CommandHandler("set_trailing", set_trailing))
     app.add_handler(CommandHandler("set_timestop", set_timestop))
     app.add_handler(CommandHandler("set_size", set_size))
