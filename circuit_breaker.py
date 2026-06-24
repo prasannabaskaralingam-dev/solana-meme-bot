@@ -3,9 +3,9 @@ CircuitBreaker — Module centralisé de gestion des sorties.
 
 4 règles de sortie (ordre de priorité) :
   RÈGLE 1 — SL Universel : -25% depuis l'achat → sortie TOUJOURS (PRIORITÉ ABSOLUE)
-  RÈGLE 2 — Take Profit : +20% → vente immédiate
-  RÈGLE 3 — Trailing Stop : dès +15% atteint → SL à -10% du max
-  RÈGLE 4 — Time Stop : > 15 min sans +20% → sortie
+  RÈGLE 2 — Take Profit : +20% → vente partielle 50%
+  RÈGLE 3 — Trailing Stop : dès +20% atteint → SL à -15% du max
+  RÈGLE 4 — Time Stop : > 20 min sniper / 30 min recovered sans +20% → sortie
 
 Usage:
   cb = CircuitBreaker()              # 1 fois au démarrage
@@ -32,7 +32,7 @@ class CBConfig:
 
     # RÈGLE 1 — Time Stop
     time_stop_enabled: bool = True
-    time_stop_minutes: float = 15.0       # Max 15 min (sniper)
+    time_stop_minutes: float = 20.0       # Max 20 min (sniper)
     time_stop_minutes_recovered: float = 30.0  # Max 30 min (recovered)
     time_stop_min_profit: float = 20.0    # Sortie si pas +20% après X min
 
@@ -43,6 +43,7 @@ class CBConfig:
     trailing_enabled: bool = True
     trailing_activation_pct: float = 20.0  # Dès +20% atteint
     trailing_stop_pct: float = 15.0        # SL à -15% du max (base)
+    # NOTE: paliers moonshot ci-dessous
     # Paliers pour moonshots
     trailing_tight_pct: float = 10.0       # -10% si ATH > +50%
     trailing_ultra_tight_pct: float = 8.0  # -8% si ATH > +100%
@@ -267,7 +268,7 @@ class CircuitBreaker:
                 )
             # Si partial_tp_done = True, on laisse courir → trailing gère la suite
 
-        # 📉 RÈGLE 3 — Trailing Stop (dès +15% → SL à -10% du max)
+        # 📉 RÈGLE 3 — Trailing Stop (dès +20% → SL à -15% du max)
         if self.config.trailing_enabled:
             action = self._check_trailing(pos)
             if action and action.should_sell:
@@ -276,7 +277,7 @@ class CircuitBreaker:
                               f"(ATH {pos.pnl_at_high:+.1f}%, now {pos.pnl_pct:+.1f}%)\n{'='*50}")
                 return action
 
-        # ⏰ RÈGLE 1 — Time Stop (> 15 min sans +20%)
+        # ⏰ RÈGLE 4 — Time Stop (> 20 min sniper / 30 min recovered sans +20%)
         if self.config.time_stop_enabled:
             action = self._check_time_stop(pos)
             if action and action.should_sell:
@@ -308,7 +309,7 @@ class CircuitBreaker:
 
     def _check_trailing(self, pos: CBPosition) -> Optional[CBAction]:
         """RÈGLE 3 — Trailing Stop dynamique"""
-        # Le trailing s'active seulement si le prix a atteint +15% depuis l'entrée
+        # Le trailing s'active seulement si le prix a atteint +20% depuis l'entrée
         if pos.pnl_at_high < self.config.trailing_activation_pct:
             return None
 
@@ -339,7 +340,7 @@ class CircuitBreaker:
         return None
 
     def _check_time_stop(self, pos: CBPosition) -> Optional[CBAction]:
-        """RÈGLE 4 — Time Stop (> 15 min sniper / > 30 min recovered sans +20%)"""
+        """RÈGLE 4 — Time Stop (> 20 min sniper / > 30 min recovered sans +20%)"""
         # Time stop adapté par stratégie
         if pos.strategy == "recovered":
             time_limit = self.config.time_stop_minutes_recovered
