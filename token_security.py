@@ -55,6 +55,7 @@ class TokenSecurityChecker:
     MAX_TOP_HOLDER_PCT = 25.0  # Réduit de 30% à 25%
     MAX_CREATOR_HOLDING_PCT = 15.0  # Le créateur ne doit pas garder > 15%
     MAX_TOP5_COMBINED_PCT = 50.0  # Top 5 holders combinés < 50%
+    MAX_TOP10_COMBINED_PCT = 20.0  # Top 10 holders combinés < 20% (hors pools/burn)
     
     # Liquidité
     MIN_LP_LOCKED_PCT = 50.0  # LP doit être lockée à > 50%
@@ -118,6 +119,7 @@ class TokenSecurityChecker:
         holder_count = 0
         is_honeypot = False
         top5_combined = 0.0
+        top10_combined = 0.0
 
         # === COUCHE 1: RugCheck API ===
         rugcheck_data = self._get_rugcheck_report(token_address)
@@ -192,6 +194,9 @@ class TokenSecurityChecker:
                     # Top 5 combinés
                     top5_combined = sum(h["pct"] for h in real_holders[:5])
                     
+                    # Top 10 combinés (hors pools et burn addresses)
+                    top10_combined = sum(h["pct"] for h in real_holders[:10])
+                    
                     # Vérifier le créateur (souvent le premier holder non-pool)
                     creator = rugcheck_data.get("creator")
                     if creator:
@@ -215,6 +220,10 @@ class TokenSecurityChecker:
                 if top5_combined > self.MAX_TOP5_COMBINED_PCT:
                     reasons.append(f"🚨 Top 5 holders: {top5_combined:.1f}% (max {self.MAX_TOP5_COMBINED_PCT}%)")
                     risk_score += 150
+
+                if top10_combined > self.MAX_TOP10_COMBINED_PCT:
+                    reasons.append(f"🚨 Top 10 holders: {top10_combined:.1f}% (max {self.MAX_TOP10_COMBINED_PCT}%)")
+                    risk_score += 250  # Très critique: concentration extrême
 
                 if creator_holding_pct > self.MAX_CREATOR_HOLDING_PCT:
                     reasons.append(f"🚨 Créateur garde: {creator_holding_pct:.1f}% (max {self.MAX_CREATOR_HOLDING_PCT}%)")
@@ -336,6 +345,11 @@ class TokenSecurityChecker:
         if top5_combined > self.MAX_TOP5_COMBINED_PCT:
             is_safe = False
             rejection_reasons.append(f"Top5 = {top5_combined:.1f}%")
+
+        # 10. Top 10 holders combinés > 20% (hors pools/burn)
+        if top10_combined > self.MAX_TOP10_COMBINED_PCT:
+            is_safe = False
+            rejection_reasons.append(f"Top10 = {top10_combined:.1f}% (max {self.MAX_TOP10_COMBINED_PCT}%)")
 
         # Log les raisons de rejet
         if not is_safe and rejection_reasons:
