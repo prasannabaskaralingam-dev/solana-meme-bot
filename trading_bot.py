@@ -160,7 +160,10 @@ def init_trading():
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
-    price_monitor = PriceMonitor(on_price_update=on_realtime_price_update)
+    price_monitor = PriceMonitor(
+        on_price_update=on_realtime_price_update,
+        on_fallback_change=on_ws_fallback_change,
+    )
     # Copy Trading DÉSACTIVÉ (performances négatives)
     copy_trader = None
     smart_entry = SmartEntryEngine()
@@ -290,14 +293,37 @@ def init_trading():
 # WEBSOCKET PRICE MONITOR - CALLBACKS
 # ============================================================
 
+# Queue de notifications Telegram (le WS callback n'a pas accès au context)
+_ws_notification_queue: list = []
+
+# Prix SOL/USD caché (mis à jour périodiquement par le polling job)
+_cached_sol_price_usd: float = 150.0  # Défaut conservateur
+
+
+def update_sol_price(price_usd: float):
+    """Mettre à jour le prix SOL/USD caché (appelé par le polling job)"""
+    global _cached_sol_price_usd
+    if price_usd > 0:
+        _cached_sol_price_usd = price_usd
+
+
 async def on_realtime_price_update(token_address: str, price_sol: float, change_pct: float):
     """
-    Callback appelé en temps réel quand le prix d'un token change.
-    Vérifie instantanément le TP/SL.
+    Callback Helius WebSocket — PRIORITÉ ABSOLUE.
+    
+    Appelé en temps réel quand le prix d'un token change.
+    Pipeline: prix reçu → cb.check() EN PREMIER → SL -25% avant tout.
+    
+    Compatible avec:
+      - circuit_breaker (cb.check)
+      - capital_watchdog (.heartbeat)
+      - postmortem_tracker
+      - pnl_tracker
+      - correlation_filter
     """
     global sl_blacklist
 
-    if not trading_engine:
+    if not trading_engine or not circuit_breaker:
         return
 
     if token_address not in positions.positions:
@@ -305,118 +331,158 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
 
     pos = positions.positions[token_address]
 
-    # Convertir le prix SOL en USD (approximation)
-    # On utilise le ratio entry_price / (amount_sol / amount_tokens) pour estimer
-    # Mais plus simple: utiliser le prix SOL actuel depuis le wallet
-    sol_price_usd = 73.0  # Approximation, sera mis à jour
-    try:
-        balance_sol = wallet.get_sol_balance()
-        if balance_sol > 0:
-            # On ne peut pas facilement obtenir le prix USD du SOL ici
-            # Utiliser le prix SOL depuis DexScreener serait trop lent
-            # On utilise le ratio de prix pour calculer le PnL
-            pass
-    except:
-        pass
+    # Convertir prix SOL → USD
+    current_price_usd = price_sol * _cached_sol_price_usd
+    if current_price_usd <= 0:
+        return
 
-    # Calculer le prix USD à partir du prix SOL
-    current_price_usd = price_sol * sol_price_usd
+    # Mettre à jour la position (high watermark, PnL)
+    positions.update_position(token_address, current_price_usd)
 
-    # Mettre à jour la position
-    if current_price_usd > 0:
-        positions.update_position(token_address, current_price_usd)
-
-    # Heartbeat watchdog (cette position est surveillée)
+    # Heartbeat watchdog (cette position est surveillée activement)
     if capital_watchdog:
         capital_watchdog.heartbeat(token_address, current_price_usd)
 
-    # Vérifier TP/SL via CircuitBreaker centralisé (SEUL chemin de décision)
-    if not circuit_breaker:
-        return
+    # ━━━ PRIORITÉ ABSOLUE: cb.check() → SL -25% avant tout ━━━
     cb_action = circuit_breaker.check(token_address, current_price_usd)
-    if cb_action.should_sell:
-        reason = cb_action.reason
-        result = trading_engine.execute_sell(pos, reason)
-        if result:
-            # Enregistrer dans le PnL tracker
-            if pnl_tracker:
-                pnl_tracker.record_trade(
-                    token_address=pos.token_address,
-                    token_symbol=pos.token_symbol,
-                    strategy=pos.strategy,
-                    entry_time=pos.entry_time,
-                    amount_sol=pos.amount_sol_invested,
-                    pnl_pct=pos.pnl_pct,
-                    exit_reason=reason,
-                )
-            # Mettre à jour le position sizer (streak)
-            if position_sizer:
-                position_sizer.record_result(pos.pnl_pct > 0)
-            # Daily PnL Guard
-            if daily_pnl_guard:
-                pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
-                daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(reason and "SL" in reason))
 
-            # Retirer du filtre de corrélation
-            if correlation_filter:
-                correlation_filter.unregister_position(pos.token_address)
+    if not cb_action.should_sell:
+        return  # Pas d'action, on sort immédiatement
 
-            # Retirer du monitoring LP
-            if liquidity_guard:
-                liquidity_guard.unregister_position(pos.token_address)
+    # === VENTE DÉCLENCHÉE ===
+    reason = cb_action.reason
+    is_partial = cb_action.rule == "partial_take_profit"
+    sell_pct = 50.0 if is_partial else 100.0
 
-            # Retirer du CircuitBreaker
-            if circuit_breaker:
-                circuit_breaker.close_position(pos.token_address)
-                if capital_watchdog:
-                    capital_watchdog.unregister_position(pos.token_address)
+    result = trading_engine.execute_sell(pos, reason, sell_pct=sell_pct)
 
-            # Enregistrer pour analyse post-trade
-            if post_trade_analyzer:
-                post_trade_analyzer.record_trade_exit(
-                    token_address=pos.token_address,
-                    token_symbol=pos.token_symbol,
-                    token_name=pos.token_name,
-                    strategy=pos.strategy,
-                    entry_time=pos.entry_time,
-                    entry_price=pos.entry_price_usd,
-                    exit_price=pos.current_price,
-                    exit_pnl_pct=pos.pnl_pct,
-                    exit_reason=reason,
-                    highest_price=pos.highest_price,
-                    amount_sol=pos.amount_sol_invested,
-                )
+    if not result:
+        # Vente échouée — le fallback polling réessaiera
+        logger.warning(f"⚡ WS vente échouée: {pos.token_symbol} ({reason})")
+        return
 
-            # Postmortem Tracker (thread dédié 30min)
-            if result and pos.entry_price_usd > 0:
-                try:
-                    helius_key = os.environ.get("HELIUS_API_KEY", "")
-                    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-                    tg_chat = str(subscribers[0]) if subscribers else ""
-                    start_postmortem_thread(
-                        trade_record=result,
-                        entry_price_usd=pos.entry_price_usd,
-                        helius_api_key=helius_key,
-                        telegram_bot_token=tg_token,
-                        telegram_chat_id=tg_chat,
-                    )
-                except Exception as e:
-                    logger.error(f"Erreur postmortem thread: {e}")
+    if is_partial:
+        # Partial TP: 50% vendu, trailing gère la suite
+        logger.info(f"⚡ WS PARTIAL TP: {pos.token_symbol} +{pos.pnl_pct:.1f}%")
+        _ws_notification_queue.append({
+            "type": "partial_tp",
+            "symbol": pos.token_symbol,
+            "name": pos.token_name,
+            "pnl_pct": pos.pnl_pct,
+            "reason": reason,
+            "tx": result.get("tx_signature", ""),
+        })
+        return
 
-            # Blacklister si SL
-            if pos.pnl_pct < 0:
-                sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
-                _save_blacklist()
-                seen_tokens.add(pos.token_address)
-                logger.info(f"🚫 Blacklisté après SL (WS): {pos.token_name}")
+    # === VENTE TOTALE: cleanup complet ===
 
-            # Retirer du monitoring WS
-            if price_monitor:
-                await price_monitor.remove_token(token_address)
+    # PnL Tracker
+    if pnl_tracker:
+        pnl_tracker.record_trade(
+            token_address=pos.token_address,
+            token_symbol=pos.token_symbol,
+            strategy=pos.strategy,
+            entry_time=pos.entry_time,
+            amount_sol=pos.amount_sol_invested,
+            pnl_pct=pos.pnl_pct,
+            exit_reason=reason,
+        )
 
-            # Notifier (on ne peut pas envoyer de message Telegram depuis ici
-            # car on n'a pas le context. On log et le polling job notifiera)
-            logger.info(f"⚡ VENTE WS INSTANTANÉE: {pos.token_name} PnL: {pos.pnl_pct:+.1f}% - {reason}")
+    # Position Sizer (streak)
+    if position_sizer:
+        position_sizer.record_result(pos.pnl_pct > 0)
+
+    # Daily PnL Guard
+    if daily_pnl_guard:
+        pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
+        daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(cb_action.rule == "stop_loss"))
+
+    # Corrélation
+    if correlation_filter:
+        correlation_filter.unregister_position(pos.token_address)
+
+    # Liquidity Guard
+    if liquidity_guard:
+        liquidity_guard.unregister_position(pos.token_address)
+
+    # CircuitBreaker + Watchdog
+    circuit_breaker.close_position(pos.token_address)
+    if capital_watchdog:
+        capital_watchdog.unregister_position(pos.token_address)
+
+    # Post-Trade Analyzer
+    if post_trade_analyzer:
+        post_trade_analyzer.record_trade_exit(
+            token_address=pos.token_address,
+            token_symbol=pos.token_symbol,
+            token_name=pos.token_name,
+            strategy=pos.strategy,
+            entry_time=pos.entry_time,
+            entry_price=pos.entry_price_usd,
+            exit_price=pos.current_price,
+            exit_pnl_pct=pos.pnl_pct,
+            exit_reason=reason,
+            highest_price=pos.highest_price,
+            amount_sol=pos.amount_sol_invested,
+        )
+
+    # Postmortem Tracker (thread dédié 30min)
+    if pos.entry_price_usd > 0:
+        try:
+            helius_key = os.environ.get("HELIUS_API_KEY", "")
+            tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            tg_chat = str(subscribers[0]) if subscribers else ""
+            start_postmortem_thread(
+                trade_record=result,
+                entry_price_usd=pos.entry_price_usd,
+                helius_api_key=helius_key,
+                telegram_bot_token=tg_token,
+                telegram_chat_id=tg_chat,
+            )
+        except Exception as e:
+            logger.error(f"Erreur postmortem thread: {e}")
+
+    # Blacklister si perte
+    if pos.pnl_pct < 0:
+        sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+        _save_blacklist()
+        seen_tokens.add(pos.token_address)
+
+    # Retirer du monitoring WS
+    if price_monitor:
+        await price_monitor.remove_token(token_address)
+
+    # Notification Telegram (via queue, sera envoyée par le polling job)
+    _ws_notification_queue.append({
+        "type": "sell",
+        "symbol": pos.token_symbol,
+        "name": pos.token_name,
+        "pnl_pct": pos.pnl_pct,
+        "reason": reason,
+        "amount_sol": pos.amount_sol_invested,
+        "tx": result.get("tx_signature", ""),
+    })
+
+    logger.info(f"⚡ VENTE WS INSTANTANÉE: {pos.token_name} PnL: {pos.pnl_pct:+.1f}% - {reason}")
+
+
+async def on_ws_fallback_change(is_fallback: bool, reason: str):
+    """
+    Callback quand le WebSocket bascule entre connecté et fallback.
+    Ajoute une notification à la queue Telegram.
+    """
+    if is_fallback:
+        logger.warning(f"⚠️ FALLBACK ACTIVÉ: {reason}")
+        _ws_notification_queue.append({
+            "type": "fallback_on",
+            "reason": reason,
+        })
+    else:
+        logger.info(f"✅ WebSocket RECONNECTÉ: {reason}")
+        _ws_notification_queue.append({
+            "type": "fallback_off",
+            "reason": reason,
+        })
 
 
 async def start_price_monitor_for_positions():
@@ -1432,25 +1498,121 @@ async def watchdog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Compteur d'échecs de vente par token (si 3 échecs → fermer la position)
 sell_fail_counter: dict = {}
 
+
+async def _flush_ws_notifications(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Envoyer les notifications Telegram accumulées par le WS callback.
+    Appelé par le polling job (qui a accès au context Telegram).
+    """
+    global _ws_notification_queue
+    if not _ws_notification_queue:
+        return
+
+    # Copier et vider la queue
+    notifications = _ws_notification_queue[:]
+    _ws_notification_queue = []
+
+    for notif in notifications:
+        try:
+            msg = ""
+            if notif["type"] == "sell":
+                pnl_emoji = '✅' if notif['pnl_pct'] > 0 else '❌'
+                msg = f"{pnl_emoji} *VENTE WS INSTANTANÉE*\n\n"
+                msg += f"🪙 {notif['name']} (${notif['symbol']})\n"
+                msg += f"📈 PnL: {notif['pnl_pct']:+.1f}%\n"
+                msg += f"📝 Raison: {notif['reason']}\n"
+                msg += f"⚡ Source: Helius WebSocket (temps réel)\n"
+                if notif.get('tx'):
+                    msg += f"🔗 [TX](https://solscan.io/tx/{notif['tx']})"
+
+            elif notif["type"] == "partial_tp":
+                msg = f"✅ *PARTIAL TP 50% (WS)*\n\n"
+                msg += f"🪙 {notif['name']} (${notif['symbol']})\n"
+                msg += f"📈 PnL: {notif['pnl_pct']:+.1f}%\n"
+                msg += f"📊 50% vendu, 50% court avec trailing\n"
+                msg += f"⚡ Source: Helius WebSocket\n"
+                if notif.get('tx'):
+                    msg += f"🔗 [TX](https://solscan.io/tx/{notif['tx']})"
+
+            elif notif["type"] == "fallback_on":
+                msg = f"⚠️ *FALLBACK ACTIVÉ*\n\n"
+                msg += f"🔌 WebSocket Helius déconnecté\n"
+                msg += f"📝 {notif['reason']}\n"
+                msg += f"🔄 Polling DexScreener 3s actif\n"
+                msg += f"⚠️ Réactivité réduite (3s vs temps réel)"
+
+            elif notif["type"] == "fallback_off":
+                msg = f"✅ *WEBSOCKET RECONNECTÉ*\n\n"
+                msg += f"🔌 Helius WebSocket actif\n"
+                msg += f"📝 {notif['reason']}\n"
+                msg += f"⚡ Monitoring temps réel rétabli"
+
+            if msg:
+                for chat_id in subscribers:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id, text=msg,
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True
+                        )
+                    except:
+                        pass
+        except Exception as e:
+            logger.error(f"Erreur flush notification WS: {e}")
+
 async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job ultra-rapide (3s): vérifier UNIQUEMENT les positions SNIPER.
-    Le SL universel (-25%) doit être réactif sur les tokens frais.
+    Job FALLBACK (3s): vérifie les positions SNIPER UNIQUEMENT quand:
+      - Le WebSocket est DOWN (fallback mode)
+      - Un token n'est pas monitoré via WS (pool non supporté)
+    
+    Si le WS est connecté et le token est monitoré, ce job ne fait RIEN
+    (le WS callback gère déjà le cb.check en temps réel).
+    
     TOURNE TOUJOURS, même si auto_trading est off (protège le capital).
     """
     global sell_fail_counter
     if not trading_engine or not circuit_breaker:
         return
 
+    # === ENVOYER LES NOTIFICATIONS WS EN ATTENTE ===
+    await _flush_ws_notifications(context)
+
     sniper_positions = [p for p in positions.get_open_positions() if p.strategy == "sniper"]
     if not sniper_positions:
         return
 
+    # Déterminer quels tokens ont besoin du polling
+    ws_connected = price_monitor and price_monitor.is_connected
+    ws_monitored = set(price_monitor.monitored_pools.keys()) if price_monitor else set()
+
     for pos in sniper_positions:
         try:
-            # Récupérer le prix actuel via DexScreener
+            # SKIP si le WS gère déjà ce token (pas besoin de polling)
+            if ws_connected and pos.token_address in ws_monitored:
+                # Juste vérifier le Time Stop (pas besoin de prix frais)
+                cb_action = circuit_breaker.check(pos.token_address, pos.current_price)
+                if cb_action.should_sell and cb_action.rule == "time_stop":
+                    # Time Stop ne dépend pas du prix, on peut le déclencher ici
+                    pass  # Sera géré ci-dessous
+                else:
+                    continue  # WS gère le reste
+
+            # Récupérer le prix actuel via DexScreener (FALLBACK)
             analysis = api.analyze_token(pos.token_address)
             current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
+
+            # Mettre à jour le prix SOL/USD caché (pour le WS callback)
+            if analysis:
+                sol_price = analysis.get("sol_price_usd", 0)
+                if not sol_price:
+                    # Estimer depuis price_native et price_usd
+                    price_native = float(analysis.get("price_native", 0) or 0)
+                    price_usd = float(analysis.get("price_usd", 0) or 0)
+                    if price_native > 0 and price_usd > 0:
+                        sol_price = price_usd / price_native
+                if sol_price and sol_price > 50:  # Sanity check
+                    update_sol_price(sol_price)
 
             # Si prix indisponible, utiliser le dernier prix connu
             # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
@@ -2767,7 +2929,7 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("unpause", unpause_cmd))
 
-    # Job SNIPER ultra-rapide (3s) - SL/TP réactif pour positions sniper
+    # Job SNIPER FALLBACK (3s) - polling DexScreener seulement si WS down
     job_queue = app.job_queue
     job_queue.run_repeating(sniper_monitor_job, interval=3, first=5)
 
@@ -2803,8 +2965,9 @@ def main():
     app.post_init = post_init
 
     print("✅ Bot de trading démarré !")
-    print("🔌 WebSocket: monitoring temps réel actif (TP/SL instantané)")
-    print("⏱  Polling 15s: backup pour tokens sans pool PumpSwap")
+    print("🔌 Helius WebSocket: source PRIMAIRE de prix (temps réel)")
+    print("🔄 Polling DexScreener 3s: FALLBACK si WS down")
+    print("⚡ Pipeline: prix WS → cb.check() → SL -25% instantané")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

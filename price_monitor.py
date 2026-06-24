@@ -1,11 +1,17 @@
 """
-Price Monitor WebSocket - Monitoring en temps réel des prix via Helius WebSocket.
-Surveille les pools PumpSwap ET Raydium pour détecter TP/SL instantanément.
+Price Monitor WebSocket — Helius WebSocket comme source PRIMAIRE de prix.
+
+Architecture:
+  1. CONNEXION: wss://mainnet.helius-rpc.com?api-key=HELIUS_API_KEY
+  2. ABONNEMENT: accountSubscribe sur les vaults (base + quote) de chaque pool
+  3. ÉVÉNEMENT: accountNotification → recalcul prix → callback immédiat
+  4. HEARTBEAT: ping toutes les 30s, détection déconnexion
+  5. FALLBACK: si WS down > 5s → signale au bot de basculer en polling
+  6. UNSUBSCRIBE: accountUnsubscribe propre quand position fermée
 
 Supporte:
   - PumpSwap: parsing direct du pool account → vaults → prix
   - Raydium AMM V4: parsing des vaults via offsets connus → prix
-  - Fallback: si un pool n'est pas supporté, retourne False (polling backup)
 """
 
 import asyncio
@@ -15,8 +21,9 @@ import struct
 import logging
 import time
 import os
-from typing import Optional, Callable, Dict
-from dataclasses import dataclass
+from typing import Optional, Callable, Dict, Set
+from dataclasses import dataclass, field
+from enum import Enum
 
 import base58
 import requests
@@ -28,30 +35,40 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================
 
-# Helius WebSocket (gratuit, 2 connexions max)
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
 RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-WS_URL = os.environ.get("SOLANA_WS_URL", "")
 
-# Si pas de WS_URL défini, dériver du RPC_URL ou utiliser Helius
+# Endpoint WebSocket Helius (PRIMAIRE)
+WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+
+# Fallback: dériver du RPC si pas de clé Helius
 if not WS_URL:
-    if HELIUS_API_KEY:
-        WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    elif "helius" in RPC_URL:
-        # Extraire l'API key du RPC URL
-        WS_URL = RPC_URL.replace("https://", "wss://")
+    if "helius" in RPC_URL:
+        WS_URL = RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
     else:
         WS_URL = "wss://api.mainnet-beta.solana.com"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
-
-# DexScreener API pour trouver les pools
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/tokens"
 
+# Paramètres WebSocket
+WS_HEARTBEAT_INTERVAL = 30      # Ping toutes les 30s
+WS_RECV_TIMEOUT = 45            # Timeout réception (doit être > heartbeat)
+WS_RECONNECT_MAX_DELAY = 15     # Max delay entre reconnexions
+WS_FALLBACK_THRESHOLD = 5       # Secondes sans WS avant de signaler fallback
+
 
 # ============================================================
-# POOL STRUCTURES
+# ENUMS & DATACLASSES
 # ============================================================
+
+class MonitorStatus(Enum):
+    """État du monitoring"""
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    FALLBACK = "fallback"
+    STOPPED = "stopped"
+
 
 @dataclass
 class PoolInfo:
@@ -63,10 +80,13 @@ class PoolInfo:
     quote_mint: str
     base_decimals: int
     quote_decimals: int
-    token_address: str  # Le mint du token (pas SOL)
-    dex_type: str = "pumpswap"  # "pumpswap" ou "raydium"
+    token_address: str
+    dex_type: str = "pumpswap"
     latest_price_sol: float = 0.0
     last_update: float = 0.0
+    # Subscription IDs pour unsubscribe propre
+    base_sub_id: Optional[int] = None
+    quote_sub_id: Optional[int] = None
 
 
 # ============================================================
@@ -82,7 +102,6 @@ def fetch_pair_address(token_mint: str) -> Optional[dict]:
         data = resp.json()
         pairs = data.get("pairs", [])
 
-        # Chercher un pool PumpSwap ou Raydium sur Solana
         for pair in pairs:
             chain = pair.get("chainId", "").lower()
             if chain != "solana":
@@ -127,7 +146,7 @@ def get_spl_decimals(mint_addr: str) -> Optional[int]:
         if not result or not result.get("data"):
             return None
         raw = base64.b64decode(result["data"][0])
-        decimals = raw[44]  # u8 at offset 44 for SPL mint account
+        decimals = raw[44]
         return decimals
     except Exception as e:
         logger.error(f"Erreur get_spl_decimals {mint_addr}: {e}")
@@ -138,23 +157,12 @@ def parse_pumpswap_pool(b64_data: str) -> Optional[dict]:
     """Parser les données d'un pool PumpSwap"""
     try:
         raw = base64.b64decode(b64_data)
-        # PumpSwap Pool struct:
-        # 8 bytes discriminator
-        # 1 byte pool_bump
-        # 2 bytes index
-        # 32 bytes creator
-        # 32 bytes base_mint
-        # 32 bytes quote_mint
-        # 32 bytes lp_mint
-        # 32 bytes pool_base_token_account
-        # 32 bytes pool_quote_token_account
-        offset = 8 + 1 + 2 + 32  # skip discriminator, bump, index, creator
+        offset = 8 + 1 + 2 + 32  # discriminator + bump + index + creator
         base_mint = base58.b58encode(raw[offset:offset+32]).decode()
         offset += 32
         quote_mint = base58.b58encode(raw[offset:offset+32]).decode()
         offset += 32
-        # skip lp_mint
-        offset += 32
+        offset += 32  # skip lp_mint
         base_vault = base58.b58encode(raw[offset:offset+32]).decode()
         offset += 32
         quote_vault = base58.b58encode(raw[offset:offset+32]).decode()
@@ -173,13 +181,7 @@ def parse_pumpswap_pool(b64_data: str) -> Optional[dict]:
 def parse_raydium_amm_pool(b64_data: str) -> Optional[dict]:
     """
     Parser les données d'un pool Raydium AMM V4.
-    
-    Layout Raydium AMM V4 (offsets principaux):
-      offset 400: LP mint (32 bytes)
-      offset 432: coin_mint (base token, 32 bytes)
-      offset 464: pc_mint (quote token, 32 bytes)
-      offset 496: pool_coin_token_account (base vault, 32 bytes)
-      offset 528: pool_pc_token_account (quote vault, 32 bytes)
+    Offsets: coin_mint@432, pc_mint@464, coin_vault@496, pc_vault@528
     """
     try:
         raw = base64.b64decode(b64_data)
@@ -187,7 +189,6 @@ def parse_raydium_amm_pool(b64_data: str) -> Optional[dict]:
             logger.warning(f"Raydium pool data trop court: {len(raw)} bytes")
             return None
 
-        # Extraire les mints et vaults
         coin_mint = base58.b58encode(raw[432:464]).decode()
         pc_mint = base58.b58encode(raw[464:496]).decode()
         coin_vault = base58.b58encode(raw[496:528]).decode()
@@ -223,10 +224,8 @@ def calculate_price_sol(base_amount: int, quote_amount: int,
         return None
 
     if base_mint == SOL_MINT:
-        # base = SOL, quote = token → price = base_amount / quote_amount (ajusté)
         price = (base_amount * (10 ** quote_decimals)) / (quote_amount * (10 ** base_decimals))
     else:
-        # base = token, quote = SOL → price = quote_amount / base_amount (ajusté)
         price = (quote_amount * (10 ** base_decimals)) / (base_amount * (10 ** quote_decimals))
 
     return price
@@ -238,57 +237,95 @@ def calculate_price_sol(base_amount: int, quote_amount: int,
 
 class PriceMonitor:
     """
-    Moniteur de prix en temps réel via WebSocket.
-    Surveille les pools des positions ouvertes et déclenche des callbacks
-    quand le prix change (pour TP/SL instantané).
+    Moniteur de prix en temps réel via Helius WebSocket.
     
-    Supporte: PumpSwap + Raydium AMM V4
+    PRIORITÉ ABSOLUE: Prix reçu → cb.check() → SL -25% avant tout.
+    
+    Features:
+      - Connexion Helius WebSocket avec heartbeat 30s
+      - Reconnexion automatique avec backoff exponentiel
+      - accountSubscribe sur les vaults (base + quote)
+      - accountUnsubscribe propre quand position fermée
+      - Signalement fallback si WS down > 5s
+      - Callback immédiat sur changement de prix
     """
 
-    def __init__(self, on_price_update: Callable = None):
+    def __init__(self, on_price_update: Callable = None,
+                 on_fallback_change: Callable = None):
         """
         Args:
-            on_price_update: async callback(token_address, price_sol, price_change_pct)
+            on_price_update: async callback(token_address, price_sol, change_pct)
+                             Appelé à CHAQUE changement de prix significatif.
+            on_fallback_change: async callback(is_fallback: bool, reason: str)
+                                Appelé quand le mode bascule WS↔fallback.
         """
         self.on_price_update = on_price_update
+        self.on_fallback_change = on_fallback_change
+
+        # Pools surveillés
         self.monitored_pools: Dict[str, PoolInfo] = {}  # token_address → PoolInfo
-        self.subscription_map: Dict[int, tuple] = {}  # sub_id → (token_address, "base"|"quote")
-        self.vault_amounts: Dict[str, int] = {}  # vault_address → amount
+        self.subscription_map: Dict[int, tuple] = {}    # sub_id → (token_address, "base"|"quote", vault_addr)
+        self.vault_amounts: Dict[str, int] = {}         # vault_address → amount
+
+        # Pending subscriptions (msg_id → info)
+        self._pending_subs: Dict[int, tuple] = {}
+
+        # WebSocket state
         self._ws = None
         self._running = False
         self._reconnect_delay = 1
         self._task = None
+        self._last_msg_time: float = 0.0
+        self._status = MonitorStatus.STOPPED
+        self._was_fallback = False
+
+        # Stats
+        self._stats = {
+            "messages_received": 0,
+            "price_updates_sent": 0,
+            "reconnections": 0,
+            "last_connected": 0.0,
+            "fallback_activations": 0,
+        }
+
+    # ============================================================
+    # PUBLIC API
+    # ============================================================
 
     async def start(self):
         """Démarrer le monitoring WebSocket en arrière-plan"""
         if self._running:
             return
         self._running = True
+        self._status = MonitorStatus.RECONNECTING
         self._task = asyncio.create_task(self._ws_loop())
-        logger.info("🔌 PriceMonitor WebSocket démarré (PumpSwap + Raydium)")
+        logger.info(f"🔌 PriceMonitor démarré (Helius WS: {WS_URL[:50]}...)")
 
     async def stop(self):
         """Arrêter le monitoring"""
         self._running = False
+        self._status = MonitorStatus.STOPPED
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except:
+                pass
         if self._task:
             self._task.cancel()
-        logger.info("🔌 PriceMonitor WebSocket arrêté")
+        logger.info("🔌 PriceMonitor arrêté")
 
     async def add_token(self, token_address: str) -> bool:
         """
         Ajouter un token à surveiller.
         Trouve le pool, récupère les vaults, et s'abonne aux changements.
-        Supporte PumpSwap ET Raydium.
         """
         if token_address in self.monitored_pools:
-            return True  # Déjà surveillé
+            return True
 
         # 1. Trouver le pool via DexScreener
         pair_info = fetch_pair_address(token_address)
         if not pair_info or not pair_info.get("pair_address"):
-            logger.warning(f"⚠️ Pas de pool trouvé pour {token_address}")
+            logger.warning(f"⚠️ Pas de pool trouvé pour {token_address[:12]}")
             return False
 
         pool_address = pair_info["pair_address"]
@@ -297,7 +334,7 @@ class PriceMonitor:
         # 2. Récupérer les données du pool
         pool_data = get_account_info(pool_address)
         if not pool_data or not pool_data.get("data"):
-            logger.warning(f"⚠️ Impossible de lire le pool {pool_address}")
+            logger.warning(f"⚠️ Impossible de lire le pool {pool_address[:12]}")
             return False
 
         # 3. Parser le pool selon le DEX
@@ -322,7 +359,7 @@ class PriceMonitor:
         base_dec = get_spl_decimals(parsed["base_mint"])
         quote_dec = get_spl_decimals(parsed["quote_mint"])
         if base_dec is None or quote_dec is None:
-            logger.warning(f"⚠️ Impossible de récupérer les décimales pour {token_address}")
+            logger.warning(f"⚠️ Impossible de récupérer les décimales pour {token_address[:12]}")
             return False
 
         # 5. Créer le PoolInfo
@@ -358,60 +395,73 @@ class PriceMonitor:
                 pool_info.last_update = time.time()
 
         self.monitored_pools[token_address] = pool_info
-        logger.info(f"✅ Monitoring WS ajouté: {token_address[:12]}... "
+        logger.info(f"✅ WS monitoring: {token_address[:12]}... "
                     f"(pool: {pool_address[:8]}..., dex: {dex_type})")
 
         # 7. S'abonner via WebSocket si connecté
-        if self._ws and self._ws.open:
+        if self._ws and not self._ws.closed:
             await self._subscribe_pool(pool_info)
 
         return True
 
     async def remove_token(self, token_address: str):
-        """Retirer un token du monitoring"""
-        if token_address in self.monitored_pools:
-            pool_info = self.monitored_pools.pop(token_address)
-            # Nettoyer les vault amounts
-            self.vault_amounts.pop(pool_info.base_vault, None)
-            self.vault_amounts.pop(pool_info.quote_vault, None)
-            logger.info(f"🗑️ Monitoring WS retiré: {token_address[:12]}... ({pool_info.dex_type})")
-
-    async def _subscribe_pool(self, pool_info: PoolInfo):
-        """S'abonner aux changements des vaults d'un pool"""
-        if not self._ws or not self._ws.open:
+        """
+        Retirer un token du monitoring.
+        Envoie accountUnsubscribe propre au serveur.
+        """
+        if token_address not in self.monitored_pools:
             return
 
-        # Subscribe base vault
-        msg_id_base = hash(pool_info.base_vault) % 100000
-        await self._ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": msg_id_base,
-            "method": "accountSubscribe",
-            "params": [pool_info.base_vault, {"encoding": "base64", "commitment": "confirmed"}]
-        }))
+        pool_info = self.monitored_pools.pop(token_address)
 
-        # Subscribe quote vault
-        msg_id_quote = hash(pool_info.quote_vault) % 100000 + 100000
-        await self._ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": msg_id_quote,
-            "method": "accountSubscribe",
-            "params": [pool_info.quote_vault, {"encoding": "base64", "commitment": "confirmed"}]
-        }))
+        # Unsubscribe propre via WebSocket
+        if self._ws and not self._ws.closed:
+            await self._unsubscribe_pool(pool_info)
 
-        # Store pending subscriptions (will be mapped when confirmation arrives)
-        self._pending_subs = getattr(self, '_pending_subs', {})
-        self._pending_subs[msg_id_base] = (pool_info.token_address, "base", pool_info.base_vault)
-        self._pending_subs[msg_id_quote] = (pool_info.token_address, "quote", pool_info.quote_vault)
+        # Nettoyer les vault amounts
+        self.vault_amounts.pop(pool_info.base_vault, None)
+        self.vault_amounts.pop(pool_info.quote_vault, None)
+
+        # Nettoyer la subscription_map
+        to_remove = [sid for sid, info in self.subscription_map.items()
+                     if info[0] == token_address]
+        for sid in to_remove:
+            del self.subscription_map[sid]
+
+        logger.info(f"🗑️ WS monitoring retiré: {token_address[:12]}... ({pool_info.dex_type})")
+
+    # ============================================================
+    # WEBSOCKET CORE
+    # ============================================================
 
     async def _ws_loop(self):
-        """Boucle principale WebSocket avec reconnexion automatique"""
+        """Boucle principale WebSocket avec reconnexion automatique et heartbeat 30s"""
         while self._running:
             try:
-                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=10) as ws:
+                async with websockets.connect(
+                    WS_URL,
+                    ping_interval=WS_HEARTBEAT_INTERVAL,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    max_size=2**20,  # 1MB max message
+                ) as ws:
                     self._ws = ws
                     self._reconnect_delay = 1
-                    logger.info(f"🔌 WebSocket connecté: {WS_URL[:50]}...")
+                    self._last_msg_time = time.time()
+                    self._status = MonitorStatus.CONNECTED
+                    self._stats["last_connected"] = time.time()
+                    self._stats["reconnections"] += 1
+
+                    logger.info(f"🔌 Helius WebSocket CONNECTÉ ({len(self.monitored_pools)} pools)")
+
+                    # Si on revient de fallback, notifier
+                    if self._was_fallback:
+                        self._was_fallback = False
+                        if self.on_fallback_change:
+                            try:
+                                await self.on_fallback_change(False, "WebSocket reconnecté")
+                            except:
+                                pass
 
                     # Re-souscrire à tous les pools existants
                     self._pending_subs = {}
@@ -421,37 +471,119 @@ class PriceMonitor:
                     # Boucle de réception
                     while self._running:
                         try:
-                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
+                            self._last_msg_time = time.time()
+                            self._stats["messages_received"] += 1
                             msg = json.loads(raw_msg)
                             await self._handle_message(msg)
                         except asyncio.TimeoutError:
-                            # Pas de message depuis 60s, envoyer un ping
+                            # Pas de message depuis WS_RECV_TIMEOUT — vérifier la connexion
+                            # Le ping_interval de websockets gère le keepalive
+                            elapsed = time.time() - self._last_msg_time
+                            if elapsed > WS_RECV_TIMEOUT * 2:
+                                logger.warning(f"🔌 Pas de message depuis {elapsed:.0f}s, reconnexion...")
+                                break
                             continue
-                        except websockets.ConnectionClosed:
-                            logger.warning("🔌 WebSocket déconnecté")
+                        except websockets.ConnectionClosed as e:
+                            logger.warning(f"🔌 WebSocket déconnecté: {e.code} {e.reason}")
                             break
 
+            except (OSError, websockets.InvalidURI, websockets.InvalidHandshake) as e:
+                logger.error(f"🔌 Erreur connexion WebSocket: {e}")
             except Exception as e:
-                logger.error(f"🔌 Erreur WebSocket: {e}")
+                logger.error(f"🔌 Erreur WebSocket inattendue: {e}")
 
+            # Déconnecté — signaler le fallback
+            self._ws = None
             if self._running:
+                self._status = MonitorStatus.FALLBACK
+                if not self._was_fallback:
+                    self._was_fallback = True
+                    self._stats["fallback_activations"] += 1
+                    if self.on_fallback_change:
+                        try:
+                            await self.on_fallback_change(True, f"WebSocket down, reconnexion dans {self._reconnect_delay}s")
+                        except:
+                            pass
+
                 logger.info(f"🔄 Reconnexion dans {self._reconnect_delay}s...")
                 await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 30)
+                self._reconnect_delay = min(self._reconnect_delay * 2, WS_RECONNECT_MAX_DELAY)
+
+    async def _subscribe_pool(self, pool_info: PoolInfo):
+        """S'abonner aux changements des vaults d'un pool"""
+        if not self._ws or self._ws.closed:
+            return
+
+        # Subscribe base vault
+        msg_id_base = abs(hash(pool_info.base_vault + "base")) % 1000000
+        try:
+            await self._ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": msg_id_base,
+                "method": "accountSubscribe",
+                "params": [pool_info.base_vault, {"encoding": "base64", "commitment": "confirmed"}]
+            }))
+            self._pending_subs[msg_id_base] = (pool_info.token_address, "base", pool_info.base_vault)
+        except Exception as e:
+            logger.error(f"Erreur subscribe base vault: {e}")
+
+        # Subscribe quote vault
+        msg_id_quote = abs(hash(pool_info.quote_vault + "quote")) % 1000000
+        try:
+            await self._ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": msg_id_quote,
+                "method": "accountSubscribe",
+                "params": [pool_info.quote_vault, {"encoding": "base64", "commitment": "confirmed"}]
+            }))
+            self._pending_subs[msg_id_quote] = (pool_info.token_address, "quote", pool_info.quote_vault)
+        except Exception as e:
+            logger.error(f"Erreur subscribe quote vault: {e}")
+
+    async def _unsubscribe_pool(self, pool_info: PoolInfo):
+        """Envoyer accountUnsubscribe pour les vaults d'un pool"""
+        if not self._ws or self._ws.closed:
+            return
+
+        for sub_id in [pool_info.base_sub_id, pool_info.quote_sub_id]:
+            if sub_id is not None:
+                try:
+                    await self._ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": abs(hash(f"unsub_{sub_id}")) % 1000000,
+                        "method": "accountUnsubscribe",
+                        "params": [sub_id]
+                    }))
+                except Exception as e:
+                    logger.error(f"Erreur unsubscribe {sub_id}: {e}")
+
+    # ============================================================
+    # MESSAGE HANDLING
+    # ============================================================
 
     async def _handle_message(self, msg: dict):
-        """Traiter un message WebSocket"""
+        """Traiter un message WebSocket — PRIORITÉ: prix → cb.check()"""
+
         # Confirmation de souscription
         if "result" in msg and "id" in msg:
             msg_id = msg["id"]
             sub_id = msg["result"]
-            pending = getattr(self, '_pending_subs', {})
-            if msg_id in pending:
-                token_addr, vault_type, vault_addr = pending.pop(msg_id)
+
+            if msg_id in self._pending_subs:
+                token_addr, vault_type, vault_addr = self._pending_subs.pop(msg_id)
                 self.subscription_map[sub_id] = (token_addr, vault_type, vault_addr)
+
+                # Stocker le sub_id dans le PoolInfo pour unsubscribe
+                if token_addr in self.monitored_pools:
+                    pool = self.monitored_pools[token_addr]
+                    if vault_type == "base":
+                        pool.base_sub_id = sub_id
+                    else:
+                        pool.quote_sub_id = sub_id
             return
 
-        # Notification de changement de compte
+        # Notification de changement de compte (ÉVÉNEMENT PRIX)
         if msg.get("method") == "accountNotification":
             params = msg.get("params", {})
             sub_id = params.get("subscription")
@@ -473,7 +605,7 @@ class PriceMonitor:
             # Mettre à jour le montant
             self.vault_amounts[vault_addr] = amount
 
-            # Recalculer le prix
+            # Recalculer le prix IMMÉDIATEMENT
             if token_addr in self.monitored_pools:
                 pool_info = self.monitored_pools[token_addr]
                 base_amt = self.vault_amounts.get(pool_info.base_vault, 0)
@@ -497,12 +629,18 @@ class PriceMonitor:
                         else:
                             change_pct = 0
 
-                        # Appeler le callback si changement significatif
-                        if self.on_price_update and abs(change_pct) > 0.1:
+                        # CALLBACK IMMÉDIAT — pas de seuil minimum
+                        # Le CircuitBreaker décide, pas nous
+                        if self.on_price_update and (abs(change_pct) > 0.05 or old_price == 0):
                             try:
+                                self._stats["price_updates_sent"] += 1
                                 await self.on_price_update(token_addr, new_price, change_pct)
                             except Exception as e:
                                 logger.error(f"Erreur callback price_update: {e}")
+
+    # ============================================================
+    # PUBLIC GETTERS
+    # ============================================================
 
     def get_price(self, token_address: str) -> Optional[float]:
         """Récupérer le dernier prix connu d'un token (en SOL)"""
@@ -520,21 +658,52 @@ class PriceMonitor:
         }
 
     def get_ws_stats(self) -> dict:
-        """Statistiques du WebSocket monitoring"""
+        """Statistiques complètes du WebSocket monitoring"""
         pumpswap_count = sum(1 for p in self.monitored_pools.values() if p.dex_type == "pumpswap")
         raydium_count = sum(1 for p in self.monitored_pools.values() if p.dex_type == "raydium")
+
+        # Calculer l'uptime
+        now = time.time()
+        last_connected = self._stats.get("last_connected", 0)
+        uptime = now - last_connected if self._status == MonitorStatus.CONNECTED else 0
+
         return {
+            "status": self._status.value,
             "connected": self.is_connected,
             "total_monitored": len(self.monitored_pools),
             "pumpswap_pools": pumpswap_count,
             "raydium_pools": raydium_count,
             "subscriptions": len(self.subscription_map),
+            "messages_received": self._stats["messages_received"],
+            "price_updates_sent": self._stats["price_updates_sent"],
+            "reconnections": self._stats["reconnections"],
+            "fallback_activations": self._stats["fallback_activations"],
+            "uptime_seconds": round(uptime),
+            "last_msg_age_seconds": round(now - self._last_msg_time) if self._last_msg_time else -1,
         }
 
     @property
     def is_connected(self) -> bool:
         """Vérifier si le WebSocket est connecté"""
-        return self._ws is not None and self._ws.open
+        return self._ws is not None and not self._ws.closed
+
+    @property
+    def is_fallback(self) -> bool:
+        """Vérifier si on est en mode fallback (WS down)"""
+        if not self._running:
+            return True
+        if not self.is_connected:
+            return True
+        # Vérifier le temps depuis le dernier message
+        if self._last_msg_time > 0:
+            elapsed = time.time() - self._last_msg_time
+            return elapsed > WS_FALLBACK_THRESHOLD
+        return False
+
+    @property
+    def status(self) -> MonitorStatus:
+        """État actuel du monitoring"""
+        return self._status
 
     @property
     def monitored_count(self) -> int:
