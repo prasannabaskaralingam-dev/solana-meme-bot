@@ -36,6 +36,7 @@ from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_t
 from circuit_breaker import CircuitBreaker, CBConfig
 from capital_watchdog import CapitalWatchdog, WatchdogConfig
 from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
+from token_filter import TokenFilter
 
 # Logging
 logging.basicConfig(
@@ -110,6 +111,7 @@ post_trade_analyzer: PostTradeAnalyzer = None
 circuit_breaker: CircuitBreaker = None
 capital_watchdog: CapitalWatchdog = None
 daily_pnl_guard: DailyPnLGuard = None
+token_filter: TokenFilter = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -154,7 +156,7 @@ if os.path.exists(SUBS_FILE):
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
-    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog, daily_pnl_guard
+    global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog, daily_pnl_guard, token_filter
     swap_engine = JupiterSwap(wallet, trading_config)
     trading_engine = TradingEngine(trading_config, wallet, swap_engine, positions)
     security_checker = TokenSecurityChecker(rpc_url=trading_config.rpc_url)
@@ -196,8 +198,12 @@ def init_trading():
     logger.info("📋 Copy Trading: DÉSACTIVÉ")
     logger.info("🧠 Smart Entry Engine initialisé (SNIPER ONLY - tokens < 1h)")
     logger.info(f"💰 Position Sizer: {trading_config.position_size_sol} SOL (dynamique 0.02-0.15)")
-    # Filtre anti-corrélation
-    correlation_filter = CorrelationFilter(data_dir=DATA_DIR)
+    # Token Filter on-chain (mint authority + LP burned + deployer)
+    token_filter = TokenFilter(rpc_url=trading_config.rpc_url)
+    logger.info("🔍 Token Filter on-chain initialisé (mint/LP/deployer)")
+
+    # Filtre anti-corrélation (RENFORCÉ avec deployer on-chain)
+    correlation_filter = CorrelationFilter(data_dir=DATA_DIR, token_filter=token_filter)
     correlation_filter.sync_with_positions(positions.get_open_positions())
     logger.info(f"🎯 Filtre corrélation: {len(correlation_filter.active_narratives)} positions trackées")
 
@@ -1846,6 +1852,13 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                         if cached_report:
                             # Invalider le cache pour ce token
                             del security_checker._cache[pos.token_address]
+                        # NOUVEAU: Blacklister le DEPLOYER (pas juste le token)
+                        if correlation_filter:
+                            deployer_rug = correlation_filter.get_deployer_for_token(pos.token_address)
+                            if deployer_rug:
+                                correlation_filter.blacklist_deployer(
+                                    deployer_rug, reason=f"Rug pull {pos.token_symbol} ({pos.pnl_pct:.0f}%)"
+                                )
                         # Blacklister le token pour 24h
                         sl_blacklist[pos.token_address] = time.time() + 86400
                         _save_blacklist()
@@ -1926,12 +1939,17 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 trading_config.sniper_position_sol = original_size
                             continue
 
-                    # Vérifier la corrélation avant d'acheter
+                    # Vérifier la corrélation avant d'acheter (RENFORCÉ: deployer on-chain)
                     if correlation_filter:
+                        # Récupérer le deployer depuis token_filter si disponible
+                        deployer_addr = None
+                        if token_filter:
+                            deployer_addr = token_filter.get_deployer(address)
                         can_buy, corr_reason = correlation_filter.can_buy(
                             token_address=address,
                             token_name=signal.token_name,
                             token_symbol=signal.token_symbol,
+                            deployer=deployer_addr,
                             age_hours=analysis.get("age_hours")
                         )
                         if not can_buy:
@@ -1972,12 +1990,16 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 entry_price=float(analysis.get("price_usd", 0) or 0),
                             )
 
-                        # Enregistrer dans le filtre de corrélation
+                        # Enregistrer dans le filtre de corrélation (avec deployer on-chain)
                         if correlation_filter:
+                            deployer_for_reg = None
+                            if token_filter:
+                                deployer_for_reg = token_filter.get_deployer(address)
                             correlation_filter.register_position(
                                 token_address=address,
                                 token_name=signal.token_name,
                                 token_symbol=signal.token_symbol,
+                                deployer=deployer_for_reg,
                                 age_hours=analysis.get("age_hours")
                             )
 
@@ -2056,7 +2078,17 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             if not analysis:
                 continue
 
-            # 🛡️ FILTRE ANTI-RUG RENFORCÉ (avant toute décision d'achat)
+            # 🔍 FILTRE ON-CHAIN RAPIDE (mint authority + freeze) — 1 seul appel RPC
+            if token_filter:
+                mint_ok, mint_reason = await token_filter.quick_mint_check(address)
+                if not mint_ok:
+                    logger.info(f"🚫 REJETÉ (on-chain): {analysis.get('name', address[:12])} - {mint_reason}")
+                    seen_tokens.add(address)
+                    if len(seen_tokens) > MAX_SEEN_TOKENS:
+                        seen_tokens.clear()
+                    continue
+
+            # 🛡️ FILTRE ANTI-RUG RENFORCÉ (RugCheck + holders + LP)
             if security_checker:
                 # Déterminer la stratégie pour adapter la sévérité
                 token_age = analysis.get('age_hours', 999)
@@ -2069,6 +2101,20 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         seen_tokens.clear()
                     continue
                 logger.info(f"✅ Token sûr: {analysis.get('name', address[:12])} - {security_reason}")
+
+            # 🔥 FILTRE LP BURNED (vérification on-chain indépendante)
+            if token_filter:
+                pair_addr = analysis.get('pair_address', '')
+                if pair_addr:
+                    tf_result = await token_filter.check(
+                        address, require_lp_burned=True, pair_address=pair_addr
+                    )
+                    if not tf_result.is_safe:
+                        logger.info(f"🚫 REJETÉ (LP check): {analysis.get('name', address[:12])} - {tf_result.rejection_reason}")
+                        seen_tokens.add(address)
+                        if len(seen_tokens) > MAX_SEEN_TOKENS:
+                            seen_tokens.clear()
+                        continue
 
             # 🧠 SMART ENTRY: Premier check (ajouter à la watchlist si prometteur)
             if smart_entry:

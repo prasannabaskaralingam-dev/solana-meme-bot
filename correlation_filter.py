@@ -115,18 +115,27 @@ class CorrelationFilter:
     
     Empêche d'acheter trop de tokens du même narratif, du même dev,
     ou lancés au même moment (probable même dev/scam).
+    
+    RENFORCÉ: récupère le deployer on-chain via TokenFilter et maintient
+    une blacklist de devs scammers.
     """
 
-    def __init__(self, data_dir: str = "/var/data/solana-bot"):
+    def __init__(self, data_dir: str = "/var/data/solana-bot", token_filter=None):
         self.config = CorrelationConfig()
         self.data_dir = data_dir
         self.data_file = os.path.join(data_dir, "correlation_data.json")
+        
+        # Référence au TokenFilter pour récupérer le deployer on-chain
+        self.token_filter = token_filter
         
         # Cache des narratifs détectés pour les positions ouvertes
         self.active_narratives: Dict[str, TokenNarrative] = {}
         
         # Historique des deployers vus
         self.deployer_cache: Dict[str, str] = {}  # token_address -> deployer
+        
+        # Blacklist des deployers scammers (adresses ayant rug pull)
+        self.deployer_blacklist: Set[str] = set()
         
         # Clusters temporels (tokens lancés en même temps)
         self.time_clusters: Dict[str, List[str]] = {}  # cluster_id -> [token_addresses]
@@ -140,6 +149,7 @@ class CorrelationFilter:
                 with open(self.data_file, "r") as f:
                     data = json.load(f)
                 self.deployer_cache = data.get("deployer_cache", {})
+                self.deployer_blacklist = set(data.get("deployer_blacklist", []))
         except Exception as e:
             logger.error(f"Erreur chargement correlation data: {e}")
 
@@ -149,6 +159,7 @@ class CorrelationFilter:
             os.makedirs(self.data_dir, exist_ok=True)
             data = {
                 "deployer_cache": self.deployer_cache,
+                "deployer_blacklist": list(self.deployer_blacklist),
                 "last_updated": datetime.utcnow().isoformat(),
             }
             with open(self.data_file, "w") as f:
@@ -276,6 +287,35 @@ class CorrelationFilter:
                     pos.token_address, pos.token_name, pos.token_symbol
                 )
 
+    def blacklist_deployer(self, deployer_address: str, reason: str = ""):
+        """
+        Blacklister un deployer (après un rug pull détecté).
+        Tous ses futurs tokens seront automatiquement rejetés.
+        """
+        if deployer_address and deployer_address != "unknown":
+            self.deployer_blacklist.add(deployer_address)
+            self._save_data()
+            logger.warning(f"🚨 Deployer blacklisté: {deployer_address[:12]}... ({reason})")
+
+    def get_deployer_for_token(self, token_address: str) -> Optional[str]:
+        """
+        Récupérer le deployer d'un token.
+        Cherche d'abord dans le cache, puis via TokenFilter si disponible.
+        """
+        # Cache local
+        if token_address in self.deployer_cache:
+            return self.deployer_cache[token_address]
+        
+        # Via TokenFilter (cache du module on-chain)
+        if self.token_filter:
+            deployer = self.token_filter.get_deployer(token_address)
+            if deployer:
+                self.deployer_cache[token_address] = deployer
+                self._save_data()
+                return deployer
+        
+        return None
+
     def can_buy(self, token_address: str, token_name: str, token_symbol: str,
                 deployer: Optional[str] = None, age_hours: Optional[float] = None) -> Tuple[bool, str]:
         """
@@ -286,6 +326,14 @@ class CorrelationFilter:
         """
         if not self.config.enabled:
             return True, "Filtre corrélation désactivé"
+
+        # 0. NOUVEAU: Récupérer le deployer on-chain si pas fourni
+        if not deployer or deployer == "unknown":
+            deployer = self.get_deployer_for_token(token_address)
+
+        # 0b. NOUVEAU: Vérifier la blacklist de deployers
+        if deployer and deployer in self.deployer_blacklist:
+            return False, f"🚨 Deployer BLACKLISTÉ (scammer connu): {deployer[:12]}..."
 
         # 1. Détecter les narratifs du nouveau token
         new_narratives = self.detect_narratives(token_name, token_symbol)
@@ -306,7 +354,7 @@ class CorrelationFilter:
                 return False, (f"🚫 Corrélation: max {self.config.max_per_narrative} tokens "
                               f"'{narr}' atteint (existants: {', '.join(existing)})")
         
-        # 4. Vérifier le même deployer
+        # 4. Vérifier le même deployer (RENFORCÉ: utilise le deployer on-chain)
         if deployer and deployer != "unknown":
             same_deployer_count = sum(
                 1 for addr, dep in self.deployer_cache.items()

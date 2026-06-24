@@ -1,6 +1,11 @@
 """
 Price Monitor WebSocket - Monitoring en temps réel des prix via Helius WebSocket.
-Surveille les pools PumpSwap/Raydium pour détecter TP/SL instantanément.
+Surveille les pools PumpSwap ET Raydium pour détecter TP/SL instantanément.
+
+Supporte:
+  - PumpSwap: parsing direct du pool account → vaults → prix
+  - Raydium AMM V4: parsing des vaults via offsets connus → prix
+  - Fallback: si un pool n'est pas supporté, retourne False (polling backup)
 """
 
 import asyncio
@@ -59,6 +64,7 @@ class PoolInfo:
     base_decimals: int
     quote_decimals: int
     token_address: str  # Le mint du token (pas SOL)
+    dex_type: str = "pumpswap"  # "pumpswap" ou "raydium"
     latest_price_sol: float = 0.0
     last_update: float = 0.0
 
@@ -164,6 +170,40 @@ def parse_pumpswap_pool(b64_data: str) -> Optional[dict]:
         return None
 
 
+def parse_raydium_amm_pool(b64_data: str) -> Optional[dict]:
+    """
+    Parser les données d'un pool Raydium AMM V4.
+    
+    Layout Raydium AMM V4 (offsets principaux):
+      offset 400: LP mint (32 bytes)
+      offset 432: coin_mint (base token, 32 bytes)
+      offset 464: pc_mint (quote token, 32 bytes)
+      offset 496: pool_coin_token_account (base vault, 32 bytes)
+      offset 528: pool_pc_token_account (quote vault, 32 bytes)
+    """
+    try:
+        raw = base64.b64decode(b64_data)
+        if len(raw) < 560:
+            logger.warning(f"Raydium pool data trop court: {len(raw)} bytes")
+            return None
+
+        # Extraire les mints et vaults
+        coin_mint = base58.b58encode(raw[432:464]).decode()
+        pc_mint = base58.b58encode(raw[464:496]).decode()
+        coin_vault = base58.b58encode(raw[496:528]).decode()
+        pc_vault = base58.b58encode(raw[528:560]).decode()
+
+        return {
+            "base_mint": coin_mint,
+            "quote_mint": pc_mint,
+            "base_vault": coin_vault,
+            "quote_vault": pc_vault,
+        }
+    except Exception as e:
+        logger.error(f"Erreur parse_raydium_amm_pool: {e}")
+        return None
+
+
 def parse_token_account_amount(b64_data: str) -> Optional[int]:
     """Extraire le montant d'un token account"""
     try:
@@ -201,6 +241,8 @@ class PriceMonitor:
     Moniteur de prix en temps réel via WebSocket.
     Surveille les pools des positions ouvertes et déclenche des callbacks
     quand le prix change (pour TP/SL instantané).
+    
+    Supporte: PumpSwap + Raydium AMM V4
     """
 
     def __init__(self, on_price_update: Callable = None):
@@ -223,7 +265,7 @@ class PriceMonitor:
             return
         self._running = True
         self._task = asyncio.create_task(self._ws_loop())
-        logger.info("🔌 PriceMonitor WebSocket démarré")
+        logger.info("🔌 PriceMonitor WebSocket démarré (PumpSwap + Raydium)")
 
     async def stop(self):
         """Arrêter le monitoring"""
@@ -238,6 +280,7 @@ class PriceMonitor:
         """
         Ajouter un token à surveiller.
         Trouve le pool, récupère les vaults, et s'abonne aux changements.
+        Supporte PumpSwap ET Raydium.
         """
         if token_address in self.monitored_pools:
             return True  # Déjà surveillé
@@ -257,16 +300,22 @@ class PriceMonitor:
             logger.warning(f"⚠️ Impossible de lire le pool {pool_address}")
             return False
 
-        # 3. Parser le pool (PumpSwap)
+        # 3. Parser le pool selon le DEX
+        parsed = None
+        dex_type = "unknown"
+
         if "pump" in dex_id:
             parsed = parse_pumpswap_pool(pool_data["data"][0])
+            dex_type = "pumpswap"
+        elif "raydium" in dex_id:
+            parsed = parse_raydium_amm_pool(pool_data["data"][0])
+            dex_type = "raydium"
         else:
-            # Pour Raydium, on utilise une approche simplifiée via le prix DexScreener
-            # et le polling rapide (pas de WS pour Raydium dans cette version)
-            logger.info(f"ℹ️ Pool Raydium détecté pour {token_address}, monitoring via polling")
+            logger.info(f"ℹ️ DEX non supporté pour WS: {dex_id} ({token_address[:12]})")
             return False
 
         if not parsed:
+            logger.warning(f"⚠️ Impossible de parser le pool {dex_type} pour {token_address[:12]}")
             return False
 
         # 4. Récupérer les décimales
@@ -286,6 +335,7 @@ class PriceMonitor:
             base_decimals=base_dec,
             quote_decimals=quote_dec,
             token_address=token_address,
+            dex_type=dex_type,
         )
 
         # 6. Récupérer les montants initiaux des vaults
@@ -308,7 +358,8 @@ class PriceMonitor:
                 pool_info.last_update = time.time()
 
         self.monitored_pools[token_address] = pool_info
-        logger.info(f"✅ Monitoring WS ajouté: {token_address} (pool: {pool_address[:8]}...)")
+        logger.info(f"✅ Monitoring WS ajouté: {token_address[:12]}... "
+                    f"(pool: {pool_address[:8]}..., dex: {dex_type})")
 
         # 7. S'abonner via WebSocket si connecté
         if self._ws and self._ws.open:
@@ -323,9 +374,7 @@ class PriceMonitor:
             # Nettoyer les vault amounts
             self.vault_amounts.pop(pool_info.base_vault, None)
             self.vault_amounts.pop(pool_info.quote_vault, None)
-            logger.info(f"🗑️ Monitoring WS retiré: {token_address}")
-            # Note: on ne peut pas unsubscribe facilement, mais c'est OK
-            # les notifications seront juste ignorées
+            logger.info(f"🗑️ Monitoring WS retiré: {token_address[:12]}... ({pool_info.dex_type})")
 
     async def _subscribe_pool(self, pool_info: PoolInfo):
         """S'abonner aux changements des vaults d'un pool"""
@@ -448,7 +497,7 @@ class PriceMonitor:
                         else:
                             change_pct = 0
 
-                        # Appeler le callback
+                        # Appeler le callback si changement significatif
                         if self.on_price_update and abs(change_pct) > 0.1:
                             try:
                                 await self.on_price_update(token_addr, new_price, change_pct)
@@ -468,6 +517,18 @@ class PriceMonitor:
             addr: info.latest_price_sol
             for addr, info in self.monitored_pools.items()
             if info.latest_price_sol > 0
+        }
+
+    def get_ws_stats(self) -> dict:
+        """Statistiques du WebSocket monitoring"""
+        pumpswap_count = sum(1 for p in self.monitored_pools.values() if p.dex_type == "pumpswap")
+        raydium_count = sum(1 for p in self.monitored_pools.values() if p.dex_type == "raydium")
+        return {
+            "connected": self.is_connected,
+            "total_monitored": len(self.monitored_pools),
+            "pumpswap_pools": pumpswap_count,
+            "raydium_pools": raydium_count,
+            "subscriptions": len(self.subscription_map),
         }
 
     @property
