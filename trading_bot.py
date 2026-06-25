@@ -94,29 +94,154 @@ def save_trading_config(config: TradingConfig):
 
 # === PERSISTANCE DE L'ÉTAT (survit aux redémarrages Render) ===
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+TRADES_LOG_FILE = os.path.join(DATA_DIR, "trades.json")
+
+# Valeurs par défaut pour state.json (source de vérité)
+_STATE_DEFAULTS = {
+    "auto_trading": True,
+    "sl_pct": -25.0,
+    "tp_pct": 20.0,
+    "trailing_activation": 20.0,
+    "trailing_sl": -15.0,
+    "time_stop_sniper": 20,
+    "time_stop_recovered": 30,
+    "position_sizing": {
+        "base": 0.05,
+        "min": 0.02,
+        "max": 0.15,
+    },
+    "streak": {
+        "consecutive_wins": 0,
+        "consecutive_losses": 0,
+    },
+    "blacklist": {},
+    "last_updated": "",
+}
 
 
 def _load_state() -> dict:
-    """Charger l'état persistant (auto_trading_enabled, etc.)"""
+    """
+    Charger l'état persistant depuis state.json.
+    - Si fichier absent → créer avec défauts
+    - Si clé manquante → utiliser valeur par défaut
+    - Ne jamais crasher
+    """
+    state = {}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {}
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError, ValueError):
+            logger.warning("[STATE] state.json corrompu, utilisation des défauts")
+            state = {}
+
+    # Remplir les clés manquantes avec les défauts
+    for key, default_val in _STATE_DEFAULTS.items():
+        if key not in state:
+            state[key] = default_val
+        elif isinstance(default_val, dict):
+            # Merge profond pour les sous-dicts (position_sizing, streak, blacklist)
+            for sub_key, sub_default in default_val.items():
+                if sub_key not in state[key]:
+                    state[key][sub_key] = sub_default
+
+    # Nettoyer la blacklist (supprimer les entrées expirées)
+    now = time.time()
+    if "blacklist" in state and isinstance(state["blacklist"], dict):
+        state["blacklist"] = {
+            addr: entry for addr, entry in state["blacklist"].items()
+            if isinstance(entry, dict) and entry.get("banned_until", 0) > now
+        }
+
+    return state
 
 
 def _save_state():
-    """Sauvegarder l'état persistant"""
+    """
+    Sauvegarder l'état complet immédiatement après chaque modification.
+    Toutes les variables critiques sont capturées ici.
+    """
+    from datetime import datetime, timezone
+
+    # Capturer le sizing et la streak depuis position_sizer (si initialisé)
+    sizing_data = {"base": 0.05, "min": 0.02, "max": 0.15}
+    streak_data = {"consecutive_wins": 0, "consecutive_losses": 0}
+    if position_sizer:
+        info = position_sizer.get_info()
+        sizing_data = {
+            "base": info["base_size"],
+            "min": info["min_size"],
+            "max": info["max_size"],
+        }
+        streak_data = {
+            "consecutive_wins": info["consecutive_wins"],
+            "consecutive_losses": info["consecutive_losses"],
+        }
+
+    # Construire la blacklist au format enrichi
+    blacklist_data = {}
+    for addr, expiry in sl_blacklist.items():
+        if expiry > time.time():
+            blacklist_data[addr] = {
+                "banned_until": expiry,
+                "reason": "SL déclenché",
+            }
+
     state = {
-        "trading": auto_trading_enabled,
+        "auto_trading": auto_trading_enabled,
+        "sl_pct": trading_config.stop_loss_pct,
+        "tp_pct": trading_config.take_profit_pct,
+        "trailing_activation": trading_config.trailing_activation_pct,
+        "trailing_sl": -trading_config.trailing_stop_pct,  # Stocké en négatif
+        "time_stop_sniper": trading_config.time_stop_minutes,
+        "time_stop_recovered": 30,  # Fixe dans CBConfig
+        "position_sizing": sizing_data,
+        "streak": streak_data,
+        "blacklist": blacklist_data,
+        "last_updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+            json.dump(state, f, indent=2)
     except IOError as e:
-        logger.error(f"Erreur sauvegarde state.json: {e}")
+        logger.error(f"[STATE] Erreur sauvegarde state.json: {e}")
+
+
+def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
+               pnl_pct: float = 0.0, reason: str = "", price: float = 0.0,
+               amount_sol: float = 0.0):
+    """
+    RÈGLE 5: Logger chaque trade dans trades.json (source de vérité post-mortem).
+    Format structuré append-only.
+    """
+    from datetime import datetime, timezone
+
+    trade_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "token": token_symbol,
+        "token_address": token_address,
+        "strategy": strategy,
+        "side": side,
+        "pnl_pct": round(pnl_pct, 2),
+        "reason": reason,
+        "price": price,
+        "amount_sol": round(amount_sol, 6),
+    }
+
+    try:
+        trades = []
+        if os.path.exists(TRADES_LOG_FILE):
+            with open(TRADES_LOG_FILE, "r") as f:
+                trades = json.load(f)
+        trades.append(trade_entry)
+        # Garder les 500 derniers trades max (éviter fichier trop gros)
+        if len(trades) > 500:
+            trades = trades[-500:]
+        with open(TRADES_LOG_FILE, "w") as f:
+            json.dump(trades, f, indent=2)
+    except (IOError, json.JSONDecodeError) as e:
+        logger.error(f"[TRADES] Erreur écriture trades.json: {e}")
 
 
 # Initialisation globale
@@ -360,17 +485,25 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
 
     # Convertir prix SOL → USD
     current_price_usd = price_sol * _cached_sol_price_usd
-    if current_price_usd <= 0:
-        return
 
-    # Mettre à jour la position (high watermark, PnL)
-    positions.update_position(token_address, current_price_usd)
+    # RÈGLE 2: Si prix indisponible → fallback last_known_price
+    # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
+    if current_price_usd <= 0:
+        current_price_usd = pos.current_price  # Dernier prix connu
+        if current_price_usd <= 0:
+            current_price_usd = pos.entry_price_usd * 0.01  # Assumer -99% si jamais vu
+        logger.warning(f"[⚡ WS] Prix indisponible pour {pos.token_symbol}, "
+                      f"fallback=${current_price_usd:.8f}")
+    else:
+        # Prix valide → mettre à jour la position (high watermark, PnL)
+        positions.update_position(token_address, current_price_usd)
 
     # Heartbeat watchdog (cette position est surveillée activement)
     if capital_watchdog:
         capital_watchdog.heartbeat(token_address, current_price_usd)
 
     # ━━━ PRIORITÉ ABSOLUE: cb.check() → SL -25% avant tout ━━━
+    # JAMAIS skipé, même si le prix est un fallback (Time Stop fonctionne toujours)
     cb_action = circuit_breaker.check(token_address, current_price_usd)
 
     if not cb_action.should_sell:
@@ -418,6 +551,7 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     # Position Sizer (streak)
     if position_sizer:
         position_sizer.record_result(pos.pnl_pct > 0)
+        _save_state()  # Persister streak immédiatement
 
     # Daily PnL Guard
     if daily_pnl_guard:
@@ -469,11 +603,24 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
         except Exception as e:
             logger.error(f"Erreur postmortem thread: {e}")
 
-    # Blacklister si perte
+    # RÈGLE 5: Logger le trade dans trades.json
+    _log_trade(
+        token_address=pos.token_address,
+        token_symbol=pos.token_symbol,
+        strategy=pos.strategy,
+        side="SELL",
+        pnl_pct=pos.pnl_pct,
+        reason=reason,
+        price=current_price_usd,
+        amount_sol=pos.amount_sol_invested,
+    )
+
+    # RÈGLE 3: Blacklister si perte (SL déclenché)
     if pos.pnl_pct < 0:
         sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
         _save_blacklist()
         seen_tokens.add(pos.token_address)
+        _save_state()  # Persister blacklist dans state.json
 
     # Retirer du monitoring WS
     if price_monitor:
@@ -825,6 +972,7 @@ async def set_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tp = float(context.args[0])
         trading_config.take_profit_pct = tp
         save_trading_config(trading_config)
+        _save_state()  # Persistance immédiate
         if circuit_breaker:
             circuit_breaker.update_config(take_profit_pct=tp)
         await update.message.reply_text(f"✅ Take Profit mis à jour: +{tp}%")
@@ -841,6 +989,7 @@ async def set_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sl = float(context.args[0])
         trading_config.stop_loss_pct = -abs(sl)
         save_trading_config(trading_config)
+        _save_state()  # Persistance immédiate
         if circuit_breaker:
             circuit_breaker.update_config(stop_loss_pct=-abs(sl))
         await update.message.reply_text(f"✅ Stop Loss mis à jour: {trading_config.stop_loss_pct}%")
@@ -893,6 +1042,7 @@ async def set_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         trading_config.trailing_activation_pct = activation
         save_trading_config(trading_config)
+        _save_state()  # Persistance immédiate
         if circuit_breaker:
             circuit_breaker.update_config(trailing_activation_pct=activation)
         await update.message.reply_text(
@@ -951,6 +1101,7 @@ async def set_timestop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trading_config.time_stop_min_profit = min_profit
 
         save_trading_config(trading_config)
+        _save_state()  # Persistance immédiate
         if circuit_breaker:
             circuit_breaker.update_config(
                 time_stop_minutes=trading_config.time_stop_minutes,
@@ -976,6 +1127,10 @@ async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trading_config.position_size_sol = size
         trading_config.sniper_position_sol = size
         save_trading_config(trading_config)
+        # Mettre à jour le position_sizer (base durable, pas l'override temporaire)
+        if position_sizer:
+            position_sizer.base_size = size
+        _save_state()  # Persistance immédiate
         await update.message.reply_text(f"✅ Taille de position: {size} SOL")
     except ValueError:
         await update.message.reply_text("❌ Valeur invalide")
@@ -1002,6 +1157,15 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Exécuter l'achat
     result = trading_engine.execute_buy(analysis, "manual")
     if result:
+        # RÈGLE 5: Logger le BUY
+        _log_trade(
+            token_address=token_address,
+            token_symbol=analysis.get("symbol", "???"),
+            strategy="manual",
+            side="BUY",
+            price=float(analysis.get("price_usd", 0) or 0),
+            amount_sol=result['amount_sol'],
+        )
         # Enregistrer dans le CircuitBreaker
         if circuit_breaker:
             entry_price = float(analysis.get("price_usd", 0) or 0)
@@ -1047,6 +1211,17 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     result = trading_engine.execute_sell(position, "Vente manuelle")
     if result:
+        # RÈGLE 5: Logger le SELL
+        _log_trade(
+            token_address=token_address,
+            token_symbol=position.token_symbol,
+            strategy=position.strategy,
+            side="SELL",
+            pnl_pct=result.get('pnl_pct', 0),
+            reason="Vente manuelle",
+            price=position.current_price,
+            amount_sol=position.amount_sol_invested,
+        )
         # Retirer du CircuitBreaker
         if circuit_breaker:
             circuit_breaker.close_position(token_address)
@@ -1676,6 +1851,17 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     if fails >= 3:
                         # Token mort — fermer la position sans vente
                         logger.warning(f"[SNIPER 3s] 🗑️ {pos.token_symbol}: 3 échecs de vente → fermeture forcée")
+                        # RÈGLE 5: Logger le SELL forcé
+                        _log_trade(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            strategy=pos.strategy,
+                            side="SELL",
+                            pnl_pct=-100.0,
+                            reason="Token mort (3 échecs vente)",
+                            price=0,
+                            amount_sol=pos.amount_sol_invested,
+                        )
                         if pnl_tracker:
                             pnl_tracker.record_trade(
                                 token_address=pos.token_address,
@@ -1716,6 +1902,17 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 pass
                     continue
                 if result:
+                    # RÈGLE 5: Logger le SELL
+                    _log_trade(
+                        token_address=pos.token_address,
+                        token_symbol=pos.token_symbol,
+                        strategy=pos.strategy,
+                        side="SELL",
+                        pnl_pct=pos.pnl_pct,
+                        reason=cb_action.reason,
+                        price=current_price,
+                        amount_sol=pos.amount_sol_invested,
+                    )
                     if is_partial:
                         # Partial TP: ne PAS fermer la position, le trailing gère la suite
                         logger.info(f"[SNIPER 3s] Partial TP 50% exécuté pour {pos.token_symbol}")
@@ -1764,6 +1961,7 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                             sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
                             _save_blacklist()
                             seen_tokens.add(pos.token_address)
+                        _save_state()  # Persister streak + blacklist
                     # Retirer du WS seulement si vente totale
                     if not is_partial and price_monitor:
                         try:
@@ -1963,6 +2161,17 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                 reason = cb_action.reason
                 result = trading_engine.execute_sell(pos, reason)
                 if result:
+                    # RÈGLE 5: Logger le SELL
+                    _log_trade(
+                        token_address=pos.token_address,
+                        token_symbol=pos.token_symbol,
+                        strategy=pos.strategy,
+                        side="SELL",
+                        pnl_pct=pos.pnl_pct,
+                        reason=reason,
+                        price=current_price,
+                        amount_sol=pos.amount_sol_invested,
+                    )
                     # Enregistrer dans le PnL tracker
                     if pnl_tracker:
                         pnl_tracker.record_trade(
@@ -2034,6 +2243,8 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
                         _save_blacklist()
                         seen_tokens.add(pos.token_address)
                         logger.info(f"🚫 Blacklisté après SL: {pos.token_name} (1h)")
+
+                    _save_state()  # Persister streak + blacklist immédiatement
 
                     # Détecter un RUG PULL (-80%+) et blacklister le créateur
                     if pos.pnl_pct < -80 and security_checker:
@@ -2163,6 +2374,16 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                     if result:
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)
+
+                        # RÈGLE 5: Logger le BUY
+                        _log_trade(
+                            token_address=address,
+                            token_symbol=signal.token_symbol,
+                            strategy=signal.strategy,
+                            side="BUY",
+                            price=float(analysis.get("price_usd", 0) or 0),
+                            amount_sol=result['amount_sol'],
+                        )
 
                         # Enregistrer dans le CircuitBreaker
                         if circuit_breaker:
@@ -2329,6 +2550,15 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
+                    # RÈGLE 5: Logger le BUY
+                    _log_trade(
+                        token_address=address,
+                        token_symbol=analysis.get("symbol", "???"),
+                        strategy="sniper",
+                        side="BUY",
+                        price=float(analysis.get("price_usd", 0) or 0),
+                        amount_sol=result['amount_sol'],
+                    )
                     # Enregistrer dans le CircuitBreaker
                     if circuit_breaker:
                         entry_price = float(analysis.get("price_usd", 0) or 0)
@@ -2828,19 +3058,59 @@ def main():
         print("⚠️  Aucun wallet configuré. Utilisez /wallet ou /import_wallet")
 
     # === RESTAURER L'ÉTAT PERSISTANT (state.json) ===
-    global auto_trading_enabled
+    global auto_trading_enabled, sl_blacklist
     saved_state = _load_state()
-    if saved_state:
-        auto_trading_enabled = saved_state.get("trading", False)
-        print(f"💾 État restauré depuis state.json: trading={'ON' if auto_trading_enabled else 'OFF'}")
-    elif wallet.keypair:
-        # Premier démarrage (pas de state.json) : activer si wallet présent
-        auto_trading_enabled = True
+
+    # 1. Auto trading
+    auto_trading_enabled = saved_state.get("auto_trading", wallet.keypair is not None)
+
+    # 2. Paramètres de trading (restaurer dans trading_config + circuit_breaker)
+    trading_config.stop_loss_pct = saved_state.get("sl_pct", -25.0)
+    trading_config.take_profit_pct = saved_state.get("tp_pct", 20.0)
+    trading_config.trailing_activation_pct = saved_state.get("trailing_activation", 20.0)
+    trading_config.trailing_stop_pct = abs(saved_state.get("trailing_sl", -15.0))
+    trading_config.time_stop_minutes = saved_state.get("time_stop_sniper", 20)
+    if circuit_breaker:
+        circuit_breaker.update_config(
+            stop_loss_pct=trading_config.stop_loss_pct,
+            take_profit_pct=trading_config.take_profit_pct,
+            trailing_activation_pct=trading_config.trailing_activation_pct,
+            trailing_stop_pct=trading_config.trailing_stop_pct,
+            time_stop_minutes=trading_config.time_stop_minutes,
+        )
+
+    # 3. Position sizing et streak
+    sizing = saved_state.get("position_sizing", {})
+    streak = saved_state.get("streak", {})
+    if position_sizer:
+        position_sizer.base_size = sizing.get("base", 0.05)
+        position_sizer.min_size = sizing.get("min", 0.02)
+        position_sizer.max_size = sizing.get("max", 0.15)
+        position_sizer.consecutive_wins = streak.get("consecutive_wins", 0)
+        position_sizer.consecutive_losses = streak.get("consecutive_losses", 0)
+
+    # 4. Blacklist (format enrichi → convertir en {addr: expiry} pour compatibilité)
+    blacklist_raw = saved_state.get("blacklist", {})
+    sl_blacklist = {}
+    for addr, entry in blacklist_raw.items():
+        if isinstance(entry, dict):
+            sl_blacklist[addr] = entry.get("banned_until", 0)
+        elif isinstance(entry, (int, float)):
+            sl_blacklist[addr] = entry  # Ancien format
+
+    print(f"💾 État restauré depuis state.json:")
+    print(f"   Trading: {'ON' if auto_trading_enabled else 'OFF'}")
+    print(f"   SL: {trading_config.stop_loss_pct}% | TP: +{trading_config.take_profit_pct}%")
+    print(f"   Trailing: activation +{trading_config.trailing_activation_pct}%, SL -{trading_config.trailing_stop_pct}%")
+    print(f"   Time Stop: {trading_config.time_stop_minutes:.0f}min sniper / {saved_state.get('time_stop_recovered', 30)}min recovered")
+    print(f"   Streak: W{streak.get('consecutive_wins', 0)} / L{streak.get('consecutive_losses', 0)}")
+    print(f"   Blacklist: {len(sl_blacklist)} tokens")
+    print(f"   Dernière MAJ: {saved_state.get('last_updated', 'jamais')}")
+
+    # Si premier démarrage (state.json vide ou absent), sauvegarder les défauts
+    if not os.path.exists(STATE_FILE):
         _save_state()
-        print("🚀 Premier démarrage: trading automatique ACTIVÉ")
-    else:
-        auto_trading_enabled = False
-        print("🛑 Trading automatique DÉSACTIVÉ (pas de wallet)")
+        print("🚀 Premier démarrage: state.json créé avec valeurs par défaut")
 
     # Nettoyer les positions fantômes (positions sans tokens réels)
     if wallet.keypair and positions.count_positions() > 0:
@@ -2999,6 +3269,30 @@ def main():
                 print(f"📋 Copy Trading démarré: {len(copy_trader.get_active_wallets())} wallets suivis")
             except Exception as e:
                 print(f"⚠️ Erreur démarrage copy trading (polling fallback actif): {e}")
+
+        # RÈGLE 4: Alerte Telegram au redémarrage
+        if subscribers:
+            try:
+                balance = wallet.get_sol_balance() if wallet.keypair else 0
+                n_positions = positions.count_positions()
+                restart_msg = (
+                    f"🔄 *BOT REDÉMARRÉ*\n\n"
+                    f"🤖 auto\_trading: {'ON ✅' if auto_trading_enabled else 'OFF ⛔'}\n"
+                    f"💾 État restauré depuis state.json\n"
+                    f"💰 Capital: {balance:.4f} SOL\n"
+                    f"📊 Positions ouvertes: {n_positions}\n"
+                    f"🚫 Blacklist: {len(sl_blacklist)} tokens\n"
+                    f"🎯 SL: {trading_config.stop_loss_pct}% | TP: +{trading_config.take_profit_pct}%\n"
+                    f"⚡ WebSocket Helius: actif"
+                )
+                for chat_id in subscribers:
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=restart_msg,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            except Exception as e:
+                logger.error(f"Erreur alerte redémarrage Telegram: {e}")
 
     app.post_init = post_init
 
