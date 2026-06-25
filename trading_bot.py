@@ -5,6 +5,7 @@ Combine le monitoring (alertes) avec le trading automatique (achat/vente).
 
 import asyncio
 import logging
+import logging.handlers
 import time
 import json
 import os
@@ -38,12 +39,36 @@ from capital_watchdog import CapitalWatchdog, WatchdogConfig
 from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
 from token_filter import TokenFilter
 
-# Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+# ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
+def _setup_logging():
+    """Configure les logs avec rotation automatique."""
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    )
+
+    # Handler fichier avec rotation : max 10MB, garde 3 fichiers
+    file_handler = logging.handlers.RotatingFileHandler(
+        'trading_bot.log',
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=3
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    # Handler console
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    # Root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+_setup_logging()
 logger = logging.getLogger(__name__)
+# ─────────────────────────────────────────────────────────────────
 
 # ============================================================
 # INITIALISATION
@@ -1848,6 +1873,55 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             # Heartbeat watchdog (cette position est surveillée)
             if capital_watchdog:
                 capital_watchdog.heartbeat(pos.token_address, current_price)
+
+            # ─── FIX MÉMOIRE — Token mort ─────────────────
+            if capital_watchdog and pos.token_address in capital_watchdog.positions:
+                wd_pos = capital_watchdog.positions[pos.token_address]
+                if getattr(wd_pos, 'is_dead', False):
+                    logger.warning(
+                        f"[Zombie] Fermeture forcée "
+                        f"{pos.token_symbol} — token mort"
+                    )
+                    result = trading_engine.execute_sell(
+                        pos,
+                        "💀 Token mort — prix=0 depuis 5min"
+                    )
+                    if result:
+                        _log_trade(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            strategy=pos.strategy,
+                            side="SELL",
+                            pnl_pct=-100.0,
+                            reason="Token mort (prix=0 depuis 5min)",
+                            price=0,
+                            amount_sol=pos.amount_sol_invested,
+                        )
+                        if pnl_tracker:
+                            pnl_tracker.record_trade(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                strategy=pos.strategy,
+                                entry_time=pos.entry_time,
+                                amount_sol=pos.amount_sol_invested,
+                                pnl_pct=-100.0,
+                                exit_reason="Token mort (prix=0)",
+                            )
+                        if position_sizer:
+                            position_sizer.record_result(False)
+                            _save_state()
+                        circuit_breaker.close_position(pos.token_address)
+                        capital_watchdog.unregister_position(pos.token_address)
+                        if price_monitor:
+                            try:
+                                await price_monitor.remove_token(pos.token_address)
+                            except:
+                                pass
+                        positions.close_position(pos.token_address)
+                        sl_blacklist[pos.token_address] = time.time() + 86400
+                        _save_blacklist()
+                    continue
+            # ───────────────────────────────────────────────
 
             # Vérifier via CircuitBreaker centralisé
             cb_action = circuit_breaker.check(pos.token_address, current_price)

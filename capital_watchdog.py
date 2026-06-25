@@ -159,6 +159,24 @@ class CapitalWatchdog:
         cutoff = now - 30
         pos.price_history = [(t, p) for t, p in pos.price_history if t > cutoff]
 
+        # ─── FIX MÉMOIRE 1 — Limite absolue de 60 entrées ────────────
+        if len(pos.price_history) > 60:
+            pos.price_history = pos.price_history[-60:]
+        # ──────────────────────────────────────────────────────────
+
+        # ─── FIX MÉMOIRE 2 — Détection token mort ────────────────
+        # Si 10 prix consécutifs = 0 → token mort depuis ~5 min
+        zero_prices = [p for t, p in pos.price_history if p <= 0]
+        if len(zero_prices) >= 10:
+            if not getattr(pos, 'is_dead', False):
+                pos.is_dead = True
+                logger.warning(
+                    f"[Memory] Token mort détecté : "
+                    f"{pos.token_symbol} — "
+                    f"prix=0 depuis {len(zero_prices) * 30}s"
+                )
+        # ──────────────────────────────────────────────────────────
+
         # Si on était en alerte, on repasse en OK
         if pos.alert_level != "ok":
             logger.info(f"[Watchdog] ✅ {pos.token_symbol} de retour sous surveillance")

@@ -797,6 +797,12 @@ class TradingEngine:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             self.trade_history.append(trade_record)
+
+            # ─── FIX MÉMOIRE — Limite trade_history ────────────────
+            if len(self.trade_history) > 500:
+                self.trade_history = self.trade_history[-500:]
+            # ──────────────────────────────────────────────────
+
             self._save_history()
 
             return trade_record
@@ -850,6 +856,14 @@ class TradingEngine:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             self.trade_history.append(trade_record)
+
+            # ─── FIX MÉMOIRE — Limite trade_history ────────────────
+            # Garder seulement les 500 derniers trades en RAM
+            # Le reste est déjà sauvegardé dans le fichier JSON
+            if len(self.trade_history) > 500:
+                self.trade_history = self.trade_history[-500:]
+            # ──────────────────────────────────────────────────
+
             self._save_history()
 
             # Postmortem Tracker — seulement pour ventes totales
