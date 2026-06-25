@@ -37,7 +37,7 @@ POLLING_INTERVAL = 45
 FILTERS = {
     "min_liquidity_usd": 5000,       # Liquidité minimum en USD (élevé = moins de scams)
     "min_volume_24h": 5000,          # Volume 24h minimum (filtre les tokens morts)
-    "min_market_cap": 10_000,        # Market cap minimum ($10k = token réel)
+    "min_market_cap": 50_000,        # Market cap minimum ($50k = pas de micro-rug)
     "max_market_cap": 5_000_000,     # Market cap maximum (on veut les early)
     "min_price_change_5m": 5,        # % hausse min sur 5 min (détection précoce)
     "min_price_change_1h": 20,       # % hausse min sur 1h pour momentum

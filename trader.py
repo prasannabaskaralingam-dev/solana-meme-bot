@@ -47,6 +47,7 @@ class TradingConfig:
     sniper_enabled: bool = True
     sniper_position_sol: float = 0.05    # Montant par snipe
     sniper_min_liquidity: float = 5000   # Liquidité min pour sniper ($)
+    sniper_min_mc: float = 50_000        # MC MINIMUM pour sniper ($50K = pas de micro-rug)
     sniper_max_mc: float = 100_000       # MC max pour sniper ($)
 
 
@@ -649,6 +650,8 @@ class TradingEngine:
 
         # Vérifier MC
         mc = analysis.get("market_cap", 0)
+        if mc and mc < self.config.sniper_min_mc:
+            return False, f"MC trop faible (${mc:,.0f} < ${self.config.sniper_min_mc:,.0f})"
         if mc and mc > self.config.sniper_max_mc:
             return False, "MC trop élevé pour snipe"
 

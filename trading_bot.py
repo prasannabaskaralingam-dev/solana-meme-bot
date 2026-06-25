@@ -2396,6 +2396,15 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 if not analysis:
                     continue
 
+                # 🚨 GATE MC MINIMUM $50K (smart_entry aussi)
+                mc = analysis.get("market_cap", 0) or 0
+                if mc < trading_config.sniper_min_mc:
+                    logger.info(f"🚫 REJETÉ (MC trop faible): {analysis.get('name', address[:12])} "
+                               f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
+                    smart_entry.consume_signal(address)
+                    seen_tokens.add(address)
+                    continue
+
                 # Tenter la confirmation
                 signal = smart_entry.confirm_check(analysis)
                 if signal:
@@ -2578,6 +2587,16 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1.5)
             analysis = api.analyze_token(address)
             if not analysis:
+                continue
+
+            # 🚨 GATE MC MINIMUM $50K — AVANT TOUT (bloque les micro-rugs)
+            mc = analysis.get("market_cap", 0) or 0
+            if mc < trading_config.sniper_min_mc:
+                logger.info(f"🚫 REJETÉ (MC trop faible): {analysis.get('name', address[:12])} "
+                           f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
+                seen_tokens.add(address)
+                if len(seen_tokens) > MAX_SEEN_TOKENS:
+                    seen_tokens.clear()
                 continue
 
             # 🔍 FILTRE ON-CHAIN RAPIDE (mint authority + freeze) — 1 seul appel RPC
