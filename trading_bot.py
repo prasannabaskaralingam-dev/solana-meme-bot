@@ -1424,6 +1424,83 @@ async def close_position_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Erreur: {e}")
 
 
+async def kill_zombies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kill_zombies - Fermer TOUTES les positions zombies (> 60 min ET PnL = 0%)"""
+    if not positions.positions:
+        await update.message.reply_text("✅ Aucune position ouverte.")
+        return
+
+    now = datetime.now(timezone.utc)
+    zombies_killed = []
+    addrs_to_kill = []
+
+    for addr, pos in list(positions.positions.items()):
+        try:
+            entry_time = datetime.fromisoformat(pos.entry_time)
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=timezone.utc)
+            age_minutes = (now - entry_time).total_seconds() / 60
+        except:
+            age_minutes = 9999  # Si entry_time invalide, considérer comme zombie
+
+        # Zombie = > 60 min ET PnL figé à 0% (ou prix = entry)
+        is_zombie = (age_minutes > 60 and abs(pos.pnl_pct) < 0.1)
+        if is_zombie:
+            addrs_to_kill.append((addr, pos, age_minutes))
+
+    if not addrs_to_kill:
+        await update.message.reply_text("✅ Aucune position zombie détectée.")
+        return
+
+    for addr, pos, age_min in addrs_to_kill:
+        try:
+            # Tenter la vente réelle
+            sold = False
+            if trading_engine:
+                try:
+                    result = trading_engine.execute_sell(addr, percentage=100)
+                    if result:
+                        sold = True
+                except:
+                    pass
+
+            # Fermer dans tous les systèmes
+            if pnl_tracker:
+                pnl_tracker.record_trade(
+                    token_address=addr,
+                    token_symbol=pos.token_symbol,
+                    strategy=pos.strategy,
+                    pnl_pct=-100.0,
+                    pnl_sol=-(pos.amount_sol_invested),
+                    reason="Zombie killé (/kill_zombies)",
+                    duration_minutes=age_min
+                )
+            if circuit_breaker:
+                circuit_breaker.close_position(addr)
+            if capital_watchdog:
+                capital_watchdog.unregister_position(addr)
+            if price_monitor:
+                try:
+                    asyncio.create_task(price_monitor.remove_token(addr))
+                except:
+                    pass
+            positions.close_position(addr)
+            sl_blacklist[addr] = time.time() + 86400
+            _save_blacklist()
+
+            zombies_killed.append(
+                f"  💀 {pos.token_symbol} ({age_min:.0f}min) {'VENDU' if sold else 'FERMÉ'}"
+            )
+        except Exception as e:
+            zombies_killed.append(f"  ❌ {pos.token_symbol}: erreur {e}")
+
+    _save_state()
+    msg = f"💀 *ZOMBIE KILLER*\n\n"
+    msg += f"Positions fermées: {len(zombies_killed)}\n\n"
+    msg += "\n".join(zombies_killed)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 # ============================================================
 # COPY TRADING - CALLBACKS & COMMANDES
 # ============================================================
@@ -3407,6 +3484,7 @@ def main():
     app.add_handler(CommandHandler("sell", sell_cmd))
     app.add_handler(CommandHandler("sell_all", sell_all_cmd))
     app.add_handler(CommandHandler("close_position", close_position_cmd))
+    app.add_handler(CommandHandler("kill_zombies", kill_zombies_cmd))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("trending", trending_command))
     app.add_handler(CommandHandler("metas", metas_command))
@@ -3444,6 +3522,47 @@ def main():
     # (s'exécute en arrière-plan dans l'event loop)
     async def post_init(application):
         """Callback post-init pour démarrer le WebSocket et le copy trading"""
+        # 💀 PURGE ZOMBIE AU DÉMARRAGE: fermer les positions mortes qui survivent aux reboots
+        try:
+            now = datetime.now(timezone.utc)
+            time_stop_min = trading_config.time_stop_minutes if hasattr(trading_config, 'time_stop_minutes') else 20
+            zombies_purged = 0
+            for addr in list(positions.positions.keys()):
+                pos = positions.positions.get(addr)
+                if not pos:
+                    continue
+                try:
+                    entry_time = datetime.fromisoformat(pos.entry_time)
+                    if entry_time.tzinfo is None:
+                        entry_time = entry_time.replace(tzinfo=timezone.utc)
+                    age_minutes = (now - entry_time).total_seconds() / 60
+                except:
+                    age_minutes = 9999
+
+                # Zombie = age > time_stop + 5 min ET PnL figé à 0%
+                if age_minutes > (time_stop_min + 5) and abs(pos.pnl_pct) < 0.1:
+                    print(f"💀 ZOMBIE PURGE: {pos.token_symbol} ({age_minutes:.0f}min, PnL={pos.pnl_pct:.1f}%)")
+                    # Tenter la vente
+                    if trading_engine:
+                        try:
+                            trading_engine.execute_sell(addr, percentage=100)
+                        except:
+                            pass
+                    if circuit_breaker:
+                        circuit_breaker.close_position(addr)
+                    if capital_watchdog:
+                        capital_watchdog.unregister_position(addr)
+                    positions.close_position(addr)
+                    sl_blacklist[addr] = time.time() + 86400
+                    _save_blacklist()
+                    zombies_purged += 1
+
+            if zombies_purged > 0:
+                _save_state()
+                print(f"💀 {zombies_purged} position(s) zombie purgée(s) au démarrage")
+        except Exception as e:
+            print(f"⚠️ Erreur purge zombies: {e}")
+
         try:
             await start_price_monitor_for_positions()
             print("🔌 WebSocket PriceMonitor démarré !")
