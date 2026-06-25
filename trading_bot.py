@@ -2282,6 +2282,99 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Erreur post-trade analysis: {e}")
 
 
+async def postmortem_analysis_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job d'analyse automatique des post-mortems (toutes les 6h).
+    Agrège les résultats, détecte les patterns, et suggère des ajustements.
+    """
+    if not post_trade_analyzer:
+        return
+
+    try:
+        insights = post_trade_analyzer.get_insights()
+        if insights["status"] == "no_data":
+            return
+
+        total = insights["total_analyzed"]
+        if total < 3:
+            return  # Pas assez de données pour un rapport
+
+        # Générer le rapport
+        verdicts = insights.get("verdicts", {})
+        hold_pct = insights.get("pct_hold_too_short", 0)
+        perfect_pct = insights.get("pct_perfect_exit", 0)
+        avg_missed = insights.get("avg_missed_profit", 0)
+        avg_peak_time = insights.get("avg_time_to_peak", 0)
+        avg_ath = insights.get("avg_ath_during_hold", 0)
+        continued_up = insights.get("continued_up_after_sell", 0)
+        crashed_after = insights.get("crashed_after_sell", 0)
+
+        # Déterminer l'état global
+        if perfect_pct >= 60:
+            status_emoji = "✅"
+            status_text = "Stratégie bien calibrée"
+        elif hold_pct >= 40:
+            status_emoji = "⚠️"
+            status_text = "Tu vends trop tôt"
+        else:
+            status_emoji = "ℹ️"
+            status_text = "Résultats mixtes"
+
+        msg = f"📊 *RAPPORT POST-MORTEM AUTO*\n"
+        msg += f"{status_emoji} {status_text}\n\n"
+        msg += f"📊 Trades analysés: {total}\n"
+        msg += f"✅ Ventes parfaites: {perfect_pct:.0f}%\n"
+        msg += f"📈 Vendus trop tôt: {hold_pct:.0f}%\n"
+        msg += f"💰 Profit moyen raté: {avg_missed:+.1f}%\n"
+        msg += f"🚀 ATH moyen pendant hold: +{avg_ath:.0f}%\n"
+        msg += f"⏱ Temps moyen au peak: {avg_peak_time:.0f} min\n\n"
+
+        msg += f"*Après la vente:*\n"
+        msg += f"  📈 A continué à monter: {continued_up}/{total}\n"
+        msg += f"  📉 A crashé: {crashed_after}/{total}\n\n"
+
+        # Recommandations auto
+        recommendations = insights.get("recommendations", [])
+        if recommendations:
+            msg += "*💡 Recommandations:*\n"
+            for rec in recommendations[:3]:
+                msg += f"  {rec}\n"
+            msg += "\n"
+
+        # Suggestions d'ajustement concrètes
+        suggestions = []
+        if avg_missed > 20 and hold_pct > 35:
+            new_tp = min(int(avg_ath * 0.6), 50)
+            if new_tp > trading_config.take_profit_pct:
+                suggestions.append(f"🎯 TP: {trading_config.take_profit_pct:.0f}% → {new_tp}%")
+        if avg_peak_time > 25 and trading_config.time_stop_minutes < avg_peak_time:
+            new_ts = min(int(avg_peak_time * 1.2), 45)
+            suggestions.append(f"⏰ Time Stop: {trading_config.time_stop_minutes}min → {new_ts}min")
+        if crashed_after > total * 0.7:
+            suggestions.append("✅ SL/TP actuels sont bons (70%+ crash après vente)")
+
+        if suggestions:
+            msg += "*🔧 Ajustements suggérés:*\n"
+            for s in suggestions:
+                msg += f"  {s}\n"
+            msg += "\nℹ️ Utilise /set\_tp, /set\_sl, /set\_timestop pour appliquer"
+
+        # Envoyer le rapport
+        for chat_id in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=msg,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except:
+                pass
+
+        logger.info(f"[POSTMORTEM] Rapport auto envoyé: {total} trades analysés")
+
+    except Exception as e:
+        logger.error(f"Erreur postmortem_analysis_job: {e}")
+
+
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
     """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
     global auto_trading_enabled
@@ -3517,6 +3610,9 @@ def main():
 
     # Heartbeat Telegram (30min) - confirme que le bot est actif
     job_queue.run_repeating(heartbeat_job, interval=1800, first=60)
+
+    # Job Post-Mortem Analysis (6h) - rapport automatique d'insights
+    job_queue.run_repeating(postmortem_analysis_job, interval=21600, first=300)
 
     # Démarrer le WebSocket PriceMonitor pour les positions existantes
     # (s'exécute en arrière-plan dans l'event loop)
