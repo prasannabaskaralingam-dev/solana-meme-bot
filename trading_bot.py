@@ -92,6 +92,33 @@ def save_trading_config(config: TradingConfig):
         json.dump(data, f, indent=2)
 
 
+# === PERSISTANCE DE L'ÉTAT (survit aux redémarrages Render) ===
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+
+def _load_state() -> dict:
+    """Charger l'état persistant (auto_trading_enabled, etc.)"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def _save_state():
+    """Sauvegarder l'état persistant"""
+    state = {
+        "trading": auto_trading_enabled,
+    }
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except IOError as e:
+        logger.error(f"Erreur sauvegarde state.json: {e}")
+
+
 # Initialisation globale
 trading_config = load_trading_config()
 api = DexScreenerAPI()
@@ -641,6 +668,7 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         init_trading()
 
     auto_trading_enabled = True
+    _save_state()  # Persister l'état pour survivre aux redémarrages
     balance = wallet.get_sol_balance()
     msg = f"✅ *Trading automatique ACTIVÉ*\n\n"
     msg += f"💵 Solde: {balance:.4f} SOL\n"
@@ -656,6 +684,7 @@ async def auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Désactiver le trading automatique"""
     global auto_trading_enabled
     auto_trading_enabled = False
+    _save_state()  # Persister l'état pour survivre aux redémarrages
     await update.message.reply_text("🛑 *Trading automatique DÉSACTIVÉ*\n\nLe bot continue de scanner mais n'achètera plus.", parse_mode=ParseMode.MARKDOWN)
 
 
@@ -2789,20 +2818,29 @@ def main():
             print(f"💰 Wallet chargé depuis env: {pub_key}")
             balance = wallet.get_sol_balance()
             print(f"💰 Solde: {balance} SOL")
-            # Auto-activer le trading si wallet présent
-            global auto_trading_enabled
-            auto_trading_enabled = True
-            print("🚀 Trading automatique ACTIVÉ")
         except Exception as e:
             print(f"[ERROR] Impossible de charger wallet depuis env: {e}")
     elif os.path.exists(WalletManager.WALLET_FILE):
         wallet.load_or_create_wallet()
         init_trading()
         print(f"💰 Wallet chargé depuis fichier: {wallet.public_key}")
-        auto_trading_enabled = True
-        print("🚀 Trading automatique ACTIVÉ")
     else:
         print("⚠️  Aucun wallet configuré. Utilisez /wallet ou /import_wallet")
+
+    # === RESTAURER L'ÉTAT PERSISTANT (state.json) ===
+    global auto_trading_enabled
+    saved_state = _load_state()
+    if saved_state:
+        auto_trading_enabled = saved_state.get("trading", False)
+        print(f"💾 État restauré depuis state.json: trading={'ON' if auto_trading_enabled else 'OFF'}")
+    elif wallet.keypair:
+        # Premier démarrage (pas de state.json) : activer si wallet présent
+        auto_trading_enabled = True
+        _save_state()
+        print("🚀 Premier démarrage: trading automatique ACTIVÉ")
+    else:
+        auto_trading_enabled = False
+        print("🛑 Trading automatique DÉSACTIVÉ (pas de wallet)")
 
     # Nettoyer les positions fantômes (positions sans tokens réels)
     if wallet.keypair and positions.count_positions() > 0:
