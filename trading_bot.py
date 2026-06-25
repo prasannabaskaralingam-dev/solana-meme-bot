@@ -2693,6 +2693,76 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /today - PnL du jour en cours avec détail des trades"""
+    from datetime import datetime, timezone
+
+    # Charger trades.json
+    if not os.path.exists(TRADES_LOG_FILE):
+        await update.message.reply_text("📊 Aucun trade enregistré pour le moment.")
+        return
+
+    try:
+        with open(TRADES_LOG_FILE, "r") as f:
+            all_trades = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        await update.message.reply_text("❌ Erreur lecture trades.json.")
+        return
+
+    # Filtrer les trades du jour (UTC)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_trades = [t for t in all_trades if t.get("timestamp", "").startswith(today_str)]
+
+    if not today_trades:
+        await update.message.reply_text(f"📊 *PnL du {today_str}*\n\nAucun trade aujourd'hui.",
+                                        parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Calculs
+    buys = [t for t in today_trades if t["side"] == "BUY"]
+    sells = [t for t in today_trades if t["side"] == "SELL"]
+    wins = [t for t in sells if t.get("pnl_pct", 0) > 0]
+    losses = [t for t in sells if t.get("pnl_pct", 0) < 0]
+
+    total_pnl_sol = 0.0
+    for t in sells:
+        pnl_pct = t.get("pnl_pct", 0)
+        amount = t.get("amount_sol", 0)
+        total_pnl_sol += amount * (pnl_pct / 100.0)
+
+    avg_pnl = sum(t.get("pnl_pct", 0) for t in sells) / max(len(sells), 1)
+    best = max((t.get("pnl_pct", 0) for t in sells), default=0)
+    worst = min((t.get("pnl_pct", 0) for t in sells), default=0)
+    win_rate = (len(wins) / max(len(sells), 1)) * 100
+
+    pnl_emoji = "🟢" if total_pnl_sol >= 0 else "🔴"
+    msg = f"📅 *PnL du jour \u2014 {today_str}*\n\n"
+    msg += f"{pnl_emoji} *PnL total: {total_pnl_sol:+.4f} SOL*\n\n"
+    msg += f"📊 Trades: {len(buys)} achats / {len(sells)} ventes\n"
+    msg += f"🎯 Win Rate: {win_rate:.0f}% (✅{len(wins)} / ❌{len(losses)})\n"
+    msg += f"📈 PnL moyen: {avg_pnl:+.1f}%\n"
+    msg += f"🚀 Meilleur: {best:+.1f}%\n"
+    msg += f"💥 Pire: {worst:+.1f}%\n"
+
+    # Détail des trades (max 15)
+    if sells:
+        msg += f"\n📝 *Détail des ventes:*\n"
+        for t in sells[-15:]:
+            pnl = t.get("pnl_pct", 0)
+            emoji = "✅" if pnl > 0 else "❌"
+            time_str = t.get("timestamp", "")[11:16]  # HH:MM
+            reason_short = t.get("reason", "")[:25]
+            msg += f"  {emoji} `{time_str}` {t['token']} {pnl:+.1f}% ({reason_short})\n"
+
+    if buys:
+        msg += f"\n🛍 *Achats du jour:*\n"
+        for t in buys[-10:]:
+            time_str = t.get("timestamp", "")[11:16]
+            msg += f"  🔵 `{time_str}` {t['token']} ({t['strategy']}) {t.get('amount_sol', 0):.4f} SOL\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 async def diversity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /diversity - Voir la diversification du portefeuille"""
     if not correlation_filter:
@@ -3229,6 +3299,7 @@ def main():
     app.add_handler(CommandHandler("copy_remove", copy_remove_cmd))
     app.add_handler(CommandHandler("copy_history", copy_history_cmd))
     app.add_handler(CommandHandler("pnl", pnl_cmd))
+    app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("diversity", diversity_cmd))
     app.add_handler(CommandHandler("set_corr", set_corr))
     app.add_handler(CommandHandler("insights", insights_cmd))
