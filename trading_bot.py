@@ -208,6 +208,19 @@ def _save_state():
         logger.error(f"[STATE] Erreur sauvegarde state.json: {e}")
 
 
+def _safe_symbol(symbol, token_address: str) -> str:
+    """
+    Garantir que symbol n'est JAMAIS None/vide.
+    Si symbol = None ou vide → utiliser adresse courte comme fallback.
+    Ex: 'UNK_7xKp'
+    """
+    if symbol and str(symbol).strip() and str(symbol).strip() != "None":
+        return str(symbol).strip()
+    # Fallback: préfixe UNK_ + 4 premiers caractères de l'adresse
+    short_addr = token_address[:4] if token_address else "????"
+    return f"UNK_{short_addr}"
+
+
 def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
                pnl_pct: float = 0.0, reason: str = "", price: float = 0.0,
                amount_sol: float = 0.0):
@@ -1157,10 +1170,11 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Exécuter l'achat
     result = trading_engine.execute_buy(analysis, "manual")
     if result:
+        sym = _safe_symbol(analysis.get("symbol"), token_address)
         # RÈGLE 5: Logger le BUY
         _log_trade(
             token_address=token_address,
-            token_symbol=analysis.get("symbol", "???"),
+            token_symbol=sym,
             strategy="manual",
             side="BUY",
             price=float(analysis.get("price_usd", 0) or 0),
@@ -1171,13 +1185,13 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entry_price = float(analysis.get("price_usd", 0) or 0)
             circuit_breaker.open_position(
                 token_address=token_address,
-                token_symbol=analysis.get("symbol", "???"),
+                token_symbol=sym,
                 entry_price=entry_price,
             )
         if capital_watchdog:
             capital_watchdog.register_position(
                 token_address=token_address,
-                token_symbol=analysis.get("symbol", "???"),
+                token_symbol=sym,
                 strategy="manual",
                 amount_sol=result['amount_sol'],
                 entry_price=float(analysis.get("price_usd", 0) or 0),
@@ -1433,19 +1447,20 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
     # Exécuter l'achat (copy trade)
     result = trading_engine.execute_buy(analysis, "copy_trade")
     if result:
+        sym = _safe_symbol(analysis.get("symbol") or signal.token_symbol, token_mint)
         seen_tokens.add(token_mint)
         # Enregistrer dans le CircuitBreaker
         if circuit_breaker:
             entry_price = float(analysis.get("price_usd", 0) or 0)
             circuit_breaker.open_position(
                 token_address=token_mint,
-                token_symbol=analysis.get("symbol", signal.token_symbol),
+                token_symbol=sym,
                 entry_price=entry_price,
             )
         if capital_watchdog:
             capital_watchdog.register_position(
                 token_address=token_mint,
-                token_symbol=analysis.get("symbol", signal.token_symbol),
+                token_symbol=sym,
                 strategy="copy_trade",
                 amount_sol=result['amount_sol'],
                 entry_price=float(analysis.get("price_usd", 0) or 0),
@@ -2376,9 +2391,10 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         seen_tokens.add(address)
 
                         # RÈGLE 5: Logger le BUY
+                        sym = _safe_symbol(signal.token_symbol or analysis.get("symbol"), address)
                         _log_trade(
                             token_address=address,
-                            token_symbol=signal.token_symbol,
+                            token_symbol=sym,
                             strategy=signal.strategy,
                             side="BUY",
                             price=float(analysis.get("price_usd", 0) or 0),
@@ -2390,13 +2406,13 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             entry_price = float(analysis.get("price_usd", 0) or 0)
                             circuit_breaker.open_position(
                                 token_address=address,
-                                token_symbol=signal.token_symbol,
+                                token_symbol=sym,
                                 entry_price=entry_price,
                             )
                         if capital_watchdog:
                             capital_watchdog.register_position(
                                 token_address=address,
-                                token_symbol=signal.token_symbol,
+                                token_symbol=sym,
                                 strategy=signal.strategy,
                                 amount_sol=result['amount_sol'],
                                 entry_price=float(analysis.get("price_usd", 0) or 0),
@@ -2550,10 +2566,11 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
+                    sym = _safe_symbol(analysis.get("symbol"), address)
                     # RÈGLE 5: Logger le BUY
                     _log_trade(
                         token_address=address,
-                        token_symbol=analysis.get("symbol", "???"),
+                        token_symbol=sym,
                         strategy="sniper",
                         side="BUY",
                         price=float(analysis.get("price_usd", 0) or 0),
@@ -2564,13 +2581,13 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         entry_price = float(analysis.get("price_usd", 0) or 0)
                         circuit_breaker.open_position(
                             token_address=address,
-                            token_symbol=analysis.get("symbol", "???"),
+                            token_symbol=sym,
                             entry_price=entry_price,
                         )
                     if capital_watchdog:
                         capital_watchdog.register_position(
                             token_address=address,
-                            token_symbol=analysis.get("symbol", "???"),
+                            token_symbol=sym,
                             strategy="sniper",
                             amount_sol=result['amount_sol'],
                             entry_price=float(analysis.get("price_usd", 0) or 0),
@@ -3221,7 +3238,7 @@ def main():
                     analysis = api.analyze_token(mint)
                     if analysis:
                         token_name = analysis.get("name", "Unknown")
-                        token_symbol = analysis.get("symbol", "???")
+                        token_symbol = _safe_symbol(analysis.get("symbol"), mint)
                         price_usd = float(analysis.get("price_usd", 0) or 0)
                         # Filtre qualité Recovered: vérifier volume et liquidité
                         volume_24h = float(analysis.get("volume_24h", 0) or 0)
