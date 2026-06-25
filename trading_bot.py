@@ -2378,6 +2378,12 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
     """Scanner et trader automatiquement avec Smart Entry (double-check)"""
+    # ─── COUVRE-FEU 3h-7h UTC (heures creuses pump.fun = rugs nocturnes) ───
+    current_hour_utc = datetime.now(timezone.utc).hour
+    if 3 <= current_hour_utc < 7:
+        return  # Skip silencieusement, pas de log spam
+    # ─────────────────────────────────────────────────────────────────
+
     # Daily PnL Guard: ne pas trader si en pause
     if daily_pnl_guard and daily_pnl_guard.is_paused():
         logger.info(f"[SCAN] Trading en pause: {daily_pnl_guard.get_pause_reason()}")
