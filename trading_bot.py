@@ -38,6 +38,7 @@ from circuit_breaker import CircuitBreaker, CBConfig
 from capital_watchdog import CapitalWatchdog, WatchdogConfig
 from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
 from token_filter import TokenFilter
+from onchain_scorer import OnchainScorer
 from auto_calibration import analyze_postmortems, apply_adjustments
 
 # ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
@@ -303,6 +304,7 @@ circuit_breaker: CircuitBreaker = None
 capital_watchdog: CapitalWatchdog = None
 daily_pnl_guard: DailyPnLGuard = None
 token_filter: TokenFilter = None
+onchain_scorer: OnchainScorer = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -395,6 +397,11 @@ def init_trading():
     # Token Filter on-chain (mint authority + LP burned + deployer)
     token_filter = TokenFilter(rpc_url=trading_config.rpc_url)
     logger.info("🔍 Token Filter on-chain initialisé (mint/LP/deployer)")
+
+    # Onchain Scorer — scoring direct RPC (remplace RugCheck comme source primaire)
+    global onchain_scorer
+    onchain_scorer = OnchainScorer(rpc_url=trading_config.rpc_url)
+    logger.info("⚡ Onchain Scorer initialisé (score maison 0-100, ~150ms)")
 
     # Filtre anti-corrélation (RENFORCÉ avec deployer on-chain)
     correlation_filter = CorrelationFilter(data_dir=DATA_DIR, token_filter=token_filter)
@@ -3131,32 +3138,44 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                     seen_tokens.clear()
                 continue
 
-            # 🔍 FILTRE ON-CHAIN RAPIDE (mint authority + freeze) — 1 seul appel RPC
-            if token_filter:
-                mint_ok, mint_reason = await token_filter.quick_mint_check(address)
-                if not mint_ok:
-                    logger.info(f"🚫 REJETÉ (on-chain): {analysis.get('name', address[:12])} - {mint_reason}")
+            # ⚡ SCORING ON-CHAIN DIRECT (remplace RugCheck comme source primaire, ~150ms)
+            if onchain_scorer:
+                oc_score = await onchain_scorer.score_token(address)
+                if not oc_score.safe:
+                    logger.info(f"🚫 REJETÉ (onchain score={oc_score.score}): "
+                               f"{analysis.get('name', address[:12])} — {oc_score.summary}")
                     seen_tokens.add(address)
                     if len(seen_tokens) > MAX_SEEN_TOKENS:
                         seen_tokens.clear()
                     continue
+                logger.info(f"✅ Onchain OK (score={oc_score.score}): "
+                           f"{analysis.get('name', address[:12])} — {oc_score.summary}")
+            else:
+                # Fallback: anciens filtres si onchain_scorer indisponible
+                if token_filter:
+                    mint_ok, mint_reason = await token_filter.quick_mint_check(address)
+                    if not mint_ok:
+                        logger.info(f"🚫 REJETÉ (on-chain): {analysis.get('name', address[:12])} - {mint_reason}")
+                        seen_tokens.add(address)
+                        if len(seen_tokens) > MAX_SEEN_TOKENS:
+                            seen_tokens.clear()
+                        continue
 
-            # 🛡️ FILTRE ANTI-RUG RENFORCÉ (RugCheck + holders + LP)
-            if security_checker:
-                # Déterminer la stratégie pour adapter la sévérité
+            # 🛡️ FILTRE ANTI-RUG (RugCheck = FALLBACK si onchain_scorer a des erreurs)
+            if security_checker and (not onchain_scorer or (onchain_scorer and oc_score.errors)):
                 token_age = analysis.get('age_hours', 999)
                 check_strategy = "sniper" if token_age < 1 else "momentum"
                 is_safe, security_reason = security_checker.quick_check(address, strategy=check_strategy)
                 if not is_safe:
-                    logger.info(f"🚫 REJETÉ (anti-rug): {analysis.get('name', address[:12])} - {security_reason}")
+                    logger.info(f"🚫 REJETÉ (RugCheck fallback): {analysis.get('name', address[:12])} - {security_reason}")
                     seen_tokens.add(address)
                     if len(seen_tokens) > MAX_SEEN_TOKENS:
                         seen_tokens.clear()
                     continue
-                logger.info(f"✅ Token sûr: {analysis.get('name', address[:12])} - {security_reason}")
+                logger.info(f"✅ RugCheck fallback OK: {analysis.get('name', address[:12])} - {security_reason}")
 
-            # 🔥 FILTRE LP BURNED (vérification on-chain indépendante)
-            if token_filter:
+            # 🔥 FILTRE LP BURNED (vérification on-chain complète si pas déjà confirmé par scorer)
+            if token_filter and not (onchain_scorer and oc_score.lp_burned):
                 pair_addr = analysis.get('pair_address', '')
                 if pair_addr:
                     tf_result = await token_filter.check(
