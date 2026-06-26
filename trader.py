@@ -47,8 +47,9 @@ class TradingConfig:
     sniper_enabled: bool = True
     sniper_position_sol: float = 0.05    # Montant par snipe
     sniper_min_liquidity: float = 5000   # Liquidité min pour sniper ($)
-    sniper_min_mc: float = 50_000        # MC MINIMUM pour sniper ($50K = pas de micro-rug)
+    sniper_min_mc: float = 5_000         # MC MINIMUM pour sniper ($5K = token frais, pump potentiel)
     sniper_max_mc: float = 100_000       # MC max pour sniper ($)
+    recovered_min_mc: float = 50_000     # MC MINIMUM pour recovered ($50K = token établi)
 
 
     # Take Profit & Stop Loss

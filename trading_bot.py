@@ -2572,11 +2572,11 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 if not analysis:
                     continue
 
-                # 🚨 GATE MC MINIMUM $50K (smart_entry aussi)
+                # 🚨 GATE MC MINIMUM RECOVERED $50K (token établi requis)
                 mc = analysis.get("market_cap", 0) or 0
-                if mc < trading_config.sniper_min_mc:
-                    logger.info(f"🚫 REJETÉ (MC trop faible): {analysis.get('name', address[:12])} "
-                               f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
+                if mc < trading_config.recovered_min_mc:
+                    logger.info(f"🚫 REJETÉ (MC trop faible RECOVERED): {analysis.get('name', address[:12])} "
+                               f"MC=${mc:,.0f} < ${trading_config.recovered_min_mc:,.0f}")
                     smart_entry.consume_signal(address)
                     seen_tokens.add(address)
                     continue
@@ -2765,10 +2765,10 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
             if not analysis:
                 continue
 
-            # 🚨 GATE MC MINIMUM $50K — AVANT TOUT (bloque les micro-rugs)
+            # 🚨 GATE MC MINIMUM SNIPER $5K — AVANT TOUT (bloque les nano-rugs)
             mc = analysis.get("market_cap", 0) or 0
             if mc < trading_config.sniper_min_mc:
-                logger.info(f"🚫 REJETÉ (MC trop faible): {analysis.get('name', address[:12])} "
+                logger.info(f"🚫 REJETÉ (MC trop faible SNIPER): {analysis.get('name', address[:12])} "
                            f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
                 seen_tokens.add(address)
                 if len(seen_tokens) > MAX_SEEN_TOKENS:
