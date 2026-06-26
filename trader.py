@@ -510,12 +510,25 @@ class PositionManager:
         self._load_positions()
 
     def _load_positions(self):
-        """Charger les positions depuis le fichier"""
+        """Charger les positions depuis le fichier (purge zombies > 2h)"""
         if os.path.exists(self.POSITIONS_FILE):
             with open(self.POSITIONS_FILE, "r") as f:
                 data = json.load(f)
+            now = datetime.utcnow()
             for addr, pos_data in data.items():
-                self.positions[addr] = Position.from_dict(pos_data)
+                pos = Position.from_dict(pos_data)
+                # PURGE ZOMBIE: virer toute position > 2 heures
+                try:
+                    entry_dt = datetime.fromisoformat(pos.entry_time)
+                    age_hours = (now - entry_dt).total_seconds() / 3600
+                    if age_hours > 2:
+                        logger.warning(f"\U0001f480 PURGE ZOMBIE au boot: {pos.token_symbol} "
+                                      f"({age_hours:.1f}h) — supprim\u00e9e")
+                        continue  # Ne pas charger cette position
+                except (ValueError, TypeError):
+                    pass  # entry_time invalide → charger quand même
+                self.positions[addr] = pos
+            self._save_positions()  # Sauvegarder sans les zombies
 
     def _save_positions(self):
         """Sauvegarder les positions"""
