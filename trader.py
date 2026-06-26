@@ -633,9 +633,11 @@ class TradingEngine:
         if elapsed < self.config.cooldown_seconds:
             return False, f"Cooldown ({self.config.cooldown_seconds - elapsed:.0f}s restantes)"
 
-        # Max positions
-        if self.positions.count_positions() >= self.config.max_open_positions:
-            return False, f"Max positions atteint ({self.config.max_open_positions})"
+        # Max positions (dynamique: solde / position_size)
+        balance = self.wallet.get_sol_balance()
+        dynamic_max = max(1, int(balance / self.config.position_size_sol))
+        if self.positions.count_positions() >= dynamic_max:
+            return False, f"Max positions atteint ({self.positions.count_positions()}/{dynamic_max}, solde={balance:.2f} SOL)"
 
         # Budget
         total_invested = self.positions.total_invested()
