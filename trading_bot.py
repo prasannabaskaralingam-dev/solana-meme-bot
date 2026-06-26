@@ -9,7 +9,7 @@ import logging.handlers
 import time
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 
 from telegram import Update
 from telegram.ext import (
@@ -2375,6 +2375,255 @@ async def postmortem_analysis_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Erreur postmortem_analysis_job: {e}")
 
 
+# ============================================================
+# DAILY SUMMARY JOB (20h UTC)
+# ============================================================
+
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job quotidien — envoyé chaque soir à 20h UTC.
+    Résumé complet de la journée sur Telegram.
+    """
+    if not pnl_tracker or not subscribers:
+        return
+
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Récupérer les trades du jour depuis trades.json
+        trades_today = []
+        if os.path.exists(TRADES_LOG_FILE):
+            try:
+                with open(TRADES_LOG_FILE, "r") as f:
+                    all_trades = json.load(f)
+                trades_today = [
+                    t for t in all_trades
+                    if t.get("timestamp", "").startswith(today)
+                ]
+            except Exception:
+                pass
+
+        total_trades = len(trades_today)
+        sells = [t for t in trades_today if t.get("side") == "SELL"]
+        buys = [t for t in trades_today if t.get("side") == "BUY"]
+        wins = [t for t in sells if t.get("pnl_pct", 0) > 0]
+        losses = [t for t in sells if t.get("pnl_pct", 0) <= 0]
+        total_pnl_pct = sum(t.get("pnl_pct", 0) for t in sells)
+        avg_pnl = total_pnl_pct / len(sells) if sells else 0
+
+        best = max(sells, key=lambda t: t.get("pnl_pct", 0), default=None)
+        worst = min(sells, key=lambda t: t.get("pnl_pct", 0), default=None)
+
+        best_str = f"+{best['pnl_pct']:.1f}% ({best.get('token', '?')})" if best else "—"
+        worst_str = f"{worst['pnl_pct']:.1f}% ({worst.get('token', '?')})" if worst else "—"
+
+        # Post-mortems du jour (gains manqués)
+        missed_avg = 0
+        try:
+            import sqlite3
+            conn = sqlite3.connect(os.path.join(DATA_DIR, "postmortem.db"))
+            c = conn.cursor()
+            c.execute("""
+                SELECT AVG(missed_gain), COUNT(*)
+                FROM postmortem
+                WHERE exit_time LIKE ?
+            """, (f"{today}%",))
+            row = c.fetchone()
+            conn.close()
+            if row and row[0]:
+                missed_avg = row[0]
+        except Exception:
+            pass
+
+        # Recommandation
+        recommandation = ""
+        if missed_avg > 30:
+            recommandation = (
+                f"\n\u2699\ufe0f *Recommandation :*\n"
+                f"Gain moyen manqu\u00e9 : `+{missed_avg:.1f}%`\n"
+                f"\u2192 TP trop t\u00f4t \u2014 envisager Trailing plus large"
+            )
+        elif missed_avg < 5 and len(sells) > 3:
+            recommandation = (
+                f"\n\u2699\ufe0f *Recommandation :*\n"
+                f"Gain manqu\u00e9 faible : `+{missed_avg:.1f}%`\n"
+                f"\u2192 Param\u00e8tres bien calibr\u00e9s \u2705"
+            )
+
+        # Solde actuel
+        solde_sol = 0.0
+        try:
+            solde_sol = trading_engine.wallet.get_sol_balance()
+        except Exception:
+            pass
+
+        # Message Telegram
+        emoji_jour = "\u2705" if avg_pnl > 0 else "\ud83d\udd34"
+
+        msg = (
+            f"\ud83d\udcca *R\u00e9sum\u00e9 du {today}*\n\n"
+            f"{emoji_jour} *PnL moyen :* `{avg_pnl:+.1f}%`\n"
+            f"\ud83d\udcc8 *Trades :* `{total_trades}` "
+            f"(\ud83d\udcb0{len(buys)} achats / \ud83d\udcb8{len(sells)} ventes)\n"
+            f"\ud83c\udfaf *Win Rate :* `{len(wins)}/{len(sells)}` "
+            f"({(len(wins)/len(sells)*100) if sells else 0:.0f}%)\n"
+            f"\ud83d\ude80 *Meilleur :* `{best_str}`\n"
+            f"\ud83d\udca5 *Pire :* `{worst_str}`\n"
+            f"\ud83d\udcb0 *Solde :* `{solde_sol:.4f} SOL`\n"
+            f"{recommandation}\n\n"
+            f"\ud83d\udd50 Prochain r\u00e9sum\u00e9 demain \u00e0 20h UTC"
+        )
+
+        for chat_id in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"[DailySummary] Telegram error: {e}")
+
+        logger.info(f"[DailySummary] R\u00e9sum\u00e9 envoy\u00e9 \u2014 {total_trades} trades")
+
+    except Exception as e:
+        logger.error(f"[DailySummary] Erreur: {e}")
+
+
+# ============================================================
+# CRITICAL MONITOR JOB (60s)
+# ============================================================
+
+# Anti-spam : une alerte par type par heure
+CRITICAL_SL_THRESHOLD = -20.0
+CRITICAL_ZOMBIE_MINUTES = 60
+CRITICAL_RAM_PCT = 80
+CRITICAL_GAP_SECONDS = 30
+_last_alert_time = {}
+
+
+def _can_alert(alert_type: str, cooldown_seconds: int = 3600) -> bool:
+    """\u00c9vite le spam d'alertes du m\u00eame type."""
+    now = time.time()
+    last = _last_alert_time.get(alert_type, 0)
+    if now - last > cooldown_seconds:
+        _last_alert_time[alert_type] = now
+        return True
+    return False
+
+
+async def _send_critical_alert(context, alert_type: str, message: str):
+    """Envoie une alerte critique sur Telegram (cooldown 1h par type)."""
+    if not _can_alert(alert_type):
+        return
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"[CriticalAlert] Telegram error: {e}")
+
+
+async def critical_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job toutes les 60s \u2014 v\u00e9rifie les 4 conditions critiques.
+    N'envoie une alerte QUE si condition critique atteinte.
+    """
+    try:
+        # CRITIQUE 1 \u2014 SL > -20%
+        if positions:
+            for pos in positions.get_open_positions():
+                pnl = getattr(pos, 'pnl_pct', 0) or 0
+                if pnl <= CRITICAL_SL_THRESHOLD:
+                    symbol = getattr(pos, 'token_symbol', pos.token_address[:8])
+                    await _send_critical_alert(
+                        context,
+                        alert_type=f"sl_{pos.token_address[:8]}",
+                        message=(
+                            f"\ud83d\udea8 *ALERTE SL CRITIQUE*\n\n"
+                            f"\ud83c\udff7 Token : `{symbol}`\n"
+                            f"\ud83d\udcc9 PnL : `{pnl:.1f}%`\n"
+                            f"\u26a0\ufe0f SL universel -25% imminent\n"
+                            f"\ud83d\udd50 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+                        )
+                    )
+
+        # CRITIQUE 2 \u2014 Zombie > 60 min
+        if positions:
+            for pos in positions.get_open_positions():
+                entry_time = getattr(pos, 'entry_time', None)
+                if entry_time:
+                    try:
+                        if isinstance(entry_time, str):
+                            entry = datetime.fromisoformat(entry_time)
+                        else:
+                            entry = entry_time
+                        if entry.tzinfo is None:
+                            entry = entry.replace(tzinfo=timezone.utc)
+                        age_min = (datetime.now(timezone.utc) - entry).total_seconds() / 60
+
+                        if age_min > CRITICAL_ZOMBIE_MINUTES:
+                            symbol = getattr(pos, 'token_symbol', pos.token_address[:8])
+                            pnl = getattr(pos, 'pnl_pct', 0) or 0
+                            await _send_critical_alert(
+                                context,
+                                alert_type=f"zombie_{pos.token_address[:8]}",
+                                message=(
+                                    f"\ud83e\udddf *POSITION ZOMBIE D\u00c9TECT\u00c9E*\n\n"
+                                    f"\ud83c\udff7 Token : `{symbol}`\n"
+                                    f"\u23f1 \u00c2ge : `{age_min:.0f} min`\n"
+                                    f"\ud83d\udcca PnL : `{pnl:+.1f}%`\n"
+                                    f"\u2192 Utilise /kill\\_zombies pour fermer"
+                                )
+                            )
+                    except Exception:
+                        pass
+
+        # CRITIQUE 3 \u2014 RAM > 80%
+        try:
+            import psutil
+            ram_pct = psutil.virtual_memory().percent
+            if ram_pct > CRITICAL_RAM_PCT:
+                await _send_critical_alert(
+                    context,
+                    alert_type="ram_critical",
+                    message=(
+                        f"\u26a0\ufe0f *RAM CRITIQUE*\n\n"
+                        f"\ud83d\udcbe Utilisation : `{ram_pct:.1f}%`\n"
+                        f"\ud83d\udd34 Risque de crash OOM\n"
+                        f"\u2192 Render peut red\u00e9marrer\n"
+                        f"\u2192 auto\\_trading sera relu depuis state.json"
+                    )
+                )
+        except ImportError:
+            pass
+
+        # CRITIQUE 4 \u2014 Bot mort (gap watchdog)
+        if capital_watchdog and hasattr(capital_watchdog, 'positions'):
+            for token_addr, wpos in capital_watchdog.positions.items():
+                last_check = getattr(wpos, 'last_check_time', 0) or 0
+                if last_check > 0:
+                    gap = time.time() - last_check
+                    if gap > CRITICAL_GAP_SECONDS:
+                        symbol = getattr(wpos, 'token_symbol', token_addr[:8])
+                        await _send_critical_alert(
+                            context,
+                            alert_type=f"dead_{token_addr[:8]}",
+                            message=(
+                                f"\ud83d\udc80 *BOT AVEUGLE D\u00c9TECT\u00c9*\n\n"
+                                f"\ud83c\udff7 Token : `{symbol}`\n"
+                                f"\u23f1 Gap : `{gap:.0f}s` sans v\u00e9rification\n"
+                                f"\ud83d\udea8 Position non surveill\u00e9e"
+                            )
+                        )
+
+    except Exception as e:
+        logger.error(f"[CriticalMonitor] Erreur: {e}")
+
+
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
     """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
     global auto_trading_enabled
@@ -3613,6 +3862,23 @@ def main():
 
     # Job Post-Mortem Analysis (6h) - rapport automatique d'insights
     job_queue.run_repeating(postmortem_analysis_job, interval=21600, first=300)
+
+    # Alertes critiques (60s) - SL imminent, zombie, RAM, bot mort
+    job_queue.run_repeating(critical_monitor_job, interval=60, first=30)
+
+    # Résumé quotidien à 20h UTC
+    job_queue.run_daily(
+        daily_summary_job,
+        time=dt_time(hour=20, minute=0, tzinfo=timezone.utc),
+        name="daily_summary"
+    )
+
+    # Auto-calibration quotidienne à 21h UTC (1h après le résumé)
+    job_queue.run_daily(
+        auto_calibration_job,
+        time=dt_time(hour=21, minute=0, tzinfo=timezone.utc),
+        name="auto_calibration"
+    )
 
     # Démarrer le WebSocket PriceMonitor pour les positions existantes
     # (s'exécute en arrière-plan dans l'event loop)
