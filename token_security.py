@@ -89,11 +89,15 @@ class TokenSecurityChecker:
 
     def __init__(self, rpc_url: str = "https://api.mainnet-beta.solana.com"):
         self.rpc_url = rpc_url
-        self.client = httpx.Client(timeout=12)
-        # Cache pour éviter de re-checker le même token
+        # Timeout RugCheck = 1.5s max (si lent → skip)
+        self.client = httpx.Client(timeout=1.5)
+        # Cache pour éviter de re-checker le même token (5 min)
         self._cache: dict[str, SecurityReport] = {}
         self._cache_ttl = 300  # 5 minutes
         self._cache_timestamps: dict[str, float] = {}
+        # Cache RugCheck brut (évite de rappeler l'API si < 5min)
+        self._rugcheck_cache: dict[str, dict] = {}
+        self._rugcheck_cache_ts: dict[str, float] = {}
         # Blacklist de créateurs connus comme scammers
         self._scammer_creators: set = set()
 
@@ -258,8 +262,9 @@ class TokenSecurityChecker:
                 is_honeypot = True
 
         else:
-            # Pas de données RugCheck - vérifications on-chain uniquement
-            logger.warning(f"RugCheck indisponible pour {token_address[:12]}...")
+            # RugCheck down/timeout → décision basée sur LP on-chain + holders
+            # Score RugCheck = OPTIONNEL, pas bloquant
+            logger.warning(f"[RugCheck] indisponible pour {token_address[:12]} — fallback on-chain")
             mint_revoked, freeze_revoked = self._check_authorities_onchain(token_address)
             if not mint_revoked:
                 reasons.append("🚨 Mint Authority active (on-chain)")
@@ -267,9 +272,14 @@ class TokenSecurityChecker:
             if not freeze_revoked:
                 reasons.append("🚨 Freeze Authority active (on-chain)")
                 risk_score += 200
-            # Sans RugCheck, on est plus conservateur
-            risk_score += 100
-            reasons.append("⚠️ RugCheck indisponible - vérification limitée")
+            # Pas de pénalité supplémentaire: on fait confiance au token_filter on-chain
+            # (LP burned + mint check déjà vérifiés par token_filter.py)
+            if mint_revoked and freeze_revoked:
+                reasons.append("✅ Authorities révoquées (on-chain) — RugCheck skip")
+                # Pas de pénalité: le token passe si mint+freeze OK
+            else:
+                risk_score += 50  # Légère pénalité (pas 100)
+                reasons.append("⚠️ RugCheck timeout — vérification on-chain seule")
 
         # === BONUS DE SÉCURITÉ ===
         if mint_revoked:
@@ -392,17 +402,39 @@ class TokenSecurityChecker:
         logger.info(f"🚫 Créateur blacklisté: {creator_address[:12]}...")
 
     def _get_rugcheck_report(self, token_address: str) -> Optional[dict]:
-        """Récupérer le rapport RugCheck (gratuit, pas besoin de clé API)"""
+        """
+        Récupérer le rapport RugCheck (gratuit, pas besoin de clé API).
+        - Timeout: 1.5s max
+        - Cache: réutilise si < 5min
+        - Si down/timeout: retourne None (fallback on-chain)
+        """
+        # Cache mémoire: si même token vérifié < 5min → réutiliser
+        if token_address in self._rugcheck_cache:
+            cache_age = time.time() - self._rugcheck_cache_ts.get(token_address, 0)
+            if cache_age < self._cache_ttl:
+                logger.debug(f"[RugCheck] Cache hit pour {token_address[:12]} ({cache_age:.0f}s)")
+                return self._rugcheck_cache[token_address]
+
         try:
             url = f"{self.RUGCHECK_API}/v1/tokens/{token_address}/report"
             response = self.client.get(url)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                # Stocker en cache
+                self._rugcheck_cache[token_address] = data
+                self._rugcheck_cache_ts[token_address] = time.time()
+                return data
             else:
-                logger.warning(f"RugCheck API status {response.status_code} pour {token_address[:12]}")
+                logger.warning(f"[RugCheck] API status {response.status_code} pour {token_address[:12]}")
                 return None
+        except httpx.TimeoutException:
+            logger.warning(f"[RugCheck] timeout skip {token_address[:12]} (>1.5s)")
+            return None
+        except httpx.ConnectError:
+            logger.warning(f"[RugCheck] connexion impossible — API down")
+            return None
         except Exception as e:
-            logger.error(f"Erreur RugCheck API: {e}")
+            logger.error(f"[RugCheck] erreur: {e}")
             return None
 
     def _get_rugcheck_summary(self, token_address: str) -> Optional[dict]:
