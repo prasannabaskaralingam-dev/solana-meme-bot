@@ -38,6 +38,7 @@ from circuit_breaker import CircuitBreaker, CBConfig
 from capital_watchdog import CapitalWatchdog, WatchdogConfig
 from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
 from token_filter import TokenFilter
+from auto_calibration import analyze_postmortems, apply_adjustments
 
 # ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
 def _setup_logging():
@@ -2622,6 +2623,112 @@ async def critical_monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"[CriticalMonitor] Erreur: {e}")
+
+
+# ============================================================
+# AUTO-CALIBRATION JOB (21h UTC)
+# ============================================================
+
+async def auto_calibration_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job quotidien \u00e0 21h UTC.
+    Analyse les post-mortems et ajuste les param\u00e8tres automatiquement.
+    """
+    logger.info("[AutoCalib] D\u00e9marrage analyse post-mortems...")
+
+    try:
+        # Analyser les donn\u00e9es
+        analysis = analyze_postmortems(DATA_DIR)
+
+        if analysis["status"] == "insufficient_data":
+            msg = (
+                f"\ud83d\udcca *Auto-Calibration*\n\n"
+                f"\u23f3 Donn\u00e9es insuffisantes\n"
+                f"Trades analys\u00e9s : `{analysis['trades_analyzed']}`\n"
+                f"Minimum requis  : `{analysis['min_required']}`\n\n"
+                f"\u2192 Calibration disponible dans "
+                f"`{analysis['min_required'] - analysis['trades_analyzed']}` trades"
+            )
+            for chat_id in subscribers:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    pass
+            return
+
+        if analysis["status"] in ("error", "no_database", "no_table"):
+            logger.info(f"[AutoCalib] Pas de donn\u00e9es: {analysis['status']}")
+            return
+
+        adjustments = analysis.get("adjustments", {})
+
+        # Appliquer les changements dans state.json
+        state = _load_state()
+        changes = apply_adjustments(adjustments, state)
+
+        if changes:
+            # Sauvegarder state.json avec les nouveaux param\u00e8tres
+            for param, data in changes.items():
+                state[param] = data["new"]
+            state["last_updated"] = datetime.now(timezone.utc).isoformat()
+            try:
+                with open(STATE_FILE, "w") as f:
+                    json.dump(state, f, indent=2)
+            except IOError:
+                pass
+
+            # Appliquer au circuit_breaker en m\u00e9moire
+            if circuit_breaker:
+                cb_updates = {}
+                if "tp_pct" in changes:
+                    cb_updates["take_profit_pct"] = changes["tp_pct"]["new"]
+                if "trailing_sl" in changes:
+                    cb_updates["trailing_sl_pct"] = changes["trailing_sl"]["new"]
+                if "time_stop_sniper" in changes:
+                    cb_updates["time_stop_sniper_min"] = changes["time_stop_sniper"]["new"]
+                if cb_updates:
+                    circuit_breaker.update_config(**cb_updates)
+
+        # Construire le rapport Telegram
+        lines = [
+            f"\ud83e\udd16 *Auto-Calibration \u2014 {datetime.now(timezone.utc).strftime('%Y-%m-%d')}*\n",
+            f"\ud83d\udcca Trades analys\u00e9s : `{analysis['trades_analyzed']}`\n"
+        ]
+
+        if changes:
+            lines.append("*Param\u00e8tres ajust\u00e9s :*\n")
+            for param, data in changes.items():
+                lines.append(
+                    f"{data['direction']} `{param}`\n"
+                    f"   `{data['old']}` \u2192 `{data['new']}`\n"
+                    f"   _{data['reason']}_\n"
+                )
+        else:
+            lines.append("\u2705 *Tous les param\u00e8tres sont optimaux*\n")
+            lines.append("Aucun ajustement n\u00e9cessaire\n")
+
+        lines.append(f"\n\ud83d\udd50 Prochaine calibration demain \u00e0 21h UTC")
+
+        msg = "\n".join(lines)
+
+        for chat_id in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"[AutoCalib] Telegram error: {e}")
+
+        logger.info(f"[AutoCalib] Termin\u00e9 \u2014 {len(changes)} changements")
+
+    except Exception as e:
+        logger.error(f"[AutoCalib] Erreur globale: {e}")
 
 
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
