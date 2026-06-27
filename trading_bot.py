@@ -41,6 +41,7 @@ from token_filter import TokenFilter
 from onchain_scorer import OnchainScorer
 from auto_calibration import analyze_postmortems, apply_adjustments
 from helius_websocket import HeliusWebSocket
+import requests
 
 # ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
 def _setup_logging():
@@ -283,6 +284,56 @@ def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
             json.dump(trades, f, indent=2)
     except (IOError, json.JSONDecodeError) as e:
         logger.error(f"[TRADES] Erreur écriture trades.json: {e}")
+
+
+# ─── FIX 2: Vérifier prix avant achat ────────────────────────────────────────
+def verify_price_before_buy(
+    token_address: str,
+    token_symbol: str,
+    max_attempts: int = 3,
+    wait_seconds: float = 2.0
+) -> tuple:
+    """
+    Vérifie que le token a un prix réel AVANT d'acheter.
+    Retourne (True, price) si OK, (False, 0.0) si skip.
+
+    Évite les Time Stop à 0% causés par
+    les tokens non encore indexés sur DexScreener.
+    """
+    for attempt in range(max_attempts):
+        try:
+            url = (
+                f"https://api.dexscreener.com/latest/"
+                f"dex/tokens/{token_address}"
+            )
+            r = requests.get(url, timeout=3)
+            pairs = r.json().get("pairs", [])
+
+            if pairs:
+                price = float(pairs[0].get("priceUsd", 0) or 0)
+                if price > 0:
+                    logger.info(
+                        f"[PrixCheck] ✅ {token_symbol} "
+                        f"prix OK à l'essai {attempt + 1}: ${price:.8f}"
+                    )
+                    return True, price
+
+            logger.info(
+                f"[PrixCheck] Prix=0 essai {attempt + 1}/{max_attempts} "
+                f"— attente {wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
+
+        except Exception as e:
+            logger.warning(f"[PrixCheck] Erreur essai {attempt + 1}: {e}")
+            time.sleep(wait_seconds)
+
+    logger.warning(
+        f"[PrixCheck] ⛔ SKIP {token_symbol} "
+        f"— prix=0 après {max_attempts} essais ({max_attempts * wait_seconds:.0f}s)"
+    )
+    return False, 0.0
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Initialisation globale
@@ -3070,6 +3121,22 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 trading_config.sniper_position_sol = original_size
                             continue
 
+                    # ─── FIX PRIX ZÉRO ─────────────────────────────────────────
+                    _sym = _safe_symbol(signal.token_symbol or analysis.get("symbol"), address)
+                    ok, verified_price = verify_price_before_buy(
+                        token_address=address,
+                        token_symbol=_sym
+                    )
+                    if not ok:
+                        logger.info(f"[Skip] {_sym} prix non disponible")
+                        smart_entry.consume_signal(address)
+                        seen_tokens.add(address)
+                        if position_sizer:
+                            trading_config.position_size_sol = original_size
+                            trading_config.sniper_position_sol = original_size
+                        continue
+                    # ────────────────────────────────────────────────────────
+
                     # Signal confirmé ! Exécuter l'achat
                     result = trading_engine.execute_buy(analysis, signal.strategy)
 
@@ -3294,6 +3361,18 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                         logger.info(f"{liq_reason} - Skip {analysis.get('name', address[:12])}")
                         seen_tokens.add(address)
                         continue
+                # ─── FIX PRIX ZÉRO ─────────────────────────────────────────
+                _sym_snipe = _safe_symbol(analysis.get("symbol"), address)
+                ok, verified_price = verify_price_before_buy(
+                    token_address=address,
+                    token_symbol=_sym_snipe
+                )
+                if not ok:
+                    logger.info(f"[Skip] {_sym_snipe} prix non disponible")
+                    seen_tokens.add(address)
+                    continue
+                # ────────────────────────────────────────────────────────
+
                 result = trading_engine.execute_buy(analysis, "sniper")
                 if result:
                     sym = _safe_symbol(analysis.get("symbol"), address)
