@@ -4374,6 +4374,10 @@ def main():
                         token_name = f"Token {mint[:8]}..."
                         token_symbol = "???"
                         price_usd = 0
+                    # Skip les tokens sans prix (non indexés = probablement morts)
+                    if price_usd <= 0:
+                        print(f"  ⚠️ Skip {token_symbol} ({mint[:12]}): prix=0 (token non indexé/mort)")
+                        continue
                     # Estimer le SOL investi (on utilise 0.05 par défaut)
                     positions.open_position(
                         token_address=mint,
@@ -4444,6 +4448,7 @@ def main():
     app.add_handler(CommandHandler("watchdog", watchdog_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("unpause", unpause_cmd))
+    app.add_handler(CommandHandler("resume", unpause_cmd))
     app.add_handler(CommandHandler("verify", verify_cmd))
     app.add_handler(CommandHandler("health_check", health_check_cmd))
 
