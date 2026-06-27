@@ -7,3 +7,11 @@ wallet.json
 positions.json
 trade_history.json
 trading_config.json
+
+# Logs & state
+bot.log
+*.log
+state.json
+postmortem.db
+*.db
+*.sqlite
