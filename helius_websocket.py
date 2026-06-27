@@ -235,7 +235,10 @@ class HeliusWebSocket:
             if t_reception is None:
                 t_reception = time.time()
             # DEBUG TEMPORAIRE — voir les events bruts
-            logger.info(f"[WSS-DEBUG] RAW EVENT REÇU: {json.dumps(msg)[:500]}")
+            # Log les logs pump.fun uniquement pour les CreateV2
+            _logs_str = str(msg.get('params',{}).get('result',{}).get('value',{}).get('logs',[]))
+            if 'CreateV2' in _logs_str or 'Initialize' in _logs_str:
+                logger.info(f"[WSS-DEBUG-CREATE] sig={msg.get('params',{}).get('result',{}).get('value',{}).get('signature','')} logs={_logs_str[:1500]}")
             params = msg.get("params", {})
             result = params.get("result", {})
             value  = result.get("value", {})
