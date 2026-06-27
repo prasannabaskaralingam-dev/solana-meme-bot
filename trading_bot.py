@@ -446,6 +446,11 @@ if os.path.exists(SUBS_FILE):
     subscribers = bot_data.get("subscribers", [])
 
 
+# Queue de nouveaux tokens détectés par le WebSocket (consommée par ws_token_processor_job)
+from collections import deque
+_ws_new_token_queue: deque = deque(maxlen=50)  # FIFO, max 50 tokens en attente
+
+
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
     global swap_engine, trading_engine, security_checker, price_monitor, copy_trader, smart_entry, pnl_tracker, position_sizer, correlation_filter, liquidity_guard, post_trade_analyzer, circuit_breaker, capital_watchdog, daily_pnl_guard, token_filter
@@ -621,6 +626,7 @@ def init_trading():
                 "price_usd": price_usd,
                 "timestamp": time.time(),
             })
+            logger.info(f"[WS-QUEUE] +1 token {token_address[:8]}... (queue={len(_ws_new_token_queue)})")
             seen_tokens.add(token_address)  # Marquer comme vu immédiatement (dédup)
             if len(seen_tokens) > MAX_SEEN_TOKENS:
                 seen_tokens.clear()
@@ -645,9 +651,8 @@ def init_trading():
 # Queue de notifications Telegram (le WS callback n'a pas accès au context)
 _ws_notification_queue: list = []
 
-# Queue de nouveaux tokens détectés par le WebSocket (consommée par ws_token_processor_job)
-from collections import deque
-_ws_new_token_queue: deque = deque(maxlen=50)  # FIFO, max 50 tokens en attente
+# Queue de nouveaux tokens détectés par le WebSocket (déplacée avant init_trading)
+# _ws_new_token_queue est définie au début du fichier (avant init_trading)
 
 # Prix SOL/USD caché (mis à jour périodiquement par le polling job)
 _cached_sol_price_usd: float = 150.0  # Défaut conservateur
@@ -2924,6 +2929,8 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
 
     # Traiter max 3 tokens par cycle (éviter de bloquer le bot)
     processed = 0
+    if _ws_new_token_queue:
+        logger.info(f"[WS-PROC] 📥 Queue: {len(_ws_new_token_queue)} tokens à traiter")
     while _ws_new_token_queue and processed < 3:
         token_data = _ws_new_token_queue.popleft()
         address = token_data["address"]
