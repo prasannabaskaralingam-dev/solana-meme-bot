@@ -1588,11 +1588,20 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
     if token_mint in seen_tokens:
         return
 
-    # Vérification sécurité rapide
-    if security_checker:
+    # Vérification sécurité rapide (RPC direct, 150ms)
+    import os
+    _helius_key = os.environ.get("HELIUS_API_KEY", "")
+    if _helius_key:
+        from rpc_security_check import check_token_security
+        rpc_sec = await check_token_security(token_mint, _helius_key)
+        if not rpc_sec.is_safe:
+            logger.info(f"[COPY] Token rejeté (Gate3 RPC): {signal.token_symbol} Score={rpc_sec.score}")
+            seen_tokens.add(token_mint)
+            return
+    elif security_checker:
         is_safe, sec_reason = security_checker.quick_check(token_mint)
         if not is_safe:
-            logger.info(f"[COPY] Token rejeté (sécurité): {signal.token_symbol} - {sec_reason}")
+            logger.info(f"[COPY] Token rejeté (RugCheck fallback): {signal.token_symbol} - {sec_reason}")
             seen_tokens.add(token_mint)
             return
 
@@ -3224,18 +3233,32 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             seen_tokens.clear()
                         continue
 
-            # 🛡️ FILTRE ANTI-RUG (RugCheck = FALLBACK si onchain_scorer a des erreurs)
-            if security_checker and (not onchain_scorer or (onchain_scorer and oc_score.errors)):
-                token_age = analysis.get('age_hours', 999)
-                check_strategy = "sniper" if token_age < 1 else "momentum"
-                is_safe, security_reason = security_checker.quick_check(address, strategy=check_strategy)
-                if not is_safe:
-                    logger.info(f"🚫 REJETÉ (RugCheck fallback): {analysis.get('name', address[:12])} - {security_reason}")
-                    seen_tokens.add(address)
-                    if len(seen_tokens) > MAX_SEEN_TOKENS:
-                        seen_tokens.clear()
-                    continue
-                logger.info(f"✅ RugCheck fallback OK: {analysis.get('name', address[:12])} - {security_reason}")
+            # 🛡️ GATE 3 — RPC Security Check (remplace RugCheck, 150ms vs 2-5s)
+            if not onchain_scorer or (onchain_scorer and oc_score.errors):
+                from rpc_security_check import check_token_security
+                import os
+                _helius_key = os.environ.get("HELIUS_API_KEY", "")
+                if _helius_key:
+                    rpc_sec = await check_token_security(address, _helius_key)
+                    if not rpc_sec.is_safe:
+                        logger.info(f"🚫 REJETÉ (Gate3 RPC): {analysis.get('name', address[:12])} "
+                                   f"Score={rpc_sec.score} - {', '.join(rpc_sec.reasons)}")
+                        seen_tokens.add(address)
+                        if len(seen_tokens) > MAX_SEEN_TOKENS:
+                            seen_tokens.clear()
+                        continue
+                    logger.info(f"✅ Gate3 RPC OK (score={rpc_sec.score}): {analysis.get('name', address[:12])}")
+                elif security_checker:
+                    # Fallback RugCheck si pas de clé Helius
+                    token_age = analysis.get('age_hours', 999)
+                    check_strategy = "sniper" if token_age < 1 else "momentum"
+                    is_safe, security_reason = security_checker.quick_check(address, strategy=check_strategy)
+                    if not is_safe:
+                        logger.info(f"🚫 REJETÉ (RugCheck fallback): {analysis.get('name', address[:12])} - {security_reason}")
+                        seen_tokens.add(address)
+                        if len(seen_tokens) > MAX_SEEN_TOKENS:
+                            seen_tokens.clear()
+                        continue
 
             # 🔥 FILTRE LP BURNED (vérification on-chain complète si pas déjà confirmé par scorer)
             if token_filter and not (onchain_scorer and oc_score.lp_burned):
