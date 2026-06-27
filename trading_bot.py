@@ -2019,17 +2019,12 @@ async def _flush_ws_notifications(context: ContextTypes.DEFAULT_TYPE):
                     msg += f"🔗 [TX](https://solscan.io/tx/{notif['tx']})"
 
             elif notif["type"] == "fallback_on":
-                msg = f"⚠️ *FALLBACK ACTIVÉ*\n\n"
-                msg += f"🔌 WebSocket Helius déconnecté\n"
-                msg += f"📝 {notif['reason']}\n"
-                msg += f"🔄 Polling DexScreener 3s actif\n"
-                msg += f"⚠️ Réactivité réduite (3s vs temps réel)"
+                # Notification désactivée (log only)
+                logger.info(f"[WS] Fallback activé: {notif['reason']}")
 
             elif notif["type"] == "fallback_off":
-                msg = f"✅ *WEBSOCKET RECONNECTÉ*\n\n"
-                msg += f"🔌 Helius WebSocket actif\n"
-                msg += f"📝 {notif['reason']}\n"
-                msg += f"⚡ Monitoring temps réel rétabli"
+                # Notification désactivée (log only)
+                logger.info(f"[WS] WebSocket reconnecté: {notif['reason']}")
 
             if msg:
                 for chat_id in subscribers:
@@ -2434,23 +2429,8 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     "sell_earlier": "⚠️ Vendre plus tôt",
                 }.get(result["verdict"], "❓")
 
-                msg = f"📊 *POST-TRADE: {result['token_symbol']}*\n\n"
-                msg += f"Vendu à: {result['exit_pnl']:+.1f}%\n"
-                msg += f"1h après: {result['pnl_1h_after']:+.1f}%\n"
-                if result['post_max'] > result['exit_pnl']:
-                    msg += f"Max post-vente: {result['post_max']:+.1f}%\n"
-                if result['missed'] > 0:
-                    msg += f"Profit raté: {result['missed']:.0f}%\n"
-                msg += f"\n{verdict_emoji}"
-
-                for chat_id in subscribers:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=chat_id, text=msg,
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                    except:
-                        pass
+                # Post-trade notification désactivée (log only)
+                logger.info(f"[PostTrade] {result['token_symbol']}: vendu {result['exit_pnl']:+.1f}% | 1h après: {result['pnl_1h_after']:+.1f}% | verdict: {result['verdict']}")
     except Exception as e:
         logger.error(f"Erreur post-trade analysis: {e}")
 
@@ -2554,9 +2534,12 @@ async def postmortem_analysis_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job quotidien — envoyé chaque soir à 20h UTC.
-    Résumé complet de la journée sur Telegram.
+    Job quotidien — DÉSACTIVÉ (log only).
+    Résumé disponible via /today.
     """
+    logger.info("[DailySummary] Job désactivé — utiliser /today")
+    return
+    # --- Code original désactivé ci-dessous ---
     if not pnl_tracker or not subscribers:
         return
 
@@ -2821,15 +2804,7 @@ async def auto_calibration_job(context: ContextTypes.DEFAULT_TYPE):
                 f"\u2192 Calibration disponible dans "
                 f"`{analysis['min_required'] - analysis['trades_analyzed']}` trades"
             )
-            for chat_id in subscribers:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception:
-                    pass
+            # Notification Telegram désactivée (log only)
             return
 
         if analysis["status"] in ("error", "no_database", "no_table"):
@@ -2887,15 +2862,7 @@ async def auto_calibration_job(context: ContextTypes.DEFAULT_TYPE):
 
         msg = "\n".join(lines)
 
-        for chat_id in subscribers:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=msg,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.error(f"[AutoCalib] Telegram error: {e}")
+        # Notification Telegram désactivée (log only)
 
         logger.info(f"[AutoCalib] Termin\u00e9 \u2014 {len(changes)} changements")
 
@@ -3791,32 +3758,12 @@ async def cb_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
-    """Heartbeat Telegram toutes les 30 min — confirme que le bot est actif"""
+    """Heartbeat Telegram toutes les 30 min — DÉSACTIVÉ (log only)"""
     open_pos = len(positions.get_open_positions()) if positions else 0
     cb_checks = circuit_breaker._stats["total_checks"] if circuit_breaker else 0
-    
-    # Daily PnL Guard status
-    guard_status = ""
-    if daily_pnl_guard:
-        stats = daily_pnl_guard.get_stats()
-        if stats["is_paused"]:
-            guard_status = f"\n⛔ {stats['pause_reason']}"
-        else:
-            guard_status = f"\n💰 PnL jour: {stats['daily_pnl_sol']:+.4f} SOL ({stats['trades_today']} trades)"
-    
-    msg = f"💚 *Bot Actif*\n"
-    msg += f"📊 Positions: {open_pos}\n"
-    msg += f"🔍 Checks CB: {cb_checks}\n"
-    msg += guard_status
-    
-    for chat_id in subscribers:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=msg,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except:
-            pass
+    logger.info(f"[Heartbeat] Bot actif | Positions: {open_pos} | CB checks: {cb_checks}")
+    # Notification Telegram désactivée pour réduire le bruit
+    return
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4622,29 +4569,15 @@ def main():
             except Exception as e:
                 print(f"⚠️ Erreur démarrage copy trading (polling fallback actif): {e}")
 
-        # RÈGLE 4: Alerte Telegram au redémarrage
+        # RÈGLE 4: Alerte Telegram au redémarrage — DÉSACTIVÉE (log only)
         if subscribers:
             try:
                 balance = wallet.get_sol_balance() if wallet.keypair else 0
                 n_positions = positions.count_positions()
-                restart_msg = (
-                    f"🔄 *BOT REDÉMARRÉ*\n\n"
-                    f"🤖 auto\_trading: {'ON ✅' if auto_trading_enabled else 'OFF ⛔'}\n"
-                    f"💾 État restauré depuis state.json\n"
-                    f"💰 Capital: {balance:.4f} SOL\n"
-                    f"📊 Positions ouvertes: {n_positions}\n"
-                    f"🚫 Blacklist: {len(sl_blacklist)} tokens\n"
-                    f"🎯 SL: {trading_config.stop_loss_pct}% | TP: +{trading_config.take_profit_pct}%\n"
-                    f"⚡ WebSocket Helius: actif"
-                )
-                for chat_id in subscribers:
-                    await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=restart_msg,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
+                logger.info(f"[Restart] Bot redémarré | Capital: {balance:.4f} SOL | Positions: {n_positions}")
+                # Notification Telegram désactivée pour réduire le bruit
             except Exception as e:
-                logger.error(f"Erreur alerte redémarrage Telegram: {e}")
+                logger.error(f"Erreur alerte redémarrage: {e}")
 
     app.post_init = post_init
 
