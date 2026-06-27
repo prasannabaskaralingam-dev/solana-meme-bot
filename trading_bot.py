@@ -607,8 +607,23 @@ def init_trading():
                         })
 
         async def _ws_on_new_token(token_address: str, price_usd: float):
-            """Callback Helius WS: nouveau token détecté sur pump.fun"""
-            logger.info(f"[WSS] 🆕 Nouveau token: {token_address[:8]}... ${price_usd:.8f}")
+            """Callback Helius WS: nouveau token détecté sur pump.fun → queue pour analyse"""
+            # Skip si déjà vu, en position, ou blacklisté
+            if token_address in seen_tokens:
+                return
+            if token_address in positions.positions:
+                return
+            if token_address in sl_blacklist and time.time() < sl_blacklist[token_address]:
+                return
+            # Ajouter à la queue pour traitement par ws_token_processor_job
+            _ws_new_token_queue.append({
+                "address": token_address,
+                "price_usd": price_usd,
+                "timestamp": time.time(),
+            })
+            seen_tokens.add(token_address)  # Marquer comme vu immédiatement (dédup)
+            if len(seen_tokens) > MAX_SEEN_TOKENS:
+                seen_tokens.clear()
 
         helius_ws = HeliusWebSocket(
             api_key=helius_api_key,
@@ -629,6 +644,10 @@ def init_trading():
 
 # Queue de notifications Telegram (le WS callback n'a pas accès au context)
 _ws_notification_queue: list = []
+
+# Queue de nouveaux tokens détectés par le WebSocket (consommée par ws_token_processor_job)
+from collections import deque
+_ws_new_token_queue: deque = deque(maxlen=50)  # FIFO, max 50 tokens en attente
 
 # Prix SOL/USD caché (mis à jour périodiquement par le polling job)
 _cached_sol_price_usd: float = 150.0  # Défaut conservateur
@@ -2883,6 +2902,188 @@ async def auto_calibration_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[AutoCalib] Erreur globale: {e}")
 
 
+async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job (5s): consomme les tokens détectés par le WebSocket Helius
+    et les passe dans le pipeline complet (OnchainScorer → filtres → execute_buy).
+    Avantage: détection en ~500ms vs 45s (polling DexScreener).
+    """
+    global auto_trading_enabled
+
+    if not auto_trading_enabled or not trading_engine:
+        return
+
+    # Daily PnL Guard: ne pas trader si en pause
+    if daily_pnl_guard and daily_pnl_guard.is_paused():
+        return
+
+    # Couvre-feu 3h-7h UTC
+    current_hour_utc = datetime.now(timezone.utc).hour
+    if 3 <= current_hour_utc < 7:
+        return
+
+    # Traiter max 3 tokens par cycle (éviter de bloquer le bot)
+    processed = 0
+    while _ws_new_token_queue and processed < 3:
+        token_data = _ws_new_token_queue.popleft()
+        address = token_data["address"]
+        ws_price = token_data["price_usd"]
+        t_detected = token_data["timestamp"]
+        processed += 1
+
+        try:
+            # Skip si trop vieux (> 30s dans la queue = plus pertinent)
+            if time.time() - t_detected > 30:
+                logger.debug(f"[WS-PROC] Skip {address[:8]}... (trop vieux: {time.time()-t_detected:.0f}s)")
+                continue
+
+            # Déjà en position ?
+            if address in positions.positions:
+                continue
+
+            # ─── GATE 1: Analyse DexScreener (prix, MC, liquidité) ───
+            await asyncio.sleep(0.5)  # Rate limit DexScreener
+            analysis = api.analyze_token(address)
+            if not analysis:
+                logger.debug(f"[WS-PROC] {address[:8]}... pas encore sur DexScreener")
+                continue
+
+            token_name = analysis.get('name', address[:12])
+            latency_ms = (time.time() - t_detected) * 1000
+            logger.info(f"[WS-PROC] 📡 Analyse {token_name} (latence {latency_ms:.0f}ms)")
+
+            # ─── GATE 2: MC minimum ───
+            mc = analysis.get("market_cap", 0) or 0
+            if mc < trading_config.sniper_min_mc:
+                logger.info(f"🚫 REJETÉ WS (MC trop faible): {token_name} "
+                           f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
+                continue
+
+            # ─── GATE 3: OnchainScorer ───
+            oc_score = None
+            if onchain_scorer:
+                oc_score = await onchain_scorer.score_token(address)
+                if not oc_score.safe:
+                    logger.info(f"🚫 REJETÉ WS (onchain score={oc_score.score}): "
+                               f"{token_name} — {oc_score.summary}")
+                    continue
+                logger.info(f"✅ WS Onchain OK (score={oc_score.score}): {token_name} — {oc_score.summary}")
+            else:
+                if token_filter:
+                    mint_ok, mint_reason = await token_filter.quick_mint_check(address)
+                    if not mint_ok:
+                        logger.info(f"🚫 REJETÉ WS (on-chain): {token_name} - {mint_reason}")
+                        continue
+
+            # ─── GATE 4: RPC Security Check ───
+            if not onchain_scorer or (onchain_scorer and oc_score and oc_score.errors):
+                from rpc_security_check import check_token_security
+                _helius_key = os.environ.get("HELIUS_API_KEY", "")
+                if _helius_key:
+                    rpc_sec = await check_token_security(address, _helius_key)
+                    if not rpc_sec.is_safe:
+                        logger.info(f"🚫 REJETÉ WS (Gate RPC): {token_name} "
+                                   f"Score={rpc_sec.score} - {', '.join(rpc_sec.reasons)}")
+                        continue
+
+            # ─── GATE 5: LP Burned ───
+            if token_filter and not (onchain_scorer and oc_score and oc_score.lp_burned):
+                pair_addr = analysis.get('pair_address', '')
+                if pair_addr:
+                    tf_result = await token_filter.check(
+                        address, require_lp_burned=True, pair_address=pair_addr
+                    )
+                    if not tf_result.is_safe:
+                        logger.info(f"🚫 REJETÉ WS (LP check): {token_name} - {tf_result.rejection_reason}")
+                        continue
+
+            # ─── GATE 6: Liquidité ───
+            if liquidity_guard:
+                liq_usd = analysis.get("liquidity_usd", 0)
+                can_buy_liq, liq_reason = liquidity_guard.can_buy(address, liq_usd, strategy="sniper")
+                if not can_buy_liq:
+                    logger.info(f"{liq_reason} - Skip WS {token_name}")
+                    continue
+
+            # ─── GATE 7: Vérification prix non-zéro ───
+            _sym = _safe_symbol(analysis.get("symbol"), address)
+            ok, verified_price = verify_price_before_buy(
+                token_address=address,
+                token_symbol=_sym
+            )
+            if not ok:
+                logger.info(f"[WS-PROC] Skip {_sym} prix non disponible")
+                continue
+
+            # ─── SMART ENTRY: ajouter à la watchlist si actif ───
+            if smart_entry:
+                added, watch_reason = smart_entry.first_check(analysis)
+                if added:
+                    logger.info(f"🧠 WS → Watchlist: {token_name} - {watch_reason}")
+                    continue
+
+            # ─── ACHAT: Sniper direct ───
+            should_snipe, reason = trading_engine.should_snipe(analysis)
+            if should_snipe:
+                result = trading_engine.execute_buy(analysis, "sniper")
+                if result:
+                    sym = _safe_symbol(analysis.get("symbol"), address)
+                    _log_trade(
+                        token_address=address,
+                        token_symbol=sym,
+                        strategy="sniper",
+                        side="BUY",
+                        price=float(analysis.get("price_usd", 0) or 0),
+                        amount_sol=result['amount_sol'],
+                    )
+                    if circuit_breaker:
+                        entry_price = float(analysis.get("price_usd", 0) or 0)
+                        circuit_breaker.open_position(
+                            token_address=address,
+                            token_symbol=sym,
+                            entry_price=entry_price,
+                        )
+                    if capital_watchdog:
+                        capital_watchdog.register_position(
+                            token_address=address,
+                            token_symbol=sym,
+                            strategy="sniper",
+                            amount_sol=result['amount_sol'],
+                            entry_price=float(analysis.get("price_usd", 0) or 0),
+                        )
+                    if liquidity_guard:
+                        liq_usd = analysis.get("liquidity_usd", 0)
+                        if liq_usd > 0:
+                            liquidity_guard.register_position(address, liq_usd)
+                    if helius_ws:
+                        helius_ws.watch_token(address)
+
+                    # Notification Telegram
+                    total_latency = (time.time() - t_detected) * 1000
+                    msg = f"⚡ *SNIPE WS* (détection {total_latency:.0f}ms)\n\n"
+                    msg += f"🪙 {analysis['name']} (${analysis.get('symbol', '???')})\n"
+                    msg += f"💵 {result['amount_sol']} SOL\n"
+                    msg += f"📊 MC: ${analysis.get('market_cap', 0):,.0f}\n"
+                    msg += f"💧 Liq: ${analysis.get('liquidity_usd', 0):,.0f}\n"
+                    msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
+                    for chat_id in subscribers:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id, text=msg,
+                                parse_mode=ParseMode.MARKDOWN,
+                                disable_web_page_preview=True
+                            )
+                        except:
+                            pass
+                    logger.info(f"⚡ SNIPE WS EXÉCUTÉ: {sym} | {result['amount_sol']} SOL | latence {total_latency:.0f}ms")
+                    await asyncio.sleep(trading_config.cooldown_seconds)
+            else:
+                logger.debug(f"[WS-PROC] {token_name} passé tous les filtres mais should_snipe=False")
+
+        except Exception as e:
+            logger.error(f"[WS-PROC] Erreur traitement {address[:8]}...: {e}")
+
+
 async def auto_trading_job(context: ContextTypes.DEFAULT_TYPE):
     """Job automatique: scan pour nouvelles opportunités (toutes les 45s)"""
     global auto_trading_enabled
@@ -4478,7 +4679,10 @@ def main():
     # Job backup pour LP monitoring + post-trade analysis (15s)
     job_queue.run_repeating(position_monitor_job, interval=15, first=10)
 
-    # Job de scan pour nouvelles opportunités (toutes les 45s)
+    # Job WebSocket: traite les tokens détectés par Helius WS (5s)
+    job_queue.run_repeating(ws_token_processor_job, interval=5, first=15)
+
+    # Job de scan pour nouvelles opportunités (toutes les 45s) - FALLBACK DexScreener
     job_queue.run_repeating(auto_trading_job, interval=POLLING_INTERVAL, first=20)
 
     # Heartbeat Telegram (30min) - confirme que le bot est actif
