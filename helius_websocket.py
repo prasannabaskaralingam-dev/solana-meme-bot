@@ -75,7 +75,6 @@ class HeliusWebSocket:
             "events_err_skipped": 0,
             "events_createv2": 0,
             "tokens_detected": 0,
-            "mint_from_logs": 0,
             "mint_from_api": 0,
         }
 
@@ -263,18 +262,11 @@ class HeliusWebSocket:
 
             self._stats["events_createv2"] += 1
 
-            # ─── FIX 2: Extraire le mint depuis les logs ──────
-            token_address = self._extract_token_from_logs(logs)
-
-            # ─── FIX 3: Fallback Enhanced API si pas trouvé ───
-            if not token_address:
-                token_address = await self._get_mint_from_enhanced_api(sig)
-                if token_address:
-                    self._stats["mint_from_api"] += 1
+            # ─── Récupérer le mint via Enhanced API (seule source fiable) ───
+            token_address = await self._get_mint_from_enhanced_api(sig)
+            if token_address:
+                self._stats["mint_from_api"] += 1
             else:
-                self._stats["mint_from_logs"] += 1
-
-            if not token_address:
                 logger.debug(f"[WSS] Mint introuvable pour sig={sig[:16]}...")
                 return
 
@@ -295,8 +287,7 @@ class HeliusWebSocket:
                     f"err_skip={self._stats['events_err_skipped']} "
                     f"createv2={self._stats['events_createv2']} "
                     f"detected={self._stats['tokens_detected']} "
-                    f"(logs={self._stats['mint_from_logs']} "
-                    f"api={self._stats['mint_from_api']})"
+                    f"(api={self._stats['mint_from_api']})"
                 )
 
             # Callback nouveau token
@@ -310,55 +301,8 @@ class HeliusWebSocket:
         except Exception as e:
             logger.error(f"[WSS] Erreur process_log: {e}")
 
-    def _extract_token_from_logs(self, logs: list) -> Optional[str]:
-        """
-        FIX 2: Extrait l'adresse du mint depuis les logs pump.fun CreateV2.
-
-        Dans les logs pump.fun, le mint apparaît parfois dans les lignes
-        "Program log:" avec des données encodées. On cherche aussi dans
-        les invocations de programmes (les account keys passées en argument).
-        """
-        # Stratégie 1: Chercher une adresse base58 dans les lignes
-        # qui mentionnent le token (InitializeMint2, Create, etc.)
-        target_keywords = [
-            "initializemint2",
-            "createv2",
-            "instruction: create",
-            "initialize the associated token account",
-        ]
-
-        # Collecter toutes les adresses base58 trouvées dans les logs
-        # (sauf les programmes connus)
-        known_programs = {
-            "11111111111111111111111111111111",
-            "ComputeBudget111111111111111111111111111111",
-            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            "pfeeUxB6jkeYEGxnEBPcQtKEzUMAfR1SNBXwcHEqpUH",  # pump.fun fee account
-            "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9i",  # pump.fun fee account 2
-        }
-
-        candidates = []
-        for log in logs:
-            parts = log.split()
-            for part in parts:
-                # Nettoyer les caractères non-alphanumériques en fin
-                clean = part.rstrip(".,;:()[]{}\"'")
-                # Adresse Solana = 32-44 caractères base58
-                if (32 <= len(clean) <= 44
-                        and clean.isalnum()
-                        and clean not in known_programs
-                        and not clean.startswith("1111")):
-                    candidates.append(clean)
-
-        # Si on a des candidats, le mint est typiquement le premier
-        # qui n'est pas un programme connu
-        if candidates:
-            return candidates[0]
-
-        return None
+    # _extract_token_from_logs supprimée — les logs pump.fun ne contiennent
+    # pas les adresses complètes des mints. On utilise uniquement l'Enhanced API.
 
     async def _get_mint_from_enhanced_api(self, signature: str) -> Optional[str]:
         """
