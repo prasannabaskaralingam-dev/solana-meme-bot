@@ -2949,8 +2949,9 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             # Skip si trop vieux (> 30s dans la queue = plus pertinent)
-            if time.time() - t_detected > 30:
-                logger.debug(f"[WS-PROC] Skip {address[:8]}... (trop vieux: {time.time()-t_detected:.0f}s)")
+            age_s = time.time() - t_detected
+            if age_s > 30:
+                logger.info(f"[WS-PROC] Skip {address[:8]}... (trop vieux: {age_s:.0f}s)")
                 continue
 
             # Déjà en position ?
@@ -2961,7 +2962,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.5)  # Rate limit DexScreener
             analysis = api.analyze_token(address)
             if not analysis:
-                logger.debug(f"[WS-PROC] {address[:8]}... pas encore sur DexScreener")
+                logger.info(f"[WS-PROC] {address[:8]}... pas encore sur DexScreener")
                 continue
 
             token_name = analysis.get('name', address[:12])
