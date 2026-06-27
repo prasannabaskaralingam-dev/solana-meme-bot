@@ -4095,6 +4095,22 @@ def main():
         name="auto_calibration"
     )
 
+    # ─── FIX 1: Helper Helius WebSocket ─────────────────────────────────
+    async def start_helius_websocket(application):
+        """
+        Lance le Helius WebSocket en arrière-plan.
+        Doit être appelé APRÈS init_trading().
+        Compatible avec python-telegram-bot v20+
+        """
+        if not helius_ws:
+            logger.warning("[WSS] helius_ws non initialisé — skip")
+            return
+
+        logger.info("[WSS] Démarrage Helius WebSocket...")
+        asyncio.create_task(helius_ws.start())
+        logger.info("[WSS] ✅ Task WebSocket lancée")
+    # ─────────────────────────────────────────────────────────────────────
+
     # Démarrer le WebSocket PriceMonitor pour les positions existantes
     # (s'exécute en arrière-plan dans l'event loop)
     async def post_init(application):
@@ -4146,11 +4162,8 @@ def main():
         except Exception as e:
             print(f"⚠️ Erreur démarrage WebSocket (fallback polling actif): {e}")
 
-        # Lancer Helius WebSocket en arrière-plan
-        if helius_ws:
-            import asyncio as _aio
-            _aio.create_task(helius_ws.start())
-            print("⚡ Helius WebSocket lancé (prix temps réel)")
+        # Lancer Helius WebSocket via helper dédié
+        await start_helius_websocket(application)
 
         # Démarrer le copy trading
         if copy_trader and auto_trading_enabled:
