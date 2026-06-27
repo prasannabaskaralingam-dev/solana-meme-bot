@@ -40,6 +40,7 @@ from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
 from token_filter import TokenFilter
 from onchain_scorer import OnchainScorer
 from auto_calibration import analyze_postmortems, apply_adjustments
+from helius_websocket import HeliusWebSocket
 
 # ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
 def _setup_logging():
@@ -305,6 +306,7 @@ capital_watchdog: CapitalWatchdog = None
 daily_pnl_guard: DailyPnLGuard = None
 token_filter: TokenFilter = None
 onchain_scorer: OnchainScorer = None
+helius_ws: HeliusWebSocket = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -485,6 +487,43 @@ def init_trading():
         pause_duration_minutes=60.0,
     ))
     logger.info("⛔ Daily PnL Guard: actif (pause après -0.05 SOL/jour ou 3 SL consécutifs)")
+
+    # Helius WebSocket — prix temps réel depuis la blockchain
+    global helius_ws
+    helius_api_key = os.environ.get("HELIUS_API_KEY", "")
+    if helius_api_key:
+        async def _ws_on_price_update(token_address: str, price_usd: float):
+            """Callback Helius WS: met à jour position + cb.check()"""
+            pos = positions.get_position(token_address)
+            if pos and price_usd > 0:
+                positions.update_position(token_address, price_usd)
+                if capital_watchdog:
+                    capital_watchdog.heartbeat(token_address, price_usd)
+                # cb.check() PRIORITÉ ABSOLUE
+                if circuit_breaker:
+                    cb_action = circuit_breaker.check(token_address, price_usd)
+                    if cb_action and cb_action.should_sell:
+                        _ws_notification_queue.append({
+                            "token_address": token_address,
+                            "action": cb_action,
+                            "price": price_usd,
+                        })
+
+        async def _ws_on_new_token(token_address: str, price_usd: float):
+            """Callback Helius WS: nouveau token détecté sur pump.fun"""
+            logger.info(f"[WSS] 🆕 Nouveau token: {token_address[:8]}... ${price_usd:.8f}")
+
+        helius_ws = HeliusWebSocket(
+            api_key=helius_api_key,
+            on_price_update=_ws_on_price_update,
+            on_new_token=_ws_on_new_token,
+        )
+        # Enregistrer les positions existantes pour surveillance
+        for addr in positions.positions:
+            helius_ws.watch_token(addr)
+        logger.info(f"⚡ Helius WebSocket initialisé ({len(positions.positions)} tokens surveillés)")
+    else:
+        logger.warning("⚠️ HELIUS_API_KEY manquante — WebSocket désactivé, polling uniquement")
 
 
 # ============================================================
@@ -671,6 +710,8 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
     # Retirer du monitoring WS
     if price_monitor:
         await price_monitor.remove_token(token_address)
+    if helius_ws:
+        helius_ws.unwatch_token(token_address)
 
     # Notification Telegram (via queue, sera envoyée par le polling job)
     _ws_notification_queue.append({
@@ -1229,6 +1270,9 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 amount_sol=result['amount_sol'],
                 entry_price=float(analysis.get("price_usd", 0) or 0),
             )
+        # Helius WebSocket: surveiller le nouveau token
+        if helius_ws:
+            helius_ws.watch_token(token_address)
         msg = f"✅ *Achat réussi !*\n\n"
         msg += f"🪙 {analysis['name']} (${analysis['symbol']})\n"
         msg += f"💵 Montant: {result['amount_sol']} SOL\n"
@@ -1414,6 +1458,8 @@ async def close_position_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             if price_monitor:
                 asyncio.create_task(price_monitor.remove_token(target_addr))
+            if helius_ws:
+                helius_ws.unwatch_token(target_addr)
         except:
             pass
         # Fermer la position dans le tracker
@@ -1492,6 +1538,8 @@ async def kill_zombies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     asyncio.create_task(price_monitor.remove_token(addr))
                 except:
                     pass
+                if helius_ws:
+                    helius_ws.unwatch_token(addr)
             positions.close_position(addr)
             sl_blacklist[addr] = time.time() + 86400
             _save_blacklist()
@@ -1779,6 +1827,8 @@ async def watchdog_check_job(context: ContextTypes.DEFAULT_TYPE):
                                 await price_monitor.remove_token(token_addr)
                             except:
                                 pass
+                        if helius_ws:
+                            helius_ws.unwatch_token(token_addr)
                         # Notifier la vente d'urgence
                         sell_msg = f"💀 *VENTE D'URGENCE*\n\n"
                         sell_msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
@@ -1927,21 +1977,25 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     continue  # WS gère le reste
 
-            # Récupérer le prix actuel via DexScreener (FALLBACK)
-            analysis = api.analyze_token(pos.token_address)
-            current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
-
-            # Mettre à jour le prix SOL/USD caché (pour le WS callback)
-            if analysis:
-                sol_price = analysis.get("sol_price_usd", 0)
-                if not sol_price:
-                    # Estimer depuis price_native et price_usd
-                    price_native = float(analysis.get("price_native", 0) or 0)
-                    price_usd = float(analysis.get("price_usd", 0) or 0)
-                    if price_native > 0 and price_usd > 0:
-                        sol_price = price_usd / price_native
-                if sol_price and sol_price > 50:  # Sanity check
-                    update_sol_price(sol_price)
+            # Récupérer le prix : Helius WS cache > DexScreener fallback
+            current_price = 0.0
+            if helius_ws and helius_ws.is_connected:
+                current_price = helius_ws.get_price(pos.token_address)
+            
+            # Fallback DexScreener si Helius n'a pas de prix
+            if current_price <= 0:
+                analysis = api.analyze_token(pos.token_address)
+                current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
+                # Mettre à jour le prix SOL/USD caché
+                if analysis:
+                    sol_price = analysis.get("sol_price_usd", 0)
+                    if not sol_price:
+                        price_native = float(analysis.get("price_native", 0) or 0)
+                        price_usd_val = float(analysis.get("price_usd", 0) or 0)
+                        if price_native > 0 and price_usd_val > 0:
+                            sol_price = price_usd_val / price_native
+                    if sol_price and sol_price > 50:
+                        update_sol_price(sol_price)
 
             # Si prix indisponible, utiliser le dernier prix connu
             # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
@@ -2002,6 +2056,8 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 await price_monitor.remove_token(pos.token_address)
                             except:
                                 pass
+                        if helius_ws:
+                            helius_ws.unwatch_token(pos.token_address)
                         positions.close_position(pos.token_address)
                         sl_blacklist[pos.token_address] = time.time() + 86400
                         _save_blacklist()
@@ -2056,6 +2112,8 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 await price_monitor.remove_token(pos.token_address)
                             except:
                                 pass
+                        if helius_ws:
+                            helius_ws.unwatch_token(pos.token_address)
                         positions.close_position(pos.token_address)
                         sl_blacklist[pos.token_address] = time.time() + 86400  # 24h
                         _save_blacklist()
@@ -2142,6 +2200,8 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                             await price_monitor.remove_token(pos.token_address)
                         except:
                             pass
+                    if not is_partial and helius_ws:
+                        helius_ws.unwatch_token(pos.token_address)
                     # Notifier
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
                     sell_type = "PARTIAL TP 50%" if is_partial else "VENTE SNIPER (3s)"
@@ -3096,6 +3156,9 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                                 await price_monitor.add_token(address)
                             except Exception as e:
                                 logger.error(f"Erreur ajout WS monitoring: {e}")
+                        # Helius WebSocket: surveiller le nouveau token
+                        if helius_ws:
+                            helius_ws.watch_token(address)
 
             # Nettoyage périodique
             smart_entry.cleanup()
@@ -3268,6 +3331,9 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                             await price_monitor.add_token(address)
                         except Exception as e:
                             logger.error(f"Erreur ajout WS monitoring: {e}")
+                    # Helius WebSocket: surveiller le nouveau token
+                    if helius_ws:
+                        helius_ws.watch_token(address)
                 continue
 
             # Stratégie Momentum - DÉSACTIVÉE (mode Sniper Only)
@@ -4056,6 +4122,13 @@ def main():
             print("🔌 WebSocket PriceMonitor démarré !")
         except Exception as e:
             print(f"⚠️ Erreur démarrage WebSocket (fallback polling actif): {e}")
+
+        # Lancer Helius WebSocket en arrière-plan
+        if helius_ws:
+            import asyncio as _aio
+            _aio.create_task(helius_ws.start())
+            print("⚡ Helius WebSocket lancé (prix temps réel)")
+
         # Démarrer le copy trading
         if copy_trader and auto_trading_enabled:
             try:
