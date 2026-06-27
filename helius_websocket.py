@@ -218,19 +218,22 @@ class HeliusWebSocket:
 
             # Notification de transaction
             if msg.get("method") == "logsNotification":
-                await self._process_log_notification(msg)
+                t_reception = time.time()
+                await self._process_log_notification(msg, t_reception)
 
         except json.JSONDecodeError:
             pass
         except Exception as e:
             logger.error(f"[WSS] Erreur handle_message: {e}")
 
-    async def _process_log_notification(self, msg: dict):
+    async def _process_log_notification(self, msg: dict, t_reception: float = None):
         """
         Traite une notification de log pump.fun.
         Extrait le token et calcule le prix.
         """
         try:
+            if t_reception is None:
+                t_reception = time.time()
             params = msg.get("params", {})
             result = params.get("result", {})
             value  = result.get("value", {})
@@ -246,6 +249,15 @@ class HeliusWebSocket:
             price = await self._get_price_from_tx(sig, token_address)
 
             if price > 0:
+                # Mesure latence M1 (réception WS → prix calculé)
+                t_processed = time.time()
+                m1_ms = (t_processed - t_reception) * 1000
+                logger.info(
+                    f"[LATENCE M1] {m1_ms:.0f}ms — "
+                    f"réception WS → prix calculé | "
+                    f"{token_address[:8]}... ${price:.8f}"
+                )
+
                 # Mettre en cache
                 self._price_cache[token_address] = {
                     "price": price,
