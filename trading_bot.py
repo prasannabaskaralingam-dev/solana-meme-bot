@@ -2975,10 +2975,10 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                            f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
                 continue
 
-            # ─── GATE 3: OnchainScorer ───
+            # ─── GATE 3: OnchainScorer (LP exemptée pour pump.fun) ───
             oc_score = None
             if onchain_scorer:
-                oc_score = await onchain_scorer.score_token(address)
+                oc_score = await onchain_scorer.score_token(address, source="pump.fun")
                 if not oc_score.safe:
                     logger.info(f"🚫 REJETÉ WS (onchain score={oc_score.score}): "
                                f"{token_name} — {oc_score.summary}")

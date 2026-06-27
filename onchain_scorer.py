@@ -116,10 +116,14 @@ class OnchainScorer:
         self._cache_ts: dict[str, float] = {}
         self._cache_ttl = 300  # 5 minutes
 
-    async def score_token(self, token_address: str) -> OnchainScore:
+    async def score_token(self, token_address: str, source: str = "") -> OnchainScore:
         """
         Score un token directement on-chain.
         3 vérifications en parallèle, timeout 500ms chacune.
+        
+        Args:
+            token_address: Adresse du token à scorer
+            source: Origine de la détection ("pump.fun" = exempte LP de la pénalité)
         
         Returns:
             OnchainScore avec score 0-100 et safe=True si < 30
@@ -143,16 +147,21 @@ class OnchainScorer:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Calculer le score maison (0-100)
+        # Pour les tokens pump.fun, la LP n'est JAMAIS burned au lancement
+        # (bonding curve interne) → on exempte la pénalité LP
+        is_pumpfun = source.lower() in ("pump.fun", "pumpfun", "ws_pumpfun")
         score = 0
         if not result.mint_revoked:
             score += 40
-        if not result.lp_burned:
-            score += 40
+        if not result.lp_burned and not is_pumpfun:
+            score += 40  # Pénalité LP uniquement pour les tokens NON pump.fun
         if not result.holders_ok:
             score += 20
 
         result.score = score
         result.safe = score < 30
+        if is_pumpfun:
+            result.source = "onchain_pumpfun"  # Traçabilité
         result.duration_ms = (time.time() - start) * 1000
 
         # Cache
