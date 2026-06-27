@@ -17,6 +17,7 @@ from datetime import datetime
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from postmortem_tracker import start_postmortem_thread, init_db as init_postmortem_db
+from postmortem import record_trade as record_postmortem_trade
 
 logger = logging.getLogger(__name__)
 
@@ -903,6 +904,31 @@ class TradingEngine:
 
             # Postmortem Tracker — seulement pour ventes totales
             if not is_partial:
+                # ─── DB Postmortem (SQLite persistant) ───────────────
+                try:
+                    duration_min = 0
+                    try:
+                        entry_dt = datetime.fromisoformat(position.entry_time)
+                        duration_min = int((datetime.utcnow() - entry_dt).total_seconds() / 60)
+                    except Exception:
+                        pass
+                    record_postmortem_trade(
+                        token_address=token_mint,
+                        token_symbol=position.token_symbol,
+                        strategy=position.strategy,
+                        entry_price=position.entry_price_usd,
+                        exit_price=position.current_price,
+                        pnl_pct=position.pnl_pct,
+                        duration_min=duration_min,
+                        exit_reason=reason,
+                        market_cap_entry=getattr(position, 'market_cap_entry', None),
+                        sol_amount=position.amount_sol_invested
+                    )
+                    logger.info(f"[Postmortem] Trade enregistré: {position.token_symbol} | {reason} | {position.pnl_pct:.1f}%")
+                except Exception as e:
+                    logger.error(f"[Postmortem] Erreur record_trade: {e}")
+                # ─────────────────────────────────────────────────────
+
                 try:
                     start_postmortem_thread(
                         trade_record=trade_record,

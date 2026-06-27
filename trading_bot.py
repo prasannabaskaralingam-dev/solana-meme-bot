@@ -3568,71 +3568,73 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /today - PnL du jour en cours avec détail des trades"""
+    """Commande /today - PnL du jour depuis postmortem.db (SQLite persistant)"""
     from datetime import datetime, timezone
+    from postmortem import get_today_trades
 
-    # Charger trades.json
-    if not os.path.exists(TRADES_LOG_FILE):
-        await update.message.reply_text("📊 Aucun trade enregistré pour le moment.")
-        return
-
-    try:
-        with open(TRADES_LOG_FILE, "r") as f:
-            all_trades = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        await update.message.reply_text("❌ Erreur lecture trades.json.")
-        return
-
-    # Filtrer les trades du jour (UTC)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_trades = [t for t in all_trades if t.get("timestamp", "").startswith(today_str)]
 
-    if not today_trades:
-        await update.message.reply_text(f"📊 *PnL du {today_str}*\n\nAucun trade aujourd'hui.",
-                                        parse_mode=ParseMode.MARKDOWN)
+    # ─── Source 1 : postmortem.db (trades fermés) ─────────────────
+    try:
+        db_trades = get_today_trades()  # [(symbol, strategy, pnl_pct, duration_min, exit_reason)]
+    except Exception as e:
+        logger.error(f"[/today] Erreur lecture postmortem.db: {e}")
+        db_trades = []
+
+    # ─── Source 2 : trades.json (achats du jour) ──────────────────
+    buys = []
+    try:
+        if os.path.exists(TRADES_LOG_FILE):
+            with open(TRADES_LOG_FILE, "r") as f:
+                all_trades = json.load(f)
+            buys = [t for t in all_trades
+                    if t.get("timestamp", "").startswith(today_str)
+                    and t.get("side") == "BUY"]
+    except Exception:
+        pass
+
+    if not db_trades and not buys:
+        await update.message.reply_text(
+            f"📊 *PnL du {today_str}*\n\nAucun trade aujourd'hui.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Calculs
-    buys = [t for t in today_trades if t["side"] == "BUY"]
-    sells = [t for t in today_trades if t["side"] == "SELL"]
-    wins = [t for t in sells if t.get("pnl_pct", 0) > 0]
-    losses = [t for t in sells if t.get("pnl_pct", 0) < 0]
+    # ─── Calculs depuis postmortem.db ─────────────────────────────
+    total_sells = len(db_trades)
+    wins = [t for t in db_trades if t[2] and t[2] > 0]
+    losses = [t for t in db_trades if t[2] and t[2] < 0]
+    pnl_values = [t[2] for t in db_trades if t[2] is not None]
 
-    total_pnl_sol = 0.0
-    for t in sells:
-        pnl_pct = t.get("pnl_pct", 0)
-        amount = t.get("amount_sol", 0)
-        total_pnl_sol += amount * (pnl_pct / 100.0)
+    avg_pnl = sum(pnl_values) / max(len(pnl_values), 1)
+    best = max(pnl_values, default=0)
+    worst = min(pnl_values, default=0)
+    win_rate = (len(wins) / max(total_sells, 1)) * 100
 
-    avg_pnl = sum(t.get("pnl_pct", 0) for t in sells) / max(len(sells), 1)
-    best = max((t.get("pnl_pct", 0) for t in sells), default=0)
-    worst = min((t.get("pnl_pct", 0) for t in sells), default=0)
-    win_rate = (len(wins) / max(len(sells), 1)) * 100
-
-    pnl_emoji = "🟢" if total_pnl_sol >= 0 else "🔴"
+    pnl_emoji = "🟢" if avg_pnl >= 0 else "🔴"
     msg = f"📅 *PnL du jour \u2014 {today_str}*\n\n"
-    msg += f"{pnl_emoji} *PnL total: {total_pnl_sol:+.4f} SOL*\n\n"
-    msg += f"📊 Trades: {len(buys)} achats / {len(sells)} ventes\n"
+    msg += f"{pnl_emoji} *PnL moyen: {avg_pnl:+.1f}%*\n\n"
+    msg += f"📊 Trades: {len(buys)} achats / {total_sells} ventes\n"
     msg += f"🎯 Win Rate: {win_rate:.0f}% (✅{len(wins)} / ❌{len(losses)})\n"
-    msg += f"📈 PnL moyen: {avg_pnl:+.1f}%\n"
     msg += f"🚀 Meilleur: {best:+.1f}%\n"
     msg += f"💥 Pire: {worst:+.1f}%\n"
 
-    # Détail des trades (max 15)
-    if sells:
+    # Détail des ventes (max 15)
+    if db_trades:
         msg += f"\n📝 *Détail des ventes:*\n"
-        for t in sells[-15:]:
-            pnl = t.get("pnl_pct", 0)
-            emoji = "✅" if pnl > 0 else "❌"
-            time_str = t.get("timestamp", "")[11:16]  # HH:MM
-            reason_short = t.get("reason", "")[:25]
-            msg += f"  {emoji} `{time_str}` {t['token']} {pnl:+.1f}% ({reason_short})\n"
+        for t in db_trades[:15]:
+            symbol, strategy, pnl_pct, duration, reason = t
+            pnl_pct = pnl_pct or 0
+            emoji = "✅" if pnl_pct > 0 else "❌"
+            dur_str = f"{duration}m" if duration else "?"
+            reason_short = (reason or "")[:20]
+            msg += f"  {emoji} {symbol} {pnl_pct:+.1f}% ({reason_short}) {dur_str}\n"
 
+    # Achats du jour (max 10)
     if buys:
         msg += f"\n🛍 *Achats du jour:*\n"
         for t in buys[-10:]:
             time_str = t.get("timestamp", "")[11:16]
-            msg += f"  🔵 `{time_str}` {t['token']} ({t['strategy']}) {t.get('amount_sol', 0):.4f} SOL\n"
+            msg += f"  🔵 `{time_str}` {t.get('token', '?')} ({t.get('strategy', '?')}) {t.get('amount_sol', 0):.4f} SOL\n"
 
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
