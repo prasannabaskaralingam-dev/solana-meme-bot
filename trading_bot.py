@@ -450,6 +450,11 @@ if os.path.exists(SUBS_FILE):
 from collections import deque
 _ws_new_token_queue: deque = deque(maxlen=50)  # FIFO, max 50 tokens en attente
 
+# Tracking pipeline silencieux
+_ws_queue_first_push: float = 0.0  # timestamp du premier token poussé (0 = jamais)
+_bot_start_time: float = time.time()  # timestamp de démarrage du bot
+_pipeline_silent_alert_sent: bool = False  # éviter de spammer l'alerte
+
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
@@ -621,11 +626,15 @@ def init_trading():
             if token_address in sl_blacklist and time.time() < sl_blacklist[token_address]:
                 return
             # Ajouter à la queue pour traitement par ws_token_processor_job
+            global _ws_queue_first_push, _pipeline_silent_alert_sent
             _ws_new_token_queue.append({
                 "address": token_address,
                 "price_usd": price_usd,
                 "timestamp": time.time(),
             })
+            if _ws_queue_first_push == 0.0:
+                _ws_queue_first_push = time.time()
+                _pipeline_silent_alert_sent = False  # reset alerte
             logger.info(f"[WS-QUEUE] +1 token {token_address[:8]}... (queue={len(_ws_new_token_queue)})")
             seen_tokens.add(token_address)  # Marquer comme vu immédiatement (dédup)
             if len(seen_tokens) > MAX_SEEN_TOKENS:
@@ -4428,6 +4437,13 @@ async def hourly_health_check_job(context):
     # Trading OFF involontairement ?
     if not auto_trading_enabled:
         issues.append("🔴 Trading AUTO est OFF")
+
+    # Pipeline silencieux ? (30min sans token dans la queue)
+    global _pipeline_silent_alert_sent
+    uptime_s = time.time() - _bot_start_time
+    if uptime_s > 1800 and _ws_queue_first_push == 0.0 and not _pipeline_silent_alert_sent:
+        issues.append("⚠️ PIPELINE SILENCIEUX\n   30min sans token dans la queue\n   Vérifie _ws_on_new_token")
+        _pipeline_silent_alert_sent = True
 
     # Si tout va bien → silence (pas de spam)
     if not issues:
