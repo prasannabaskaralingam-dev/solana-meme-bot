@@ -316,6 +316,7 @@ def verify_price_before_buy(
                         f"[PrixCheck] ✅ {token_symbol} "
                         f"prix OK à l'essai {attempt + 1}: ${price:.8f}"
                     )
+                    record_prix_ok(token_symbol)
                     return True, price
 
             logger.info(
@@ -332,6 +333,7 @@ def verify_price_before_buy(
         f"[PrixCheck] ⛔ SKIP {token_symbol} "
         f"— prix=0 après {max_attempts} essais ({max_attempts * wait_seconds:.0f}s)"
     )
+    record_prix_skip(token_symbol)
     return False, 0.0
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3951,6 +3953,319 @@ async def metas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# COMMANDES /verify ET /health_check + JOB HEALTH
+# ============================================================
+
+# Compteurs globaux pour /verify
+_prix_check_skips = 0
+_prix_check_ok = 0
+
+
+def record_prix_skip(token_symbol: str):
+    """Appeler quand verify_price_before_buy() retourne False."""
+    global _prix_check_skips
+    _prix_check_skips += 1
+
+
+def record_prix_ok(token_symbol: str):
+    """Appeler quand verify_price_before_buy() retourne True."""
+    global _prix_check_ok
+    _prix_check_ok += 1
+
+
+async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verify — État réel de tous les fixes en production."""
+    lines = ["🔍 *Vérification des fixes*\n"]
+
+    # ─── FIX 1 : Helius WebSocket
+    if helius_ws and helius_ws.is_connected:
+        watched = len(helius_ws._watched_tokens) if hasattr(helius_ws, '_watched_tokens') else 0
+        lines.append(
+            f"✅ *Helius WebSocket* : actif\n"
+            f"   → tokens surveillés : `{watched}`"
+        )
+    elif helius_ws and not helius_ws.is_connected:
+        lines.append(
+            f"⚠️ *Helius WebSocket* : déconnecté\n"
+            f"   → reconnexion automatique en cours\n"
+            f"   → fallback DexScreener actif"
+        )
+    else:
+        helius_key = os.environ.get("HELIUS_API_KEY", "")
+        if not helius_key:
+            lines.append(
+                f"❌ *Helius WebSocket* : inactif\n"
+                f"   → HELIUS\_API\_KEY manquante"
+            )
+        else:
+            lines.append(
+                f"❌ *Helius WebSocket* : non démarré\n"
+                f"   → helius\_ws.start() pas appelé"
+            )
+
+    lines.append("")
+
+    # ─── FIX 2 : Prix check avant achat
+    total_prix_checks = _prix_check_skips + _prix_check_ok
+    if total_prix_checks > 0:
+        lines.append(
+            f"✅ *Prix check avant achat* : actif\n"
+            f"   → skips (prix=0) : `{_prix_check_skips}` tokens\n"
+            f"   → achats OK (prix>0) : `{_prix_check_ok}` tokens"
+        )
+    else:
+        lines.append(
+            f"⚠️ *Prix check avant achat* : aucun trade depuis démarrage\n"
+            f"   → fonction présente, pas encore utilisée"
+        )
+
+    lines.append("")
+
+    # ─── FIX 3 : Max positions dynamique
+    if wallet and wallet.keypair:
+        sol_balance = wallet.get_sol_balance()
+        max_pos = get_dynamic_max_positions(
+            sol_balance=sol_balance,
+            position_size_sol=trading_config.sniper_position_sol or 0.05
+        )
+        current_pos = positions.count_positions()
+        lines.append(
+            f"✅ *Max positions dynamique* : actif\n"
+            f"   → solde : `{sol_balance:.4f} SOL`\n"
+            f"   → max calculé : `{max_pos}` positions\n"
+            f"   → ouvertes : `{current_pos}/{max_pos}`"
+        )
+    else:
+        lines.append(f"❌ *Max positions dynamique* : wallet non initialisé")
+
+    lines.append("")
+
+    # ─── Auto-calibration
+    try:
+        import sqlite3
+        db_path = os.path.join(DATA_DIR, "postmortem.db")
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM postmortem")
+        count = c.fetchone()[0]
+        conn.close()
+        if count >= 20:
+            lines.append(
+                f"✅ *Auto-calibration* : active\n"
+                f"   → post-mortems : `{count}`\n"
+                f"   → calibration tourne à 21h UTC"
+            )
+        else:
+            lines.append(
+                f"⏳ *Auto-calibration* : en attente\n"
+                f"   → post-mortems : `{count}/20` minimum"
+            )
+    except Exception:
+        lines.append(f"❌ *Auto-calibration* : DB postmortem absente")
+
+    lines.append("")
+
+    # ─── Blacklist post-SL
+    active_blacklist = len([
+        v for v in sl_blacklist.values()
+        if v > time.time()
+    ]) if sl_blacklist else 0
+    lines.append(
+        f"✅ *Blacklist post-SL* : active\n"
+        f"   → tokens blacklistés : `{active_blacklist}`\n"
+        f"   → durée : `1h` après chaque SL"
+    )
+
+    lines.append("")
+
+    # ─── CircuitBreaker
+    if circuit_breaker:
+        stats = circuit_breaker.get_stats()
+        lines.append(
+            f"✅ *CircuitBreaker* : actif\n"
+            f"   → checks : `{stats.get('total_checks', 0)}`\n"
+            f"   → SL : `{stats.get('stop_loss_triggered', 0)}` | "
+            f"TP : `{stats.get('take_profit_triggered', 0)}`\n"
+            f"   → Time Stop : `{stats.get('time_stop_triggered', 0)}`"
+        )
+    else:
+        lines.append(f"❌ *CircuitBreaker* : non initialisé")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def health_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/health_check — Santé complète du bot."""
+    import psutil
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [f"🏥 *Health Check — {now}*\n"]
+
+    # RAM
+    try:
+        process = psutil.Process(os.getpid())
+        ram_mb = process.memory_info().rss / 1024 / 1024
+        ram_pct = psutil.virtual_memory().percent
+        ram_emoji = "✅" if ram_mb < 800 else ("⚠️" if ram_mb < 1500 else "🚨")
+        lines.append(
+            f"{ram_emoji} *RAM* : `{ram_mb:.0f}MB` utilisés "
+            f"(`{ram_pct:.0f}%` système)"
+        )
+    except Exception:
+        lines.append(f"⚠️ *RAM* : impossible à mesurer")
+
+    # Trading ON/OFF
+    trading_emoji = "✅" if auto_trading_enabled else "🔴"
+    lines.append(
+        f"{trading_emoji} *Trading* : "
+        f"{'ON' if auto_trading_enabled else 'OFF'}"
+    )
+
+    # Solde
+    if wallet and wallet.keypair:
+        sol = wallet.get_sol_balance()
+        lines.append(f"💰 *Solde* : `{sol:.4f} SOL`")
+    else:
+        lines.append(f"❌ *Wallet* : non initialisé")
+
+    # Positions
+    open_pos = positions.count_positions()
+    pos_list = positions.get_open_positions()
+    if open_pos == 0:
+        lines.append(f"📊 *Positions* : aucune ouverte")
+    else:
+        pos_str = ""
+        for p in pos_list:
+            try:
+                entry_str = p.entry_time
+                if "Z" in entry_str:
+                    entry_str = entry_str.replace("Z", "+00:00")
+                elif "+" not in entry_str and entry_str[-1] != "Z":
+                    entry_str = entry_str + "+00:00"
+                entry = datetime.fromisoformat(entry_str)
+                if entry.tzinfo is None:
+                    entry = entry.replace(tzinfo=timezone.utc)
+                age_min = (datetime.now(timezone.utc) - entry).total_seconds() / 60
+            except Exception:
+                age_min = 0
+            zombie_warning = " ⚠️ ZOMBIE" if age_min > 60 and p.pnl_pct == 0.0 else ""
+            pos_str += f"\n   → {p.token_symbol} `{p.pnl_pct:+.1f}%` ({age_min:.0f}min){zombie_warning}"
+        lines.append(f"📊 *Positions* : `{open_pos}` ouvertes{pos_str}")
+
+    # Watchdog
+    if capital_watchdog:
+        max_gap = max(
+            (time.time() - getattr(p, 'last_check_time', 0)
+             for p in capital_watchdog.positions.values()
+             if getattr(p, 'last_check_time', 0) > 0),
+            default=0
+        )
+        gap_emoji = "✅" if max_gap < 10 else ("⚠️" if max_gap < 30 else "🚨")
+        lines.append(f"{gap_emoji} *Watchdog* : max gap `{max_gap:.0f}s`")
+    else:
+        lines.append(f"❌ *Watchdog* : non initialisé")
+
+    # Daily Guard
+    if daily_pnl_guard:
+        paused = getattr(daily_pnl_guard, 'is_paused', False)
+        guard_emoji = "🔴" if paused else "✅"
+        lines.append(f"{guard_emoji} *Daily Guard* : {'PAUSE' if paused else 'actif'}")
+    else:
+        lines.append(f"⚠️ *Daily Guard* : non initialisé")
+
+    # WebSocket
+    if helius_ws:
+        ws_status = "connecté" if helius_ws.is_connected else "déconnecté"
+        ws_emoji = "✅" if helius_ws.is_connected else "⚠️"
+        lines.append(f"{ws_emoji} *WebSocket* : {ws_status}")
+    else:
+        lines.append(f"❌ *WebSocket* : non démarré")
+
+    # CB
+    if circuit_breaker:
+        stats = circuit_breaker.get_stats()
+        lines.append(
+            f"✅ *CB* : `{stats.get('total_checks', 0)}` checks "
+            f"| TS: `{stats.get('time_stop_triggered', 0)}`"
+        )
+
+    lines.append(f"\n💡 `/verify` pour l'état détaillé des fixes")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def hourly_health_check_job(context):
+    """
+    Job automatique toutes les heures.
+    Silencieux si tout va bien, alerte Telegram si problème.
+    """
+    issues = []
+
+    # RAM trop haute ?
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        ram_mb = process.memory_info().rss / 1024 / 1024
+        if ram_mb > 1500:
+            issues.append(f"🚨 RAM critique : {ram_mb:.0f}MB")
+    except Exception:
+        pass
+
+    # Zombie détectée ?
+    for pos in positions.get_open_positions():
+        try:
+            entry_str = pos.entry_time
+            if "Z" in entry_str:
+                entry_str = entry_str.replace("Z", "+00:00")
+            elif "+" not in entry_str:
+                entry_str = entry_str + "+00:00"
+            entry = datetime.fromisoformat(entry_str)
+            if entry.tzinfo is None:
+                entry = entry.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - entry).total_seconds() / 60
+            if age_min > 60 and pos.pnl_pct == 0.0:
+                issues.append(
+                    f"🧟 Zombie : {pos.token_symbol} "
+                    f"({age_min:.0f}min, PnL={pos.pnl_pct:.1f}%)"
+                )
+        except Exception:
+            pass
+
+    # WebSocket déconnecté ?
+    if helius_ws and not helius_ws.is_connected:
+        issues.append("⚠️ WebSocket Helius déconnecté")
+
+    # Trading OFF involontairement ?
+    if not auto_trading_enabled:
+        issues.append("🔴 Trading AUTO est OFF")
+
+    # Si tout va bien → silence (pas de spam)
+    if not issues:
+        return
+
+    # Si problèmes → alerte immédiate
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    msg = f"⚠️ *Health Check — {now}*\n\n"
+    msg += "\n".join(issues)
+    msg += "\n\n💡 Tape `/health_check` pour le détail"
+
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -4168,6 +4483,8 @@ def main():
     app.add_handler(CommandHandler("watchdog", watchdog_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("unpause", unpause_cmd))
+    app.add_handler(CommandHandler("verify", verify_cmd))
+    app.add_handler(CommandHandler("health_check", health_check_cmd))
 
     # Job SNIPER FALLBACK (3s) - polling DexScreener seulement si WS down
     job_queue = app.job_queue
@@ -4203,6 +4520,14 @@ def main():
         auto_calibration_job,
         time=dt_time(hour=21, minute=0, tzinfo=timezone.utc),
         name="auto_calibration"
+    )
+
+    # Health check automatique toutes les heures (silencieux si tout OK)
+    job_queue.run_repeating(
+        hourly_health_check_job,
+        interval=3600,
+        first=300,
+        name="hourly_health"
     )
 
     # ─── FIX 1: Helper Helius WebSocket ─────────────────────────────────
