@@ -6,16 +6,8 @@ par un flux temps réel depuis la blockchain Solana.
 
 Résultat :
   Prix disponible à T+0.5s au lieu de T+30s
-  Fin des 1493 Time Stop à 0%
+  Fin des Time Stop à 0%
   Latence × 60 moins élevée
-
-Prompt Manus :
-"Crée helius_websocket.py avec ce code.
- Intègre HeliusWebSocket dans trading_bot.py :
- 1. Démarre au lancement du bot
- 2. Remplace get_price() dans sniper_monitor_job
- 3. Garde DexScreener en fallback si WebSocket down
- Confirme chaque étape avant de continuer."
 """
 
 import asyncio
@@ -76,6 +68,16 @@ class HeliusWebSocket:
         self._running      = False
         self._ws           = None
         self._sub_id       = None
+
+        # Compteurs de debug
+        self._stats = {
+            "events_total": 0,
+            "events_err_skipped": 0,
+            "events_createv2": 0,
+            "tokens_detected": 0,
+            "mint_from_logs": 0,
+            "mint_from_api": 0,
+        }
 
     # ─── Interface publique ───────────────────────────────────
 
@@ -229,84 +231,194 @@ class HeliusWebSocket:
     async def _process_log_notification(self, msg: dict, t_reception: float = None):
         """
         Traite une notification de log pump.fun.
-        Extrait le token et calcule le prix.
+        FIX 1: Ignore les TX avec err != null
+        FIX 2: Détecte CreateV2/InitializeMint2
+        FIX 3: Fallback Enhanced API si mint introuvable dans logs
         """
         try:
             if t_reception is None:
                 t_reception = time.time()
-            # DEBUG TEMPORAIRE — voir les events bruts
-            # Log les logs pump.fun uniquement pour les CreateV2
-            _logs_str = str(msg.get('params',{}).get('result',{}).get('value',{}).get('logs',[]))
-            if 'CreateV2' in _logs_str or 'Initialize' in _logs_str:
-                logger.info(f"[WSS-DEBUG-CREATE] sig={msg.get('params',{}).get('result',{}).get('value',{}).get('signature','')} logs={_logs_str[:1500]}")
+
+            self._stats["events_total"] += 1
+
             params = msg.get("params", {})
             result = params.get("result", {})
             value  = result.get("value", {})
             logs   = value.get("logs", [])
             sig    = value.get("signature", "")
+            err    = value.get("err")
 
-            # Chercher le mint du token dans les logs
-            token_address = self._extract_token_from_logs(logs)
-            if not token_address:
+            # ─── FIX 1: Ignorer les transactions échouées ─────
+            if err is not None:
+                self._stats["events_err_skipped"] += 1
                 return
 
-            # Calculer le prix depuis la transaction
-            price = await self._get_price_from_tx(sig, token_address)
+            # Vérifier si c'est une création de token (CreateV2)
+            logs_joined = " ".join(logs)
+            is_create = "Instruction: CreateV2" in logs_joined
 
-            if price > 0:
-                # Mesure latence M1 (réception WS → prix calculé)
-                t_processed = time.time()
-                m1_ms = (t_processed - t_reception) * 1000
+            if not is_create:
+                # Pas une création de token, ignorer
+                return
+
+            self._stats["events_createv2"] += 1
+
+            # ─── FIX 2: Extraire le mint depuis les logs ──────
+            token_address = self._extract_token_from_logs(logs)
+
+            # ─── FIX 3: Fallback Enhanced API si pas trouvé ───
+            if not token_address:
+                token_address = await self._get_mint_from_enhanced_api(sig)
+                if token_address:
+                    self._stats["mint_from_api"] += 1
+            else:
+                self._stats["mint_from_logs"] += 1
+
+            if not token_address:
+                logger.debug(f"[WSS] Mint introuvable pour sig={sig[:16]}...")
+                return
+
+            self._stats["tokens_detected"] += 1
+
+            # Mesure latence
+            t_detected = time.time()
+            m1_ms = (t_detected - t_reception) * 1000
+            logger.info(
+                f"[WSS] 🆕 TOKEN DÉTECTÉ en {m1_ms:.0f}ms | "
+                f"{token_address[:12]}... | sig={sig[:16]}..."
+            )
+
+            # Log stats périodique (tous les 10 tokens)
+            if self._stats["tokens_detected"] % 10 == 0:
                 logger.info(
-                    f"[LATENCE M1] {m1_ms:.0f}ms — "
-                    f"réception WS → prix calculé | "
-                    f"{token_address[:8]}... ${price:.8f}"
+                    f"[WSS-STATS] total={self._stats['events_total']} "
+                    f"err_skip={self._stats['events_err_skipped']} "
+                    f"createv2={self._stats['events_createv2']} "
+                    f"detected={self._stats['tokens_detected']} "
+                    f"(logs={self._stats['mint_from_logs']} "
+                    f"api={self._stats['mint_from_api']})"
                 )
 
-                # Mettre en cache
-                self._price_cache[token_address] = {
-                    "price": price,
-                    "ts": time.time()
-                }
-
-                # Callback mise à jour prix
-                if self.on_price_update:
-                    await self._safe_callback(
-                        self.on_price_update,
-                        token_address,
-                        price
-                    )
-
-                # Callback nouveau token
-                if (self.on_new_token and
-                        token_address not in self._watched_tokens):
-                    logger.info(
-                        f"[WSS] 🆕 Nouveau token: "
-                        f"{token_address[:8]}... "
-                        f"${price:.8f}"
-                    )
-                    await self._safe_callback(
-                        self.on_new_token,
-                        token_address,
-                        price
-                    )
+            # Callback nouveau token
+            if self.on_new_token and token_address not in self._watched_tokens:
+                await self._safe_callback(
+                    self.on_new_token,
+                    token_address,
+                    0.0  # prix initial inconnu pour un nouveau token
+                )
 
         except Exception as e:
             logger.error(f"[WSS] Erreur process_log: {e}")
 
     def _extract_token_from_logs(self, logs: list) -> Optional[str]:
         """
-        Extrait l'adresse du token depuis les logs pump.fun.
-        Cherche le pattern 'mint' dans les logs.
+        FIX 2: Extrait l'adresse du mint depuis les logs pump.fun CreateV2.
+
+        Dans les logs pump.fun, le mint apparaît parfois dans les lignes
+        "Program log:" avec des données encodées. On cherche aussi dans
+        les invocations de programmes (les account keys passées en argument).
         """
+        # Stratégie 1: Chercher une adresse base58 dans les lignes
+        # qui mentionnent le token (InitializeMint2, Create, etc.)
+        target_keywords = [
+            "initializemint2",
+            "createv2",
+            "instruction: create",
+            "initialize the associated token account",
+        ]
+
+        # Collecter toutes les adresses base58 trouvées dans les logs
+        # (sauf les programmes connus)
+        known_programs = {
+            "11111111111111111111111111111111",
+            "ComputeBudget111111111111111111111111111111",
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        }
+
+        candidates = []
         for log in logs:
-            if "initialize" in log.lower() or "create" in log.lower():
-                # Les logs pump.fun contiennent le mint
-                parts = log.split()
-                for part in parts:
-                    # Adresse Solana = 32-44 caractères base58
-                    if 32 <= len(part) <= 44 and part.isalnum():
-                        return part
+            parts = log.split()
+            for part in parts:
+                # Nettoyer les caractères non-alphanumériques en fin
+                clean = part.rstrip(".,;:()[]{}\"'")
+                # Adresse Solana = 32-44 caractères base58
+                if (32 <= len(clean) <= 44
+                        and clean.isalnum()
+                        and clean not in known_programs
+                        and not clean.startswith("1111")):
+                    candidates.append(clean)
+
+        # Si on a des candidats, le mint est typiquement le premier
+        # qui n'est pas un programme connu
+        if candidates:
+            return candidates[0]
+
+        return None
+
+    async def _get_mint_from_enhanced_api(self, signature: str) -> Optional[str]:
+        """
+        FIX 3: Récupère le mint via l'API Helius Enhanced Transactions.
+        Appelle /v0/transactions/?api-key=... avec la signature.
+        """
+        try:
+            url = (
+                f"https://api.helius.xyz/v0/transactions/"
+                f"?api-key={self.api_key}"
+            )
+            resp = requests.post(
+                url,
+                json={"transactions": [signature]},
+                timeout=3
+            )
+
+            if resp.status_code != 200:
+                logger.debug(
+                    f"[WSS] Enhanced API {resp.status_code} "
+                    f"pour sig={signature[:16]}..."
+                )
+                return None
+
+            txs = resp.json()
+            if not txs or not isinstance(txs, list):
+                return None
+
+            tx = txs[0]
+
+            # Chercher le mint dans tokenTransfers
+            token_transfers = tx.get("tokenTransfers", [])
+            for transfer in token_transfers:
+                mint = transfer.get("mint", "")
+                if mint and mint not in (
+                    "So11111111111111111111111111111111111111112",
+                ):
+                    return mint
+
+            # Chercher dans les account data
+            account_data = tx.get("accountData", [])
+            for acc in account_data:
+                # Le mint est souvent le premier account avec tokenBalanceChanges
+                token_changes = acc.get("tokenBalanceChanges", [])
+                for change in token_changes:
+                    mint = change.get("mint", "")
+                    if mint and mint != "So11111111111111111111111111111111111111112":
+                        return mint
+
+            # Dernier recours : chercher dans les instructions
+            instructions = tx.get("instructions", [])
+            for ix in instructions:
+                if ix.get("programId") == PUMP_FUN_PROGRAM:
+                    accounts = ix.get("accounts", [])
+                    # Dans CreateV2 pump.fun, le mint est typiquement
+                    # le 2ème account (index 1)
+                    if len(accounts) >= 2:
+                        return accounts[1]
+
+        except Exception as e:
+            logger.debug(f"[WSS] Enhanced API error: {e}")
+
         return None
 
     async def _get_price_from_tx(
@@ -319,15 +431,12 @@ class HeliusWebSocket:
         Prix = SOL_amount / token_amount
         """
         try:
-            url = f"https://api.helius.xyz/v0/transactions/"
-            params = {
-                "api-key": self.api_key,
-                "commitment": "confirmed"
-            }
-
-            # Utiliser l'API Helius enhanced transactions
-            resp = requests.get(
-                f"{url}?api-key={self.api_key}",
+            url = (
+                f"https://api.helius.xyz/v0/transactions/"
+                f"?api-key={self.api_key}"
+            )
+            resp = requests.post(
+                url,
                 json={"transactions": [signature]},
                 timeout=3
             )
@@ -345,7 +454,7 @@ class HeliusWebSocket:
             token_transfers = tx.get("tokenTransfers", [])
             native_transfers = tx.get("nativeTransfers", [])
 
-            sol_amount   = sum(
+            sol_amount = sum(
                 t.get("amount", 0) for t in native_transfers
             ) / 1e9  # lamports → SOL
 
@@ -418,98 +527,3 @@ class HeliusWebSocket:
                 callback(*args)
         except Exception as e:
             logger.error(f"[WSS] Erreur callback: {e}")
-
-
-# ============================================================
-# INTÉGRATION dans trading_bot.py
-# ============================================================
-
-"""
-ÉTAPE 1 — Import en haut de trading_bot.py :
-
-from helius_websocket import HeliusWebSocket
-
-
-ÉTAPE 2 — Initialiser dans main() :
-
-# Callback appelé à chaque prix reçu
-async def on_price_update(token_address: str, price: float):
-    # Mettre à jour la position si elle existe
-    pos = positions.get_position(token_address)
-    if pos:
-        positions.update_position(token_address, price)
-        if capital_watchdog:
-            capital_watchdog.heartbeat(token_address, price)
-
-# Callback pour les nouveaux tokens
-async def on_new_token(token_address: str, price: float):
-    # Déclencher l'analyse d'achat potentiel
-    logger.info(
-        f"[WSS] Nouveau token détecté: "
-        f"{token_address[:8]} ${price:.8f}"
-    )
-    # Passer par le pipeline d'achat normal
-    await analyze_and_maybe_buy(token_address, price)
-
-# Créer l'instance WebSocket
-helius_ws = HeliusWebSocket(
-    api_key=HELIUS_API_KEY,
-    on_price_update=on_price_update,
-    on_new_token=on_new_token
-)
-
-# Lancer en arrière-plan
-asyncio.create_task(helius_ws.start())
-
-
-ÉTAPE 3 — Dans sniper_monitor_job :
-
-# AVANT (DexScreener polling) :
-current_price = api.analyze_token(pos.token_address)
-
-# APRÈS (WebSocket cache) :
-current_price = helius_ws.get_price(pos.token_address)
-# get_price() retourne le cache WebSocket
-# ou fallback DexScreener si pas en cache
-
-
-ÉTAPE 4 — Dans execute_buy() :
-
-# Enregistrer le token pour surveillance
-helius_ws.watch_token(token_address)
-
-
-ÉTAPE 5 — Dans execute_sell() :
-
-# Arrêter la surveillance
-helius_ws.unwatch_token(token_address)
-"""
-
-
-# ============================================================
-# RÉSUMÉ
-# ============================================================
-"""
-AVANT Helius WebSocket :
-
-  Token créé T+0
-  Bot achète T+5s    ← prix = 0
-  DexScreener T+30s  ← prix disponible
-  25s d'attente      ← PnL = 0%
-  Time Stop 20-30min ← 1493 fois
-
-APRÈS Helius WebSocket :
-
-  Token créé T+0
-  Helius voit T+0.5s ← prix calculé
-  Bot reçoit T+0.5s  ← prix disponible
-  Bot achète T+1s    ← PnL réel dès l'achat
-  Time Stop calibré  ← sur vraies données
-
-IMPACT :
-  Latence    : 30s → 0.5s  (×60 plus rapide)
-  Prix zéro  : éliminé ✅
-  Time Stop 0%: éliminé ✅
-  RAM        : légère (~50MB pour le cache)
-  Dépendance : DexScreener → Helius (privé)
-"""
