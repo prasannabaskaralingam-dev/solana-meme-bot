@@ -631,6 +631,7 @@ def init_trading():
                 "address": token_address,
                 "price_usd": price_usd,
                 "timestamp": time.time(),
+                "source": "websocket",
             })
             if _ws_queue_first_push == 0.0:
                 _ws_queue_first_push = time.time()
@@ -2990,11 +2991,13 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             latency_ms = (time.time() - t_detected) * 1000
             logger.info(f"[WS-PROC] 📡 Analyse {token_name} (latence {latency_ms:.0f}ms)")
 
-            # ─── GATE 2: MC minimum ───
+            # ─── GATE 2: MC minimum (seuil réduit pour WS pump.fun) ───
             mc = analysis.get("market_cap", 0) or 0
-            if mc < trading_config.sniper_min_mc:
+            _source = token_data.get("source", "")
+            min_mc = 2_000 if _source == "websocket" else trading_config.sniper_min_mc
+            if mc < min_mc:
                 logger.info(f"🚫 REJETÉ WS (MC trop faible): {token_name} "
-                           f"MC=${mc:,.0f} < ${trading_config.sniper_min_mc:,.0f}")
+                           f"MC=${mc:,.0f} < ${min_mc:,.0f}")
                 continue
 
             # ─── GATE 3: OnchainScorer (LP exemptée pour pump.fun) ───
