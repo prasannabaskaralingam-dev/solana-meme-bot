@@ -234,6 +234,8 @@ class HeliusWebSocket:
         try:
             if t_reception is None:
                 t_reception = time.time()
+            # DEBUG TEMPORAIRE — voir les events bruts
+            logger.info(f"[WSS-DEBUG] RAW EVENT REÇU: {json.dumps(msg)[:500]}")
             params = msg.get("params", {})
             result = params.get("result", {})
             value  = result.get("value", {})
