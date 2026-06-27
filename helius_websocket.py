@@ -336,6 +336,8 @@ class HeliusWebSocket:
             "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
             "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
             "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "pfeeUxB6jkeYEGxnEBPcQtKEzUMAfR1SNBXwcHEqpUH",  # pump.fun fee account
+            "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9i",  # pump.fun fee account 2
         }
 
         candidates = []
