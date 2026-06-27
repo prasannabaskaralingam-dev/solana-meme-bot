@@ -2948,10 +2948,17 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
         processed += 1
 
         try:
-            # Skip si trop vieux (> 30s dans la queue = plus pertinent)
-            age_s = time.time() - t_detected
-            if age_s > 30:
-                logger.info(f"[WS-PROC] Skip {address[:8]}... (trop vieux: {age_s:.0f}s)")
+            # Retry metadata
+            retry_count = token_data.get("retry_count", 0)
+            first_seen = token_data.get("first_seen", t_detected)
+
+            # Skip si trop vieux (> 60s depuis first_seen = plus pertinent pour snipe)
+            age_s = time.time() - first_seen
+            if age_s > 60:
+                if retry_count > 0:
+                    logger.info(f"[WS-PROC] [Gate1] REJETÉ {address[:8]}... trop vieux ({age_s:.0f}s) après {retry_count} tentatives")
+                else:
+                    logger.info(f"[WS-PROC] Skip {address[:8]}... (trop vieux: {age_s:.0f}s)")
                 continue
 
             # Déjà en position ?
@@ -2962,7 +2969,21 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.5)  # Rate limit DexScreener
             analysis = api.analyze_token(address)
             if not analysis:
-                logger.info(f"[WS-PROC] {address[:8]}... pas encore sur DexScreener")
+                if retry_count >= 2:
+                    # 3 tentatives (0, 1, 2) épuisées → rejeter définitivement
+                    logger.info(f"[WS-PROC] [Gate1] REJETÉ après 3 tentatives DexScreener - "
+                               f"token non indexé {address[:8]}...")
+                    continue
+                # Re-queuer avec retry_count incrémenté (sera traité ~10s plus tard)
+                _ws_new_token_queue.append({
+                    "address": address,
+                    "price_usd": ws_price,
+                    "timestamp": time.time(),  # Reset timestamp pour le délai
+                    "first_seen": first_seen,  # Conserver le timestamp original
+                    "retry_count": retry_count + 1,
+                })
+                logger.info(f"[WS-PROC] [Gate1] Re-queue {address[:8]}... "
+                           f"(tentative {retry_count + 1}/3, retry dans ~10s)")
                 continue
 
             token_name = analysis.get('name', address[:12])
