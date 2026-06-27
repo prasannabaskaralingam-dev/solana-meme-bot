@@ -774,6 +774,13 @@ class TradingEngine:
             logger.info(f"Trade refusé: {reason}")
             return None
 
+        # FIX PRIX ZÉRO — NE PAS ACHETER SI PRIX INDISPONIBLE
+        price_usd = float(analysis.get("price_usd", 0) or 0)
+        if price_usd <= 0:
+            logger.warning(f"[BuyCheck] ⛔ SKIP {analysis.get('symbol', analysis['address'][:8])} "
+                          f"— prix = 0 (token non indexé sur DexScreener)")
+            return None
+
         # Taille de position (stratégie sniper uniquement)
         amount_sol = self.config.sniper_position_sol
 
