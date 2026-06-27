@@ -336,6 +336,37 @@ def verify_price_before_buy(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ─── FIX 3: max_positions dynamique ─────────────────────────────────────────
+def get_dynamic_max_positions(
+    sol_balance: float,
+    position_size_sol: float = 0.05,
+    reserve_pct: float = 0.1
+) -> int:
+    """
+    Calcule le nombre maximum de positions simultanées
+    basé sur le solde disponible.
+
+    Garde 10% de réserve pour les frais de gas.
+
+    Exemples :
+      0.10 SOL → max 1 position
+      0.50 SOL → max 9 positions
+      1.43 SOL → max 25 positions (cap 20)
+    """
+    if position_size_sol <= 0:
+        return 1
+
+    # Solde utilisable (en gardant 10% de réserve)
+    usable_balance = sol_balance * (1 - reserve_pct)
+
+    # Nombre de positions possibles
+    max_pos = int(usable_balance / position_size_sol)
+
+    # Minimum 1, maximum 20 (sécurité)
+    return max(1, min(max_pos, 20))
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # Initialisation globale
 trading_config = load_trading_config()
 api = DexScreenerAPI()
