@@ -2982,6 +2982,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                     "timestamp": time.time(),  # Reset timestamp pour le délai
                     "first_seen": first_seen,  # Conserver le timestamp original
                     "retry_count": retry_count + 1,
+                    "source": token_data.get("source", "websocket"),  # Conserver source
                 })
                 logger.info(f"[WS-PROC] [Gate1] Re-queue {address[:8]}... "
                            f"(tentative {retry_count + 1}/3, retry dans ~10s)")
