@@ -3039,8 +3039,8 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                         logger.info(f"🚫 REJETÉ WS (LP check): {token_name} - {tf_result.rejection_reason}")
                         continue
 
-            # ─── GATE 6: Liquidité ───
-            if liquidity_guard:
+            # ─── GATE 6: Liquidité (désactivé pour WS pump.fun - bonding curve = toujours liquide) ───
+            if liquidity_guard and _source != "websocket":
                 liq_usd = analysis.get("liquidity_usd", 0)
                 can_buy_liq, liq_reason = liquidity_guard.can_buy(address, liq_usd, strategy="sniper")
                 if not can_buy_liq:
