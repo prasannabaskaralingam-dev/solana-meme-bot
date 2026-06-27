@@ -1695,6 +1695,18 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
         logger.warning(f"[COPY] Impossible d'analyser {signal.token_symbol}")
         return
 
+    # ─── FIX PRIX ZÉRO ─────────────────────────────────────────
+    _sym_copy = _safe_symbol(analysis.get("symbol") or signal.token_symbol, token_mint)
+    ok, verified_price = verify_price_before_buy(
+        token_address=token_mint,
+        token_symbol=_sym_copy
+    )
+    if not ok:
+        logger.info(f"[Skip] {_sym_copy} prix non disponible (copy_trade)")
+        seen_tokens.add(token_mint)
+        return
+    # ────────────────────────────────────────────────────────────
+
     # Exécuter l'achat (copy trade)
     result = trading_engine.execute_buy(analysis, "copy_trade")
     if result:
