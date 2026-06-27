@@ -340,32 +340,45 @@ def verify_price_before_buy(
 
 # ─── FIX 3: max_positions dynamique ─────────────────────────────────────────
 def get_dynamic_max_positions(
-    sol_balance: float,
-    position_size_sol: float = 0.05,
-    reserve_pct: float = 0.1
+    sol_balance: float = None,
+    position_size_sol: float = 0.05
 ) -> int:
     """
     Calcule le nombre maximum de positions simultanées
-    basé sur le solde disponible.
+    basé sur le solde SOL disponible (via RPC si non fourni).
 
-    Garde 10% de réserve pour les frais de gas.
+    Logique : floor(solde / taille_position)
+    Minimum garanti : 1
+    Maximum garanti : 50 (sécurité)
 
     Exemples :
-      0.10 SOL → max 1 position
-      0.50 SOL → max 9 positions
-      1.43 SOL → max 25 positions (cap 20)
+      0.10 SOL → max 2 positions
+      0.50 SOL → max 10 positions
+      1.43 SOL → max 28 positions
     """
+    import math
+
+    # Récupérer le solde réel via RPC si non fourni
+    if sol_balance is None:
+        try:
+            sol_balance = wallet.get_sol_balance()
+        except Exception:
+            sol_balance = 0.0
+
     if position_size_sol <= 0:
         return 1
 
-    # Solde utilisable (en gardant 10% de réserve)
-    usable_balance = sol_balance * (1 - reserve_pct)
+    # Calcul dynamique : floor(solde / taille_position)
+    max_pos = math.floor(sol_balance / position_size_sol)
 
-    # Nombre de positions possibles
-    max_pos = int(usable_balance / position_size_sol)
+    # Minimum 1, maximum 50 (sécurité)
+    result = max(1, min(max_pos, 50))
 
-    # Minimum 1, maximum 20 (sécurité)
-    return max(1, min(max_pos, 20))
+    logger.info(
+        f"[MaxPos] Dynamique: {sol_balance:.4f} SOL / "
+        f"{position_size_sol} = {result} positions (min=1, max=50)"
+    )
+    return result
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -3985,15 +3998,18 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ─── FIX 3 : Max positions dynamique
     if wallet and wallet.keypair:
         sol_balance = wallet.get_sol_balance()
+        pos_size = trading_config.sniper_position_sol or 0.05
         max_pos = get_dynamic_max_positions(
             sol_balance=sol_balance,
-            position_size_sol=trading_config.sniper_position_sol or 0.05
+            position_size_sol=pos_size
         )
         current_pos = positions.count_positions()
         lines.append(
             f"✅ *Max positions dynamique* : actif\n"
-            f"   → solde : `{sol_balance:.4f} SOL`\n"
-            f"   → max calculé : `{max_pos}` positions\n"
+            f"   → solde RPC : `{sol_balance:.4f} SOL`\n"
+            f"   → taille position : `{pos_size} SOL`\n"
+            f"   → formule : floor({sol_balance:.4f} / {pos_size}) = `{max_pos}`\n"
+            f"   → limites : min=1, max=50\n"
             f"   → ouvertes : `{current_pos}/{max_pos}`"
         )
     else:

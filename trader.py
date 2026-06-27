@@ -634,7 +634,7 @@ class TradingEngine:
         if elapsed < self.config.cooldown_seconds:
             return False, f"Cooldown ({self.config.cooldown_seconds - elapsed:.0f}s restantes)"
 
-        # Max positions (dynamique: solde avec réserve 10%, cap 20)
+        # Max positions dynamique: floor(solde / taille_position), min=1, max=50
         from trading_bot import get_dynamic_max_positions
         balance = self.wallet.get_sol_balance()
         dynamic_max = get_dynamic_max_positions(
@@ -642,12 +642,12 @@ class TradingEngine:
             position_size_sol=self.config.position_size_sol
         )
         if self.positions.count_positions() >= dynamic_max:
-            logger.debug(
+            logger.info(
                 f"[Skip] Max positions atteint: "
                 f"{self.positions.count_positions()}/{dynamic_max} "
-                f"(solde={balance:.3f} SOL, réserve 10%)"
+                f"(solde={balance:.4f} SOL)"
             )
-            return False, f"[Skip] Max positions atteint ({self.positions.count_positions()}/{dynamic_max}, solde={balance:.3f} SOL)"
+            return False, f"[Skip] Max positions atteint ({self.positions.count_positions()}/{dynamic_max}, solde={balance:.4f} SOL)"
 
         # Budget
         total_invested = self.positions.total_invested()
