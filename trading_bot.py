@@ -5140,24 +5140,15 @@ def main():
         except Exception as e:
             print(f"⚠️ Erreur purge zombies: {e}")
 
-        try:
-            await start_price_monitor_for_positions()
-            print("🔌 WebSocket PriceMonitor démarré !")
-        except Exception as e:
-            print(f"⚠️ Erreur démarrage WebSocket (fallback polling actif): {e}")
-
-        # Lancer Helius WebSocket via helper dédié
-        await start_helius_websocket(application)
-
-        # Démarrer le copy trading
+        # Démarrer le copy trading (dépend de Telegram pour les commandes)
         if copy_trader and auto_trading_enabled:
             try:
                 await copy_trader.start_monitoring()
                 print(f"📋 Copy Trading démarré: {len(copy_trader.get_active_wallets())} wallets suivis")
             except Exception as e:
-                print(f"⚠️ Erreur démarrage copy trading (polling fallback actif): {e}")
+                print(f"⚠️ Erreur démarrage copy trading: {e}")
 
-        # RÈGLE 4: Alerte Telegram au redémarrage — DÉSACTIVÉE (log only)
+        # Log de redémarrage (best-effort)
         if subscribers:
             try:
                 balance = wallet.get_sol_balance() if wallet.keypair else 0
@@ -5166,7 +5157,18 @@ def main():
             except Exception as e:
                 logger.error(f"Erreur alerte redémarrage: {e}")
 
-        # ━━━ R5: DÉMARRER LE GUARDIAN AUTONOME ━━━
+    # ━━━ R5 FIX: DÉMARRAGE AUTONOME ━━━
+    # Le Guardian DOIT démarrer même si Telegram est mort.
+    # On utilise app.initialize() + app.start() manuellement au lieu de run_polling()
+    # pour pouvoir lancer le Guardian AVANT le polling Telegram.
+
+    async def _run_bot():
+        """Boucle principale R5: Guardian d'abord, Telegram ensuite (best-effort)."""
+        from telegram.error import TimedOut, NetworkError
+
+        # ━━━ ÉTAPE 1: Lancer le Guardian IMMÉDIATEMENT (sans dépendre de Telegram) ━━━
+        # Le Guardian utilise les objets déjà initialisés (positions, circuit_breaker, etc.)
+        # Il n'a PAS besoin de app.initialize() pour fonctionner.
         global autonomous_guardian
         configure_notifications(TELEGRAM_BOT_TOKEN, subscribers)
         autonomous_guardian = AutonomousGuardian(
@@ -5194,28 +5196,40 @@ def main():
         await autonomous_guardian.start()
         print("🛡️ Guardian autonome DÉMARRÉ (R5: indépendant de Telegram)")
 
-    # ━━━ R5 FIX: DÉMARRAGE AUTONOME ━━━
-    # Le Guardian DOIT démarrer même si Telegram est mort.
-    # On utilise app.initialize() + app.start() manuellement au lieu de run_polling()
-    # pour pouvoir lancer le Guardian AVANT le polling Telegram.
+        # ━━━ ÉTAPE 2: Lancer Helius WebSocket (indépendant de Telegram) ━━━
+        if helius_ws:
+            asyncio.create_task(helius_ws.start())
+            logger.info("[WSS] ✅ Helius WebSocket lancé")
 
-    async def _run_bot():
-        """Boucle principale R5: Guardian d'abord, Telegram ensuite (best-effort)."""
-        # 1. Initialiser l'application (sans polling)
-        await app.initialize()
-
-        # 2. Lancer post_init (Guardian + WebSockets)
+        # ━━━ ÉTAPE 3: Lancer PriceMonitor WebSocket (indépendant de Telegram) ━━━
         try:
-            await post_init(app)
+            await start_price_monitor_for_positions()
+            print("🔌 WebSocket PriceMonitor démarré !")
         except Exception as e:
-            logger.error(f"[R5] Erreur post_init: {e}")
-            # Le Guardian est critique — on ne continue pas sans lui
-            # Mais on essaie quand même le polling
+            logger.warning(f"⚠️ PriceMonitor non démarré: {e}")
 
-        # 3. Démarrer le job_queue et les handlers
-        await app.start()
+        # ━━━ ÉTAPE 4: Initialiser Telegram (avec retry infini) ━━━
+        telegram_ready = False
+        while not telegram_ready:
+            try:
+                await app.initialize()
+                await app.start()
+                telegram_ready = True
+                logger.info("[Telegram] Application initialisée ✅")
+                # Lancer post_init (purge zombie + copy trading)
+                try:
+                    await post_init(app)
+                except Exception as e2:
+                    logger.error(f"[post_init] Erreur: {e2}")
+            except (TimedOut, NetworkError, OSError) as e:
+                logger.warning(f"[Telegram] Initialisation échouée (retry dans 30s): {e}")
+                logger.warning("[R5] 🛡️ Guardian ACTIF — capital protégé sans Telegram")
+                await asyncio.sleep(30)
+            except Exception as e:
+                logger.error(f"[Telegram] Erreur init inattendue (retry dans 30s): {e}")
+                await asyncio.sleep(30)
 
-        # 4. Démarrer le polling Telegram (best-effort, retry infini)
+        # ━━━ ÉTAPE 5: Démarrer le polling Telegram (best-effort, retry infini) ━━━
         print("✅ Bot de trading démarré !")
         print("🔌 Helius WebSocket: source PRIMAIRE de prix (temps réel)")
         print("🔄 Polling DexScreener 3s: FALLBACK si WS down")
@@ -5236,8 +5250,11 @@ def main():
                     await autonomous_guardian.stop()
             except:
                 pass
-            await app.stop()
-            await app.shutdown()
+            try:
+                await app.stop()
+                await app.shutdown()
+            except:
+                pass
 
     async def _telegram_polling_loop():
         """
