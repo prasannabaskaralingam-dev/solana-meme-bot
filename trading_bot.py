@@ -407,6 +407,12 @@ helius_ws: HeliusWebSocket = None
 auto_trading_enabled = False
 subscribers = []
 
+# ─── Monitoring Smart Entry ───────────────────────────────────────
+_smart_entry_watchlist_added: int = 0      # Tokens ajoutés à la watchlist (session)
+_smart_entry_buys_today: int = 0           # Achats confirmés aujourd'hui
+_smart_entry_last_buy_time: float = 0.0    # Timestamp du dernier achat
+_smart_entry_last_day: int = 0             # Jour courant (pour reset daily)
+
 # Déduplication: tokens déjà analysés/rejetés (évite de re-checker les mêmes)
 seen_tokens: set = set()  # Tokens déjà achetés ou rejetés
 MAX_SEEN_TOKENS = 500  # Limite pour éviter une fuite mémoire
@@ -2853,6 +2859,25 @@ async def critical_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 )
 
+        # CRITIQUE 6 — Smart Entry bloqué (watchlist pleine sans achat)
+        if smart_entry:
+            se_stats = smart_entry.get_stats()
+            wl_size = se_stats["watchlist_size"]
+            time_since_buy = time.time() - _smart_entry_last_buy_time if _smart_entry_last_buy_time > 0 else 999
+            # Alerte si >10 tokens en watchlist ET aucun achat depuis 5 min
+            if wl_size > 10 and time_since_buy > 300:
+                await _send_critical_alert(
+                    context,
+                    alert_type="smart_entry_blocked",
+                    message=(
+                        f"⚠️ *SMART ENTRY BLOQUÉ*\n\n"
+                        f"📋 `{wl_size}` tokens en watchlist\n"
+                        f"❌ Aucun achat depuis `{time_since_buy/60:.0f}min`\n"
+                        f"📈 Tokens ajoutés (session) : `{_smart_entry_watchlist_added}`\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+                    )
+                )
+
     except Exception as e:
         logger.error(f"[CriticalMonitor] Erreur: {e}")
 
@@ -2953,7 +2978,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
     et les passe dans le pipeline complet (OnchainScorer → filtres → execute_buy).
     Avantage: détection en ~500ms vs 45s (polling DexScreener).
     """
-    global auto_trading_enabled
+    global auto_trading_enabled, _smart_entry_watchlist_added, _smart_entry_buys_today, _smart_entry_last_buy_time
 
     if not auto_trading_enabled or not trading_engine:
         return
@@ -3091,7 +3116,8 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             if smart_entry:
                 added, watch_reason = smart_entry.first_check(analysis)
                 if added:
-                    logger.info(f"🧠 WS → Watchlist: {token_name} - {watch_reason}")
+                    _smart_entry_watchlist_added += 1
+                    logger.info(f"🧠 WS → Watchlist: {token_name} - {watch_reason} (total={_smart_entry_watchlist_added})")
                     continue
 
             # ─── ACHAT: Sniper direct ───
@@ -3147,7 +3173,9 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                             )
                         except:
                             pass
-                    logger.info(f"⚡ SNIPE WS EXÉCUTÉ: {sym} | {result['amount_sol']} SOL | latence {total_latency:.0f}ms")
+                    _smart_entry_buys_today += 1
+                    _smart_entry_last_buy_time = time.time()
+                    logger.info(f"⚡ SNIPE WS EXÉCUTÉ: {sym} | {result['amount_sol']} SOL | latence {total_latency:.0f}ms (achat #{_smart_entry_buys_today})")
                     await asyncio.sleep(trading_config.cooldown_seconds)
             else:
                 logger.debug(f"[WS-PROC] {token_name} passé tous les filtres mais should_snipe=False")
@@ -3329,6 +3357,8 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
     """Scanner et trader automatiquement avec Smart Entry (double-check)"""
+    global _smart_entry_watchlist_added, _smart_entry_buys_today, _smart_entry_last_buy_time
+
     # ─── COUVRE-FEU 3h-7h UTC (heures creuses pump.fun = rugs nocturnes) ───
     current_hour_utc = datetime.now(timezone.utc).hour
     if 3 <= current_hour_utc < 7:
@@ -3445,6 +3475,10 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                     if result:
                         smart_entry.consume_signal(address)
                         seen_tokens.add(address)
+                        # Monitoring Smart Entry
+                        _smart_entry_buys_today += 1
+                        _smart_entry_last_buy_time = time.time()
+                        logger.info(f"[SmartEntry] ✅ ACHAT CONFIRMÉ #{_smart_entry_buys_today} aujourd'hui")
 
                         # RÈGLE 5: Logger le BUY
                         sym = _safe_symbol(signal.token_symbol or analysis.get("symbol"), address)
@@ -3644,7 +3678,8 @@ async def scan_and_trade(context: ContextTypes.DEFAULT_TYPE):
                 added, watch_reason = smart_entry.first_check(analysis)
                 if added:
                     # Token ajouté à la watchlist, sera confirmé au prochain cycle
-                    logger.info(f"🧠 Watchlist: {analysis.get('name', address[:12])} - {watch_reason}")
+                    _smart_entry_watchlist_added += 1
+                    logger.info(f"🧠 Watchlist: {analysis.get('name', address[:12])} - {watch_reason} (total={_smart_entry_watchlist_added})")
                     continue
 
             # Fallback: stratégies classiques (si smart_entry n'est pas actif ou score trop bas)
@@ -4455,6 +4490,24 @@ async def health_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if api._rate_limit_paused_until > time.time():
             remaining = api._rate_limit_paused_until - time.time()
             lines.append(f"🚨 *Rate Limit* : pause active (`{remaining:.0f}s` restantes)")
+
+    # Smart Entry
+    if smart_entry:
+        se_stats = smart_entry.get_stats()
+        wl_size = se_stats["watchlist_size"]
+        # Reset daily counter si nouveau jour
+        global _smart_entry_buys_today, _smart_entry_last_day
+        today = datetime.now(timezone.utc).day
+        if today != _smart_entry_last_day:
+            _smart_entry_buys_today = 0
+            _smart_entry_last_day = today
+        se_emoji = "✅" if _smart_entry_buys_today > 0 else ("⚠️" if wl_size > 10 else "🟡")
+        lines.append(
+            f"{se_emoji} *SmartEntry* : `{wl_size}` en watchlist | "
+            f"`{_smart_entry_buys_today}` achats confirmés aujourd'hui"
+        )
+    else:
+        lines.append(f"❌ *SmartEntry* : non initialisé")
 
     lines.append(f"\n💡 `/verify` pour l'état détaillé des fixes")
 
