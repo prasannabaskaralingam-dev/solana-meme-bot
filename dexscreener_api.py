@@ -239,10 +239,14 @@ class DexScreenerAPI:
                     f"[Gate1] ❌ RATE LIMIT 429 pour {token_address[:8]}... "
                     f"Pause 60s activée"
                 )
-            elif status_code > 0:
+            elif status_code == 200:
+                # DexScreener a répondu 200 mais avec un body vide (token non indexé)
                 logger.info(
-                    f"[Gate1] ❌ HTTP {status_code} pour {token_address[:8]}... "
-                    f"(token non indexé ou erreur)"
+                    f"[Gate1] ❌ {token_address[:8]}... non indexé sur DexScreener"
+                )
+            elif status_code > 0:
+                logger.warning(
+                    f"[Gate1] ❌ HTTP {status_code} pour {token_address[:8]}..."
                 )
             else:
                 logger.info(
