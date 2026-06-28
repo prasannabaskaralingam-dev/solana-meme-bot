@@ -21,9 +21,15 @@ def init_db():
             duration_min INTEGER,
             exit_reason TEXT,
             market_cap_entry REAL,
-            sol_amount REAL
+            sol_amount REAL,
+            dry_run INTEGER DEFAULT 0
         )
     ''')
+    # Migration: ajouter colonne dry_run si elle n'existe pas
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN dry_run INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Colonne existe déjà
     conn.commit()
     conn.close()
 
@@ -37,7 +43,8 @@ def record_trade(
     duration_min,
     exit_reason,
     market_cap_entry=None,
-    sol_amount=None
+    sol_amount=None,
+    dry_run=False
 ):
     init_db()
     conn = sqlite3.connect(DB_PATH)
@@ -47,8 +54,8 @@ def record_trade(
             timestamp, token_address, token_symbol,
             strategy, entry_price, exit_price,
             pnl_pct, duration_min, exit_reason,
-            market_cap_entry, sol_amount
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            market_cap_entry, sol_amount, dry_run
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         datetime.utcnow().isoformat(),
         token_address,
@@ -60,7 +67,8 @@ def record_trade(
         duration_min,
         exit_reason,
         market_cap_entry,
-        sol_amount
+        sol_amount,
+        1 if dry_run else 0
     ))
     conn.commit()
     conn.close()
@@ -72,7 +80,7 @@ def get_today_trades():
     c = conn.cursor()
     c.execute('''
         SELECT token_symbol, strategy, pnl_pct,
-               duration_min, exit_reason
+               duration_min, exit_reason, dry_run
         FROM trades
         WHERE timestamp LIKE ?
         ORDER BY timestamp DESC

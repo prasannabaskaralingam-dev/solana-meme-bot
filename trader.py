@@ -74,6 +74,9 @@ class TradingConfig:
     max_retries: int = 3                 # Nombre de tentatives par transaction
     cooldown_seconds: int = 10           # Attente entre les trades
 
+    # DRY RUN — Simulation sans vrai swap
+    dry_run: bool = False
+
     # RPC & API
     rpc_url: str = ""
     # lite-api.jup.ag est GRATUIT (pas besoin d'API key)
@@ -778,7 +781,7 @@ class TradingEngine:
             return self.config.trailing_stop_pct  # 10% par défaut
 
     def execute_buy(self, analysis: dict, strategy: str) -> Optional[dict]:
-        """Exécuter un achat"""
+        """Exécuter un achat (ou simuler en DRY RUN)"""
         can, reason = self.can_trade()
         if not can:
             logger.info(f"Trade refusé: {reason}")
@@ -793,16 +796,20 @@ class TradingEngine:
 
         # Taille de position (stratégie sniper uniquement)
         amount_sol = self.config.sniper_position_sol
-
-        # Vérifier le solde
-        balance = self.wallet.get_sol_balance()
-        if balance < amount_sol + 0.005:  # +0.005 pour les frais
-            logger.warning(f"Solde insuffisant: {balance:.4f} SOL < {amount_sol + 0.005}")
-            return None
-
-        # Exécuter l'achat
         token_mint = analysis["address"]
-        tx_sig = self.swap.buy_token(token_mint, amount_sol)
+
+        # ━━━ DRY RUN: Simuler l'achat sans vrai swap ━━━
+        if self.config.dry_run:
+            tx_sig = f"DRY_RUN_BUY_{token_mint[:8]}_{int(time.time())}"
+            logger.info(f"[DRY RUN] 🧪 Achat SIMULÉ: {amount_sol} SOL -> {analysis.get('symbol', '???')} (pas de swap réel)")
+        else:
+            # Vérifier le solde (seulement en mode réel)
+            balance = self.wallet.get_sol_balance()
+            if balance < amount_sol + 0.005:  # +0.005 pour les frais
+                logger.warning(f"Solde insuffisant: {balance:.4f} SOL < {amount_sol + 0.005}")
+                return None
+            # Exécuter l'achat réel
+            tx_sig = self.swap.buy_token(token_mint, amount_sol)
 
         if tx_sig:
             self.last_trade_time = time.time()
@@ -817,7 +824,7 @@ class TradingEngine:
                 token_symbol=analysis.get("symbol", "???"),
                 entry_price=price_usd,
                 amount_sol=amount_sol,
-                amount_tokens=0,  # Sera mis à jour après vérification on-chain
+                amount_tokens=1000 if self.config.dry_run else 0,
                 strategy=strategy,
             )
 
@@ -831,6 +838,7 @@ class TradingEngine:
                 "price_usd": price_usd,
                 "tx_signature": tx_sig,
                 "timestamp": datetime.utcnow().isoformat(),
+                "dry_run": self.config.dry_run,
             }
             self.trade_history.append(trade_record)
 
@@ -845,27 +853,33 @@ class TradingEngine:
         return None
 
     def execute_sell(self, position: Position, reason: str, sell_pct: float = 100.0) -> Optional[dict]:
-        """Exécuter une vente (sell_pct: 100=tout, 50=partial TP)"""
+        """Exécuter une vente (sell_pct: 100=tout, 50=partial TP). DRY RUN = simulation."""
         token_mint = position.token_address
-
-        # Récupérer le solde réel du token (ui_amount ET raw_amount)
-        ui_amount, raw_amount = self.wallet.get_token_balance(token_mint)
-        if raw_amount <= 0:
-            logger.warning(f"Pas de tokens à vendre pour {position.token_name}")
-            self.positions.close_position(token_mint)
-            return None
-
-        # Partial sell: vendre seulement un % de la position
-        sell_amount = int(raw_amount * (sell_pct / 100.0))
-        if sell_amount <= 0:
-            sell_amount = raw_amount
         is_partial = sell_pct < 100.0
 
-        logger.info(f"[SELL] Token balance: ui={ui_amount}, raw={raw_amount}, "
-                    f"selling {sell_pct}% = {sell_amount}")
+        # ━━━ DRY RUN: Simuler la vente sans vrai swap ━━━
+        if self.config.dry_run:
+            tx_sig = f"DRY_RUN_SELL_{token_mint[:8]}_{int(time.time())}"
+            logger.info(f"[DRY RUN] 🧪 Vente SIMULÉE: {position.token_symbol} "
+                       f"({sell_pct}%) PnL={position.pnl_pct:+.1f}% (pas de swap réel)")
+        else:
+            # Récupérer le solde réel du token (ui_amount ET raw_amount)
+            ui_amount, raw_amount = self.wallet.get_token_balance(token_mint)
+            if raw_amount <= 0:
+                logger.warning(f"Pas de tokens à vendre pour {position.token_name}")
+                self.positions.close_position(token_mint)
+                return None
 
-        # Utiliser le sell_amount (partiel ou total)
-        tx_sig = self.swap.sell_token(token_mint, sell_amount)
+            # Partial sell: vendre seulement un % de la position
+            sell_amount = int(raw_amount * (sell_pct / 100.0))
+            if sell_amount <= 0:
+                sell_amount = raw_amount
+
+            logger.info(f"[SELL] Token balance: ui={ui_amount}, raw={raw_amount}, "
+                        f"selling {sell_pct}% = {sell_amount}")
+
+            # Utiliser le sell_amount (partiel ou total)
+            tx_sig = self.swap.sell_token(token_mint, sell_amount)
 
         if tx_sig:
             self.last_trade_time = time.time()
@@ -890,19 +904,18 @@ class TradingEngine:
                 "amount_sol_invested": position.amount_sol_invested,
                 "tx_signature": tx_sig,
                 "timestamp": datetime.utcnow().isoformat(),
+                "dry_run": self.config.dry_run,
             }
             self.trade_history.append(trade_record)
 
             # ─── FIX MÉMOIRE — Limite trade_history ────────────────
-            # Garder seulement les 500 derniers trades en RAM
-            # Le reste est déjà sauvegardé dans le fichier JSON
             if len(self.trade_history) > 500:
                 self.trade_history = self.trade_history[-500:]
             # ──────────────────────────────────────────────────
 
             self._save_history()
 
-            # Postmortem Tracker — seulement pour ventes totales
+            # Postmortem Tracker — seulement pour ventes totales (et pas en DRY RUN)
             if not is_partial:
                 # ─── DB Postmortem (SQLite persistant) ───────────────
                 try:
@@ -922,23 +935,27 @@ class TradingEngine:
                         duration_min=duration_min,
                         exit_reason=reason,
                         market_cap_entry=getattr(position, 'market_cap_entry', None),
-                        sol_amount=position.amount_sol_invested
+                        sol_amount=position.amount_sol_invested,
+                        dry_run=self.config.dry_run
                     )
-                    logger.info(f"[Postmortem] Trade enregistré: {position.token_symbol} | {reason} | {position.pnl_pct:.1f}%")
+                    logger.info(f"[Postmortem] Trade enregistré: {position.token_symbol} | {reason} | {position.pnl_pct:.1f}%"
+                               f"{' [DRY RUN]' if self.config.dry_run else ''}")
                 except Exception as e:
                     logger.error(f"[Postmortem] Erreur record_trade: {e}")
                 # ─────────────────────────────────────────────────────
 
-                try:
-                    start_postmortem_thread(
-                        trade_record=trade_record,
-                        entry_price_usd=position.entry_price_usd,
-                        helius_api_key=os.environ.get("HELIUS_API_KEY", ""),
-                        telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-                        telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
-                    )
-                except Exception as e:
-                    logger.error(f"Postmortem thread error: {e}")
+                # Postmortem tracker: pas en DRY RUN (pas de vraie TX à suivre)
+                if not self.config.dry_run:
+                    try:
+                        start_postmortem_thread(
+                            trade_record=trade_record,
+                            entry_price_usd=position.entry_price_usd,
+                            helius_api_key=os.environ.get("HELIUS_API_KEY", ""),
+                            telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                            telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                        )
+                    except Exception as e:
+                        logger.error(f"Postmortem thread error: {e}")
 
             return trade_record
         return None

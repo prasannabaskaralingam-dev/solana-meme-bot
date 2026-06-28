@@ -133,6 +133,7 @@ TRADES_LOG_FILE = os.path.join(DATA_DIR, "trades.json")
 # Valeurs par défaut pour state.json (source de vérité)
 _STATE_DEFAULTS = {
     "auto_trading": True,
+    "dry_run": True,  # DRY RUN par défaut (sécurité)
     "sl_pct": -25.0,
     "tp_pct": 20.0,
     "trailing_activation": 20.0,
@@ -223,6 +224,7 @@ def _save_state():
 
     state = {
         "auto_trading": auto_trading_enabled,
+        "dry_run": trading_config.dry_run,
         "sl_pct": trading_config.stop_loss_pct,
         "tp_pct": trading_config.take_profit_pct,
         "trailing_activation": trading_config.trailing_activation_pct,
@@ -240,6 +242,13 @@ def _save_state():
             json.dump(state, f, indent=2)
     except IOError as e:
         logger.error(f"[STATE] Erreur sauvegarde state.json: {e}")
+
+
+def _sim_prefix() -> str:
+    """Retourne le préfixe [SIMULATION] si DRY RUN actif, sinon vide."""
+    if trading_config and trading_config.dry_run:
+        return "🧪 [SIMULATION] "
+    return ""
 
 
 def _safe_symbol(symbol, token_address: str) -> str:
@@ -264,6 +273,7 @@ def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
     """
     from datetime import datetime, timezone
 
+    is_dry_run = trading_config.dry_run if trading_config else False
     trade_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "token": token_symbol,
@@ -274,6 +284,7 @@ def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
         "reason": reason,
         "price": price,
         "amount_sol": round(amount_sol, 6),
+        "dry_run": is_dry_run,
     }
 
     try:
@@ -1047,7 +1058,10 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_trading_enabled = True
     _save_state()  # Persister l'état pour survivre aux redémarrages
     balance = wallet.get_sol_balance()
-    msg = f"✅ *Trading automatique ACTIVÉ*\n\n"
+    dry_tag = "🧪 [SIMULATION] " if trading_config.dry_run else ""
+    msg = f"✅ *{dry_tag}Trading automatique ACTIVÉ*\n\n"
+    if trading_config.dry_run:
+        msg += f"⚠️ *MODE DRY RUN* — Aucun swap réel\n\n"
     msg += f"💵 Solde: {balance:.4f} SOL\n"
     msg += f"📊 Stratégie:\n"
     msg += f"  • Sniper: ✅ ({trading_config.sniper_position_sol} SOL/trade)\n"
@@ -1993,7 +2007,7 @@ async def watchdog_check_job(context: ContextTypes.DEFAULT_TYPE):
                         if helius_ws:
                             helius_ws.unwatch_token(token_addr)
                         # Notifier la vente d'urgence
-                        sell_msg = f"💀 *VENTE D'URGENCE*\n\n"
+                        sell_msg = f"{_sim_prefix()}💀 *VENTE D'URGENCE*\n\n"
                         sell_msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                         sell_msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
                         sell_msg += f"📝 Raison: Non surveillé depuis {alert['gap_seconds']:.0f}s\n"
@@ -2070,7 +2084,7 @@ async def _flush_ws_notifications(context: ContextTypes.DEFAULT_TYPE):
             msg = ""
             if notif["type"] == "sell":
                 pnl_emoji = '✅' if notif['pnl_pct'] > 0 else '❌'
-                msg = f"{pnl_emoji} *VENTE WS INSTANTANÉE*\n\n"
+                msg = f"{_sim_prefix()}{pnl_emoji} *VENTE WS INSTANTANÉE*\n\n"
                 msg += f"🪙 {notif['name']} (${notif['symbol']})\n"
                 msg += f"📈 PnL: {notif['pnl_pct']:+.1f}%\n"
                 msg += f"📝 Raison: {notif['reason']}\n"
@@ -2079,7 +2093,7 @@ async def _flush_ws_notifications(context: ContextTypes.DEFAULT_TYPE):
                     msg += f"🔗 [TX](https://solscan.io/tx/{notif['tx']})"
 
             elif notif["type"] == "partial_tp":
-                msg = f"✅ *PARTIAL TP 50% (WS)*\n\n"
+                msg = f"{_sim_prefix()}✅ *PARTIAL TP 50% (WS)*\n\n"
                 msg += f"🪙 {notif['name']} (${notif['symbol']})\n"
                 msg += f"📈 PnL: {notif['pnl_pct']:+.1f}%\n"
                 msg += f"📊 50% vendu, 50% court avec trailing\n"
@@ -2437,7 +2451,7 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                         sl_blacklist[token_addr] = time.time() + 86400
                         _save_blacklist()
                         # Notifier
-                        msg = f"🚨 *VENTE D'URGENCE (Rug Pull)*\n\n"
+                        msg = f"{_sim_prefix()}🚨 *VENTE D'URGENCE (Rug Pull)*\n\n"
                         msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                         msg += f"💧 LP effondrée: {action['drop_pct']:.0f}%\n"
                         msg += f"💰 ${action['entry_liq']:.0f} \u2192 ${action['current_liq']:.0f}\n"
@@ -3251,7 +3265,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                     helius_ws.watch_token(address)
 
                 # Notification Telegram
-                msg = f"⚡ *SNIPE BONDING CURVE* (latence {total_latency:.0f}ms)\n\n"
+                msg = f"{_sim_prefix()}⚡ *SNIPE BONDING CURVE* (latence {total_latency:.0f}ms)\n\n"
                 msg += f"🪙 `{address}`\n"
                 msg += f"💵 {result['amount_sol']} SOL\n"
                 msg += f"📊 MC: ${bc_data.market_cap_usd:,.0f}\n"
@@ -3527,7 +3541,7 @@ async def check_positions(context: ContextTypes.DEFAULT_TYPE):
 
                     # Notifier
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
-                    msg = f"{pnl_emoji} *VENTE AUTO*\n\n"
+                    msg = f"{_sim_prefix()}{pnl_emoji} *VENTE AUTO*\n\n"
                     msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                     msg += f"📈 PnL: {pos.pnl_pct:+.1f}% ({pos.amount_sol_invested * pos.pnl_pct / 100:+.4f} SOL)\n"
                     msg += f"📝 Raison: {reason}\n"
@@ -4091,7 +4105,8 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_rate = (len(wins) / max(total_sells, 1)) * 100
 
     pnl_emoji = "🟢" if avg_pnl >= 0 else "🔴"
-    msg = f"📅 *PnL du jour \u2014 {today_str}*\n\n"
+    dry_tag = "🧪 [SIMULATION] " if (trading_config and trading_config.dry_run) else ""
+    msg = f"📅 *{dry_tag}PnL du jour \u2014 {today_str}*\n\n"
     msg += f"{pnl_emoji} *PnL moyen: {avg_pnl:+.1f}%*\n\n"
     msg += f"📊 Trades: {len(buys)} achats / {total_sells} ventes\n"
     msg += f"🎯 Win Rate: {win_rate:.0f}% (✅{len(wins)} / ❌{len(losses)})\n"
@@ -4102,12 +4117,17 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db_trades:
         msg += f"\n📝 *Détail des ventes:*\n"
         for t in db_trades[:15]:
-            symbol, strategy, pnl_pct, duration, reason = t
-            pnl_pct = pnl_pct or 0
+            # Format: (symbol, strategy, pnl_pct, duration, reason, dry_run)
+            symbol = t[0]
+            pnl_pct = t[2] or 0
+            duration = t[3]
+            reason = t[4]
+            is_dry = t[5] if len(t) > 5 else 0
             emoji = "✅" if pnl_pct > 0 else "❌"
             dur_str = f"{duration}m" if duration else "?"
             reason_short = (reason or "")[:20]
-            msg += f"  {emoji} {symbol} {pnl_pct:+.1f}% ({reason_short}) {dur_str}\n"
+            dry_mark = " 🧪" if is_dry else ""
+            msg += f"  {emoji} {symbol} {pnl_pct:+.1f}% ({reason_short}) {dur_str}{dry_mark}\n"
 
     # Achats du jour (max 10)
     if buys:
@@ -4282,7 +4302,10 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/status — Vue unifiée de tout le système"""
     try:
-        msg = "📊 *STATUS COMPLET*\n\n"
+        dry_tag = "🧪 [SIMULATION] " if (trading_config and trading_config.dry_run) else ""
+        msg = f"📊 *{dry_tag}STATUS COMPLET*\n\n"
+        if trading_config and trading_config.dry_run:
+            msg += "⚠️ *MODE DRY RUN ACTIF* — Aucun swap réel\n\n"
 
         # 1. Solde
         try:
@@ -4825,6 +4848,11 @@ def main():
 
     # 1. Auto trading
     auto_trading_enabled = saved_state.get("auto_trading", wallet.keypair is not None)
+
+    # 1b. DRY RUN (défaut=True pour sécurité)
+    trading_config.dry_run = saved_state.get("dry_run", True)
+    if trading_config.dry_run:
+        logger.warning("🧪 [DRY RUN] Mode SIMULATION actif — aucun swap réel ne sera exécuté")
 
     # 2. Paramètres de trading (restaurer dans trading_config + circuit_breaker)
     trading_config.stop_loss_pct = saved_state.get("sl_pct", -25.0)

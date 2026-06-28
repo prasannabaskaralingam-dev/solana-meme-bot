@@ -255,7 +255,8 @@ class AutonomousGuardian:
                     # Notification
                     pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
                     source = "Partial TP 50%" if is_partial else "VENTE WS"
-                    msg = f"{pnl_emoji} *{source}*\n\n"
+                    sim = "🧪 [SIMULATION] " if self.trading_engine.config.dry_run else ""
+                    msg = f"{sim}{pnl_emoji} *{source}*\n\n"
                     msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                     msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
                     msg += f"📝 Raison: {cb_action.reason}\n"
@@ -442,7 +443,8 @@ class AutonomousGuardian:
                         )
                         self._cleanup_after_sell(pos, cb_action.reason)
                         pnl_emoji = '✅' if pos.pnl_pct > 0 else '❌'
-                        msg = f"{pnl_emoji} *VENTE (Guardian)*\n\n"
+                        sim = "🧪 [SIMULATION] " if self.trading_engine.config.dry_run else ""
+                        msg = f"{sim}{pnl_emoji} *VENTE (Guardian)*\n\n"
                         msg += f"🪙 {pos.token_name} (${pos.token_symbol})\n"
                         msg += f"📈 PnL: {pos.pnl_pct:+.1f}%\n"
                         msg += f"📝 Raison: {cb_action.reason}"
