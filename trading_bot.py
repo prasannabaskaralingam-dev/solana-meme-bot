@@ -5134,7 +5134,14 @@ def main():
     print("🔌 Helius WebSocket: source PRIMAIRE de prix (temps réel)")
     print("🔄 Polling DexScreener 3s: FALLBACK si WS down")
     print("⚡ Pipeline: prix WS → cb.check() → SL -25% instantané")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        pool_timeout=5,
+        read_timeout=10,
+        connect_timeout=10,
+        write_timeout=10,
+    )
 
 
 if __name__ == "__main__":
