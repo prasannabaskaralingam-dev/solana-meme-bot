@@ -2823,6 +2823,36 @@ async def critical_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                             )
                         )
 
+        # CRITIQUE 5 — Gate 1 DexScreener dégradé (>50% échec sur 10 min)
+        if api:
+            stats_10m = api.get_gate1_stats_window(600)  # 10 minutes
+            if stats_10m["total"] >= 5 and stats_10m["failure_rate"] > 50:
+                await _send_critical_alert(
+                    context,
+                    alert_type="gate1_degraded",
+                    message=(
+                        f"⚠️ *GATE 1 DÉGRADÉ*\n\n"
+                        f"❌ {stats_10m['failures']}/{stats_10m['total']} tokens rejetés (None)\n"
+                        f"📉 Taux échec : `{stats_10m['failure_rate']:.0f}%` (10 min)\n"
+                        f"⚠️ Possible rate limit DexScreener\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+                    )
+                )
+
+            # Alerte rate limit immédiate (429 détecté)
+            if api._rate_limit_paused_until > time.time():
+                remaining = api._rate_limit_paused_until - time.time()
+                await _send_critical_alert(
+                    context,
+                    alert_type="gate1_ratelimit",
+                    message=(
+                        f"🚨 *RATE LIMIT DEXSCREENER*\n\n"
+                        f"🛑 HTTP 429 reçu\n"
+                        f"⏸ Bot ralenti — attente `{remaining:.0f}s`\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+                    )
+                )
+
     except Exception as e:
         logger.error(f"[CriticalMonitor] Erreur: {e}")
 
@@ -4410,6 +4440,21 @@ async def health_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *CB* : `{stats.get('total_checks', 0)}` checks "
             f"| TS: `{stats.get('time_stop_triggered', 0)}`"
         )
+
+    # Gate 1 DexScreener
+    if api:
+        g1 = api.get_gate1_stats()
+        g1_total = g1['total']
+        g1_ok = g1['successes']
+        g1_rate = g1['success_rate']
+        g1_emoji = "✅" if g1_rate >= 80 else ("⚠️" if g1_rate >= 50 else "🚨")
+        lines.append(
+            f"{g1_emoji} *Gate1* : `{g1_ok}` succès / `{g1_total}` appels "
+            f"(`{g1_rate:.0f}%` dernière heure)"
+        )
+        if api._rate_limit_paused_until > time.time():
+            remaining = api._rate_limit_paused_until - time.time()
+            lines.append(f"🚨 *Rate Limit* : pause active (`{remaining:.0f}s` restantes)")
 
     lines.append(f"\n💡 `/verify` pour l'état détaillé des fixes")
 

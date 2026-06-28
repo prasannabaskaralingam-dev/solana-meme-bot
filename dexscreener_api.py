@@ -6,6 +6,7 @@ import time
 import logging
 import requests
 from typing import Optional
+from collections import deque
 from config import DEXSCREENER_BASE_URL, ENDPOINTS, CHAIN_ID, FILTERS
 
 logger = logging.getLogger(__name__)
@@ -24,28 +25,106 @@ class DexScreenerAPI:
         self.last_request_time = 0
         self.min_interval = 1.0  # 1 seconde entre les requêtes (safe)
 
+        # ─── Monitoring Gate 1 ───────────────────────────────────────
+        self._gate1_calls: deque = deque()       # timestamps de tous les appels analyze_token
+        self._gate1_successes: deque = deque()   # timestamps des succès
+        self._gate1_failures: deque = deque()    # timestamps des échecs
+        self._rate_limit_paused_until: float = 0.0  # timestamp fin de pause rate limit
+        self._last_rate_limit_alert: float = 0.0    # cooldown alerte rate limit
+        self._last_degraded_alert: float = 0.0      # cooldown alerte dégradé
+
     def _rate_limit(self):
         """Respecter le rate limit de l'API"""
+        # Si en pause rate limit, attendre
+        now = time.time()
+        if now < self._rate_limit_paused_until:
+            wait = self._rate_limit_paused_until - now
+            logger.warning(f"[DexScreener] Rate limit pause active, attente {wait:.0f}s")
+            time.sleep(wait)
+
         elapsed = time.time() - self.last_request_time
         if elapsed < self.min_interval:
             time.sleep(self.min_interval - elapsed)
         self.last_request_time = time.time()
 
-    def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
-        """Effectuer une requête GET avec gestion d'erreurs"""
+    def _cleanup_old_entries(self, window_seconds: float = 3600.0):
+        """Nettoyer les entrées de plus d'une heure dans les compteurs"""
+        cutoff = time.time() - window_seconds
+        while self._gate1_calls and self._gate1_calls[0] < cutoff:
+            self._gate1_calls.popleft()
+        while self._gate1_successes and self._gate1_successes[0] < cutoff:
+            self._gate1_successes.popleft()
+        while self._gate1_failures and self._gate1_failures[0] < cutoff:
+            self._gate1_failures.popleft()
+
+    def get_gate1_stats(self) -> dict:
+        """Retourner les statistiques Gate 1 (dernière heure)"""
+        self._cleanup_old_entries()
+        total = len(self._gate1_calls)
+        successes = len(self._gate1_successes)
+        failures = len(self._gate1_failures)
+        return {
+            "total": total,
+            "successes": successes,
+            "failures": failures,
+            "success_rate": (successes / total * 100) if total > 0 else 100.0,
+        }
+
+    def get_gate1_stats_window(self, window_seconds: float = 600.0) -> dict:
+        """Retourner les statistiques Gate 1 sur une fenêtre glissante (défaut 10 min)"""
+        cutoff = time.time() - window_seconds
+        total = sum(1 for t in self._gate1_calls if t >= cutoff)
+        failures = sum(1 for t in self._gate1_failures if t >= cutoff)
+        successes = total - failures
+        return {
+            "total": total,
+            "successes": successes,
+            "failures": failures,
+            "failure_rate": (failures / total * 100) if total > 0 else 0.0,
+        }
+
+    def _get(self, endpoint: str, params: Optional[dict] = None) -> tuple:
+        """
+        Effectuer une requête GET avec gestion d'erreurs.
+        Retourne (data, status_code) pour permettre la détection de rate limit.
+        """
         self._rate_limit()
         url = f"{self.base_url}{endpoint}"
         try:
             response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
+
+            # Détection rate limit (429)
+            if response.status_code == 429:
+                logger.error(
+                    f"[DexScreener] 🚨 RATE LIMIT 429 reçu ! "
+                    f"Headers: {dict(response.headers)}"
+                )
+                # Activer la pause automatique de 60s
+                self._rate_limit_paused_until = time.time() + 60.0
+                return None, 429
+
+            # Autres erreurs HTTP
+            if response.status_code != 200:
+                logger.warning(
+                    f"[DexScreener] HTTP {response.status_code} pour {endpoint} "
+                    f"Headers: {dict(response.headers)}"
+                )
+                return None, response.status_code
+
+            return response.json(), 200
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Erreur API DexScreener: {e}")
-            return None
+            return None, 0
+
+    def _get_simple(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
+        """Wrapper simple pour les appels non-analyze_token (compatibilité)"""
+        data, _status = self._get(endpoint, params)
+        return data
 
     def get_latest_token_profiles(self) -> list:
         """Récupérer les derniers profils de tokens (nouveaux listings)"""
-        data = self._get(ENDPOINTS["token_profiles_latest"])
+        data = self._get_simple(ENDPOINTS["token_profiles_latest"])
         if not data:
             return []
         # Filtrer uniquement Solana
@@ -53,28 +132,28 @@ class DexScreenerAPI:
 
     def get_boosted_tokens(self) -> list:
         """Récupérer les tokens les plus boostés (trending)"""
-        data = self._get(ENDPOINTS["token_boosts_top"])
+        data = self._get_simple(ENDPOINTS["token_boosts_top"])
         if not data:
             return []
         return [t for t in data if t.get("chainId") == CHAIN_ID]
 
     def get_latest_boosts(self) -> list:
         """Récupérer les derniers tokens boostés"""
-        data = self._get(ENDPOINTS["token_boosts_latest"])
+        data = self._get_simple(ENDPOINTS["token_boosts_latest"])
         if not data:
             return []
         return [t for t in data if t.get("chainId") == CHAIN_ID]
 
     def get_trending_metas(self) -> list:
         """Récupérer les narratives/metas trending"""
-        data = self._get(ENDPOINTS["trending_metas"])
+        data = self._get_simple(ENDPOINTS["trending_metas"])
         if not data:
             return []
         return data
 
     def search_pairs(self, query: str) -> list:
         """Rechercher des paires par nom/symbole"""
-        data = self._get(ENDPOINTS["search"], params={"q": query})
+        data = self._get_simple(ENDPOINTS["search"], params={"q": query})
         if not data or "pairs" not in data:
             return []
         # Filtrer Solana uniquement
@@ -86,7 +165,7 @@ class DexScreenerAPI:
             return []
         addresses = ",".join(token_addresses[:30])
         endpoint = f"{ENDPOINTS['tokens']}/{addresses}"
-        data = self._get(endpoint)
+        data = self._get_simple(endpoint)
         if not data:
             return []
         return data if isinstance(data, list) else data.get("pairs", [])
@@ -94,7 +173,7 @@ class DexScreenerAPI:
     def get_pair_info(self, pair_address: str) -> Optional[dict]:
         """Récupérer les infos d'une paire spécifique"""
         endpoint = f"{ENDPOINTS['pairs']}/{pair_address}"
-        data = self._get(endpoint)
+        data = self._get_simple(endpoint)
         if not data or "pairs" not in data:
             return None
         pairs = data["pairs"]
@@ -142,10 +221,43 @@ class DexScreenerAPI:
     def analyze_token(self, token_address: str) -> Optional[dict]:
         """
         Analyser un token en détail : prix, volume, liquidité, etc.
+        Avec monitoring Gate 1 : compteurs succès/échec et détection rate limit.
         """
-        pairs = self.get_token_info([token_address])
-        if not pairs:
+        now = time.time()
+        self._gate1_calls.append(now)
+
+        # Appel API avec status code
+        pairs_data, status_code = self._get(
+            f"{ENDPOINTS['tokens']}/{token_address}"
+        )
+
+        # Traitement de l'échec
+        if not pairs_data:
+            self._gate1_failures.append(now)
+            if status_code == 429:
+                logger.error(
+                    f"[Gate1] ❌ RATE LIMIT 429 pour {token_address[:8]}... "
+                    f"Pause 60s activée"
+                )
+            elif status_code > 0:
+                logger.info(
+                    f"[Gate1] ❌ HTTP {status_code} pour {token_address[:8]}... "
+                    f"(token non indexé ou erreur)"
+                )
+            else:
+                logger.info(
+                    f"[Gate1] ❌ Timeout/Erreur réseau pour {token_address[:8]}..."
+                )
             return None
+
+        pairs = pairs_data if isinstance(pairs_data, list) else pairs_data.get("pairs", [])
+        if not pairs:
+            self._gate1_failures.append(now)
+            logger.info(f"[Gate1] ❌ Aucune paire trouvée pour {token_address[:8]}...")
+            return None
+
+        # Succès
+        self._gate1_successes.append(now)
 
         # Prendre la paire avec le plus de liquidité
         best_pair = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
