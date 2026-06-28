@@ -3,11 +3,13 @@ import time
 import sqlite3
 import requests
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "postmortem.db"
+_DATA_DIR = os.environ.get("PERSISTENT_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(_DATA_DIR, "postmortem.db")
 
 # ─── FIX MÉMOIRE — Limite globale : max 5 threads post-mortem simultanés ───
 # Évite l'accumulation de threads en RAM
