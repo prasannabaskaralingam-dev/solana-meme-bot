@@ -3271,16 +3271,21 @@ async def _bc_momentum_confirmation(
 ):
     """
     Confirmation momentum async post-achat bonding curve.
-    Attend 15s puis vérifie via DexScreener si le momentum est positif.
+    Attend 45s puis vérifie via DexScreener si le momentum est positif.
     Si momentum négatif (prix -10% ET volume faible) → vendre immédiatement.
-    Sinon → laisser Circuit Breaker gérer normalement.
+    Si DexScreener retourne None → ne pas vendre, laisser CB gérer.
     """
     try:
-        await asyncio.sleep(15)  # Attendre 15s pour que DexScreener indexe
+        await asyncio.sleep(45)  # Attendre 45s pour que DexScreener indexe (T+30s minimum)
+
+        # Vérifier que la position existe encore (CB peut avoir déjà vendu)
+        if token_address not in positions.positions:
+            logger.info(f"[BC-Momentum] {token_address[:8]}... position déjà fermée (CB) - skip")
+            return
 
         analysis = api.analyze_token(token_address)
         if not analysis:
-            logger.info(f"[BC-Momentum] {token_address[:8]}... pas encore sur DexScreener après 15s - CB gère")
+            logger.info(f"[BC-Momentum] {token_address[:8]}... pas encore sur DexScreener après 45s - CB gère (pas de vente)")
             return
 
         current_price = float(analysis.get("price_usd", 0) or 0)
@@ -3303,9 +3308,9 @@ async def _bc_momentum_confirmation(
                 sym = pos.token_symbol
                 sell_result = trading_engine.execute_sell(pos, "BC-Momentum faible")
                 if sell_result:
-                    logger.info(f"[BC-Momentum] 🔴 VENDU {sym} (momentum faible après 15s)")
+                    logger.info(f"[BC-Momentum] 🔴 VENDU {sym} (momentum faible après 45s)")
                     # Notification Telegram
-                    msg = f"🔴 *EXIT MOMENTUM* (15s post-achat)\n\n"
+                    msg = f"🔴 *EXIT MOMENTUM* (45s post-achat)\n\n"
                     msg += f"🪙 `{token_address}`\n"
                     msg += f"📉 Prix: {price_change_pct:+.1f}%\n"
                     msg += f"📊 Volume 5m: ${volume_5m:,.0f}\n"
