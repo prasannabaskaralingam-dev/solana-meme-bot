@@ -5194,17 +5194,87 @@ def main():
         await autonomous_guardian.start()
         print("🛡️ Guardian autonome DÉMARRÉ (R5: indépendant de Telegram)")
 
-    app.post_init = post_init
+    # ━━━ R5 FIX: DÉMARRAGE AUTONOME ━━━
+    # Le Guardian DOIT démarrer même si Telegram est mort.
+    # On utilise app.initialize() + app.start() manuellement au lieu de run_polling()
+    # pour pouvoir lancer le Guardian AVANT le polling Telegram.
 
-    print("✅ Bot de trading démarré !")
-    print("🔌 Helius WebSocket: source PRIMAIRE de prix (temps réel)")
-    print("🔄 Polling DexScreener 3s: FALLBACK si WS down")
-    print("⚡ Pipeline: prix WS → cb.check() → SL -25% instantané")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        poll_interval=1.0,
-    )
+    async def _run_bot():
+        """Boucle principale R5: Guardian d'abord, Telegram ensuite (best-effort)."""
+        # 1. Initialiser l'application (sans polling)
+        await app.initialize()
+
+        # 2. Lancer post_init (Guardian + WebSockets)
+        try:
+            await post_init(app)
+        except Exception as e:
+            logger.error(f"[R5] Erreur post_init: {e}")
+            # Le Guardian est critique — on ne continue pas sans lui
+            # Mais on essaie quand même le polling
+
+        # 3. Démarrer le job_queue et les handlers
+        await app.start()
+
+        # 4. Démarrer le polling Telegram (best-effort, retry infini)
+        print("✅ Bot de trading démarré !")
+        print("🔌 Helius WebSocket: source PRIMAIRE de prix (temps réel)")
+        print("🔄 Polling DexScreener 3s: FALLBACK si WS down")
+        print("⚡ Pipeline: prix WS → cb.check() → SL -25% instantané")
+
+        # Lancer le polling dans une task séparée (ne bloque pas le Guardian)
+        polling_task = asyncio.create_task(_telegram_polling_loop())
+
+        # Attendre indéfiniment (le Guardian tourne en background task)
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Cleanup
+            try:
+                if autonomous_guardian:
+                    await autonomous_guardian.stop()
+            except:
+                pass
+            await app.stop()
+            await app.shutdown()
+
+    async def _telegram_polling_loop():
+        """
+        Polling Telegram avec retry infini.
+        Si Telegram est down, on retry toutes les 30s.
+        Le Guardian continue de protéger le capital pendant ce temps.
+        """
+        from telegram.error import TimedOut, NetworkError
+        updater = app.updater
+        while True:
+            try:
+                await updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    poll_interval=1.0,
+                )
+                logger.info("[Telegram] Polling démarré ✅")
+                # Attendre que le polling s'arrête (normalement il tourne indéfiniment)
+                while updater.running:
+                    await asyncio.sleep(5)
+            except (TimedOut, NetworkError, OSError) as e:
+                logger.warning(f"[Telegram] Polling échoué (retry dans 30s): {e}")
+                try:
+                    await updater.stop()
+                except:
+                    pass
+                await asyncio.sleep(30)
+            except Exception as e:
+                logger.error(f"[Telegram] Erreur polling inattendue (retry dans 30s): {e}")
+                try:
+                    await updater.stop()
+                except:
+                    pass
+                await asyncio.sleep(30)
+
+    # Lancer la boucle principale
+    asyncio.run(_run_bot())
 
 
 if __name__ == "__main__":
