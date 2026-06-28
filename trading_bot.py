@@ -4957,7 +4957,7 @@ def main():
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .get_updates_pool_timeout(5.0)
-        .get_updates_read_timeout(10.0)
+        .get_updates_read_timeout(5.0)
         .get_updates_connect_timeout(10.0)
         .get_updates_write_timeout(10.0)
         .get_updates_connection_pool_size(1)
@@ -4968,6 +4968,15 @@ def main():
         .write_timeout(10.0)
         .build()
     )
+
+    # Error handler pour ignorer les Conflict 409 (sporadiques, non-bloquants)
+    from telegram.error import Conflict as TelegramConflict
+    async def _error_handler(update, context):
+        if isinstance(context.error, TelegramConflict):
+            logger.debug(f"[Telegram] Conflict 409 (ignor\u00e9): {context.error}")
+            return  # Ignorer silencieusement
+        logger.error(f"[Telegram] Erreur non g\u00e9r\u00e9e: {context.error}", exc_info=context.error)
+    app.add_error_handler(_error_handler)
 
     # Commandes
     app.add_handler(CommandHandler("start", start))
