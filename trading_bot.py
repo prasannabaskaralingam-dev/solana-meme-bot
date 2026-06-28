@@ -60,7 +60,7 @@ def _setup_logging():
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
-    # Handler console
+    # Handler console (stdout capturé par journalctl)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -70,6 +70,9 @@ def _setup_logging():
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+
+    # Silencer httpx pour éviter le spam de logs getUpdates
+    logging.getLogger('httpx').setLevel(logging.WARNING)
 
 _setup_logging()
 logger = logging.getLogger(__name__)
@@ -1793,12 +1796,11 @@ async def on_copy_trade_signal(signal: CopyTradeSignal):
         msg += f"👁 [Wallet source](https://solscan.io/tx/{signal.tx_signature})"
         for chat_id in subscribers:
             try:
-                from telegram import Bot
-                bot = Bot(token=TELEGRAM_BOT_TOKEN)
-                await bot.send_message(
-                    chat_id=chat_id, text=msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True
+                import requests as _req
+                _req.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True},
+                    timeout=10
                 )
             except Exception as e:
                 logger.error(f"Erreur notification copy trade: {e}")
@@ -4948,8 +4950,24 @@ def main():
     print(f"💰 Budget max: {trading_config.max_budget_sol} SOL")
     print(f"🌐 Jupiter API: {trading_config.jupiter_api_url}")
 
-    # Créer l'application Telegram
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Créer l'application Telegram avec timeouts configurés via le builder
+    # (évite le deprecation warning et les conflits 409 causés par des timeouts mal gérés)
+    from telegram.request import HTTPXRequest
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .get_updates_pool_timeout(5.0)
+        .get_updates_read_timeout(10.0)
+        .get_updates_connect_timeout(10.0)
+        .get_updates_write_timeout(10.0)
+        .get_updates_connection_pool_size(1)
+        .connection_pool_size(8)
+        .pool_timeout(5.0)
+        .read_timeout(10.0)
+        .connect_timeout(10.0)
+        .write_timeout(10.0)
+        .build()
+    )
 
     # Commandes
     app.add_handler(CommandHandler("start", start))
@@ -5137,10 +5155,7 @@ def main():
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        pool_timeout=5,
-        read_timeout=10,
-        connect_timeout=10,
-        write_timeout=10,
+        poll_interval=1.0,
     )
 
 
