@@ -42,6 +42,7 @@ from onchain_scorer import OnchainScorer
 from auto_calibration import analyze_postmortems, apply_adjustments
 from helius_websocket import HeliusWebSocket
 from bonding_curve import get_bonding_curve_data, is_safe_bonding_curve, get_sol_price_usd, BondingCurveData
+from autonomous_guardian import AutonomousGuardian, configure_notifications, queue_notification, flush_notifications
 import requests
 
 # ─── FIX MÉMOIRE 5 — Rotation des logs (max 10MB, 3 fichiers) ───
@@ -408,6 +409,7 @@ daily_pnl_guard: DailyPnLGuard = None
 token_filter: TokenFilter = None
 onchain_scorer: OnchainScorer = None
 helius_ws: HeliusWebSocket = None
+autonomous_guardian: AutonomousGuardian = None
 auto_trading_enabled = False
 subscribers = []
 
@@ -2037,6 +2039,17 @@ async def watchdog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Compteur d'échecs de vente par token (si 3 échecs → fermer la position)
 sell_fail_counter: dict = {}
+
+
+async def _tg_flush_notifications_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    R5: Job TG léger (10s) — flush les notifications du Guardian.
+    Best-effort: si Telegram est mort, les notifications sont loguées.
+    Ce job ne fait AUCUNE logique de trading.
+    """
+    flush_notifications()
+    # Aussi flush les anciennes notifications WS (compatibilité)
+    await _flush_ws_notifications(context)
 
 
 async def _flush_ws_notifications(context: ContextTypes.DEFAULT_TYPE):
@@ -5020,15 +5033,14 @@ def main():
     app.add_handler(CommandHandler("verify", verify_cmd))
     app.add_handler(CommandHandler("health_check", health_check_cmd))
 
-    # Job SNIPER FALLBACK (3s) - polling DexScreener seulement si WS down
+    # ━━━ R5: GUARDIAN AUTONOME — SL/TP/CB + Watchdog + LP Guard ━━━
+    # Ces jobs critiques tournent dans une asyncio task INDÉPENDANTE de Telegram.
+    # Si Telegram meurt, le Guardian continue de protéger le capital.
     job_queue = app.job_queue
-    job_queue.run_repeating(sniper_monitor_job, interval=3, first=5)
-
-    # Job Capital Watchdog (5s) - surveille que le capital est sous contrôle
-    job_queue.run_repeating(watchdog_check_job, interval=5, first=8)
-
-    # Job backup pour LP monitoring + post-trade analysis (15s)
-    job_queue.run_repeating(position_monitor_job, interval=15, first=10)
+    # NOTE: sniper_monitor_job, watchdog_check_job, position_monitor_job
+    # sont maintenant gérés par AutonomousGuardian (lancé dans post_init)
+    # Job léger TG: flush les notifications du Guardian (best-effort, 10s)
+    job_queue.run_repeating(_tg_flush_notifications_job, interval=10, first=10)
 
     # Job WebSocket: traite les tokens détectés par Helius WS (5s)
     job_queue.run_repeating(ws_token_processor_job, interval=5, first=15)
@@ -5151,9 +5163,36 @@ def main():
                 balance = wallet.get_sol_balance() if wallet.keypair else 0
                 n_positions = positions.count_positions()
                 logger.info(f"[Restart] Bot redémarré | Capital: {balance:.4f} SOL | Positions: {n_positions}")
-                # Notification Telegram désactivée pour réduire le bruit
             except Exception as e:
                 logger.error(f"Erreur alerte redémarrage: {e}")
+
+        # ━━━ R5: DÉMARRER LE GUARDIAN AUTONOME ━━━
+        global autonomous_guardian
+        configure_notifications(TELEGRAM_BOT_TOKEN, subscribers)
+        autonomous_guardian = AutonomousGuardian(
+            positions=positions,
+            trading_engine=trading_engine,
+            circuit_breaker=circuit_breaker,
+            capital_watchdog=capital_watchdog,
+            price_monitor=price_monitor,
+            helius_ws=helius_ws,
+            api=api,
+            pnl_tracker=pnl_tracker,
+            position_sizer=position_sizer,
+            daily_pnl_guard=daily_pnl_guard,
+            correlation_filter=correlation_filter,
+            liquidity_guard=liquidity_guard,
+            post_trade_analyzer=post_trade_analyzer,
+            sl_blacklist=sl_blacklist,
+            save_blacklist_fn=_save_blacklist,
+            save_state_fn=_save_state,
+            log_trade_fn=_log_trade,
+            update_sol_price_fn=update_sol_price,
+            ws_notification_queue=_ws_notification_queue,
+            trading_config=trading_config,
+        )
+        await autonomous_guardian.start()
+        print("🛡️ Guardian autonome DÉMARRÉ (R5: indépendant de Telegram)")
 
     app.post_init = post_init
 
