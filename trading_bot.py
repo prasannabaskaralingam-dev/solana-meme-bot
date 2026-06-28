@@ -596,11 +596,11 @@ def init_trading():
 
     # Daily PnL Guard (circuit breaker global)
     daily_pnl_guard = DailyPnLGuard(DailyPnLGuardConfig(
-        max_daily_loss_sol=-0.05,
+        max_daily_loss_sol=-0.15,
         max_consecutive_sl=3,
         pause_duration_minutes=60.0,
     ))
-    logger.info("⛔ Daily PnL Guard: actif (pause après -0.05 SOL/jour ou 3 SL consécutifs)")
+    logger.info("⛔ Daily PnL Guard: actif (pause après -0.15 SOL/jour ou 3 SL consécutifs)")
 
     # Helius WebSocket — prix temps réel depuis la blockchain
     global helius_ws
