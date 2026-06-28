@@ -3121,7 +3121,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             token_name = address[:12]  # Pas de nom disponible sans DexScreener
             logger.info(f"[BC] 📡 Bonding Curve: {address[:8]}... | "
                        f"MC=${bc_data.market_cap_usd:,.0f} | "
-                       f"SOL reserves={bc_data.liquidity_sol:.1f} | "
+                       f"SOL reserves={bc_data.virtual_sol_reserves / 1e9:.1f} | "
                        f"Progress={bc_data.bonding_progress_pct:.1f}% | "
                        f"Latence={latency_ms:.0f}ms")
 
@@ -3152,11 +3152,14 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             # ═══════════════════════════════════════════════════════════════
             # GATE 6 — LIQUIDITÉ BONDING CURVE (réserve SOL minimum)
             # ═══════════════════════════════════════════════════════════════
-            if bc_data.liquidity_sol < 10:
+            # Utiliser virtual_sol_reserves (inclut les 30 SOL initiaux de pump.fun)
+            # car real_sol_reserves = 0 pour les tokens fraîchement créés
+            virtual_sol = bc_data.virtual_sol_reserves / 1_000_000_000  # lamports → SOL
+            if virtual_sol < 10:
                 logger.info(f"[BC] 🚫 REJETÉ (liquidité faible): "
-                           f"{bc_data.liquidity_sol:.1f} SOL < 10 SOL minimum")
+                           f"{virtual_sol:.1f} SOL virtual < 10 SOL minimum")
                 continue
-            logger.info(f"[BC] ✅ Liquidité OK: {bc_data.liquidity_sol:.1f} SOL")
+            logger.info(f"[BC] ✅ Liquidité OK: {virtual_sol:.1f} SOL (virtual reserves)")
 
             # ═══════════════════════════════════════════════════════════════
             # ACHAT IMMÉDIAT — Bonding Curve (pas d'attente DexScreener)
@@ -3168,7 +3171,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                 "symbol": address[:6].upper(),
                 "price_usd": bc_data.price_usd,
                 "market_cap": bc_data.market_cap_usd,
-                "liquidity_usd": bc_data.liquidity_sol * _cached_sol_price_usd,
+                "liquidity_usd": (bc_data.virtual_sol_reserves / 1e9) * _cached_sol_price_usd,
                 "age_hours": 0,  # Token fraîchement créé
                 "buy_sell_ratio_5m": 10,  # Pas de données → forcer le passage
                 "pair_address": "",
@@ -3216,7 +3219,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                 msg += f"🪙 `{address}`\n"
                 msg += f"💵 {result['amount_sol']} SOL\n"
                 msg += f"📊 MC: ${bc_data.market_cap_usd:,.0f}\n"
-                msg += f"💧 Réserves: {bc_data.liquidity_sol:.1f} SOL\n"
+                msg += f"💧 Réserves: {bc_data.virtual_sol_reserves / 1e9:.1f} SOL\n"
                 msg += f"📈 Bonding: {bc_data.bonding_progress_pct:.1f}%\n"
                 msg += f"🔗 [TX](https://solscan.io/tx/{result['tx_signature']})"
                 for chat_id in subscribers:
@@ -3235,7 +3238,7 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                     f"[BC] ⚡ SNIPE EXÉCUTÉ: {sym} | "
                     f"{result['amount_sol']} SOL | "
                     f"MC=${bc_data.market_cap_usd:,.0f} | "
-                    f"SOL reserves={bc_data.liquidity_sol:.1f} | "
+                    f"SOL reserves={bc_data.virtual_sol_reserves / 1e9:.1f} | "
                     f"Latence détection→achat: {total_latency:.0f}ms"
                 )
 
