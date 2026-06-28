@@ -2992,6 +2992,9 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
     # Couvre-feu 3h-7h UTC
     current_hour_utc = datetime.now(timezone.utc).hour
     if 3 <= current_hour_utc < 7:
+        # Vider la queue pendant le couvre-feu (tokens périmés au réveil)
+        if _ws_new_token_queue:
+            _ws_new_token_queue.clear()
         return
 
     # Traiter max 3 tokens par cycle (éviter de bloquer le bot)
@@ -3298,10 +3301,7 @@ async def _bc_momentum_confirmation(
             if token_address in positions.positions:
                 pos = positions.positions[token_address]
                 sym = pos.token_symbol
-                sell_result = trading_engine.execute_sell(
-                    token_address=token_address,
-                    reason="BC-Momentum faible",
-                )
+                sell_result = trading_engine.execute_sell(pos, "BC-Momentum faible")
                 if sell_result:
                     logger.info(f"[BC-Momentum] 🔴 VENDU {sym} (momentum faible après 15s)")
                     # Notification Telegram

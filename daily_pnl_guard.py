@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DailyPnLGuardConfig:
     """Configuration du Daily PnL Guard"""
-    max_daily_loss_sol: float = -0.05       # Pause si perte > 0.05 SOL/jour
+    max_daily_loss_sol: float = -0.15       # Pause si perte > 0.15 SOL/jour (3 trades)
     max_consecutive_sl: int = 3             # Pause après 3 SL consécutifs
     pause_duration_minutes: float = 60.0    # Durée de la pause (1h)
     reset_hour_utc: int = 0                 # Reset à minuit UTC
