@@ -186,7 +186,7 @@ async def get_bonding_curve_data(
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     logger.warning(f"[BC] RPC HTTP {resp.status} pour {token_address[:8]}...")
                     return None
@@ -218,7 +218,7 @@ async def get_bonding_curve_data(
         return _parse_bonding_curve_data(data, token_address, sol_price_usd, latency_ms)
 
     except asyncio.TimeoutError:
-        logger.warning(f"[BC] Timeout RPC pour {token_address[:8]}...")
+        logger.error(f"[BC] ⏱️ TIMEOUT 10s RPC pour {token_address[:8]}...")
         return None
     except Exception as e:
         logger.error(f"[BC] Erreur get_bonding_curve_data({token_address[:8]}...): {e}")
@@ -254,7 +254,7 @@ async def is_safe_bonding_curve(
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     return SafetyCheck(is_safe=False, mint_revoked=False, freeze_revoked=False, score=100)
 
@@ -290,6 +290,9 @@ async def is_safe_bonding_curve(
             score=score,
         )
 
+    except asyncio.TimeoutError:
+        logger.error(f"[BC] ⏱️ TIMEOUT 10s RPC safety pour {token_address[:8]}...")
+        return SafetyCheck(is_safe=False, mint_revoked=False, freeze_revoked=False, score=100)
     except Exception as e:
         logger.error(f"[BC] Erreur is_safe_bonding_curve({token_address[:8]}...): {e}")
         return SafetyCheck(is_safe=False, mint_revoked=False, freeze_revoked=False, score=100)

@@ -113,8 +113,11 @@ class DexScreenerAPI:
 
             return response.json(), 200
 
+        except requests.exceptions.Timeout:
+            logger.error(f"[DexScreener] ⏱️ TIMEOUT 10s pour {endpoint}")
+            return None, 0
         except requests.exceptions.RequestException as e:
-            logger.error(f"Erreur API DexScreener: {e}")
+            logger.error(f"[DexScreener] Erreur réseau: {e}")
             return None, 0
 
     def _get_simple(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:

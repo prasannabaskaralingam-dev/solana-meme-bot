@@ -3084,7 +3084,16 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 should_snipe, reason = trading_engine.should_snipe(analysis)
                 if should_snipe:
-                    result = trading_engine.execute_buy(analysis, "sniper")
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, trading_engine.execute_buy, analysis, "sniper"
+                            ),
+                            timeout=30.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[TIMEOUT] execute_buy >30s pour {address[:8]}... (DexScreener fallback) — skip")
+                        continue
                     if result:
                         sym = _safe_symbol(analysis.get("symbol"), address)
                         _log_trade(token_address=address, token_symbol=sym, strategy="sniper", side="BUY",
@@ -3186,8 +3195,17 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"[BC] 🚫 REJETÉ (prix=0): {address[:8]}...")
                 continue
 
-            # Exécuter l'achat directement
-            result = trading_engine.execute_buy(bc_analysis, "sniper")
+            # Exécuter l'achat directement (timeout 30s)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, trading_engine.execute_buy, bc_analysis, "sniper"
+                    ),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[BC] ⏱️ TIMEOUT execute_buy >30s pour {address[:8]}... — skip")
+                continue
             if result:
                 sym = address[:6].upper()
                 total_latency = (time.time() - t_detected) * 1000
@@ -3306,7 +3324,16 @@ async def _bc_momentum_confirmation(
             if token_address in positions.positions:
                 pos = positions.positions[token_address]
                 sym = pos.token_symbol
-                sell_result = trading_engine.execute_sell(pos, "BC-Momentum faible")
+                try:
+                    sell_result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, trading_engine.execute_sell, pos, "BC-Momentum faible"
+                        ),
+                        timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[BC-Momentum] ⏱️ TIMEOUT execute_sell >30s pour {token_address[:8]}... — CB gère")
+                    return
                 if sell_result:
                     logger.info(f"[BC-Momentum] 🔴 VENDU {sym} (momentum faible après 45s)")
                     # Notification Telegram
