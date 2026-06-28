@@ -3365,8 +3365,27 @@ async def _bc_momentum_confirmation(
                     return
                 if sell_result:
                     logger.info(f"[BC-Momentum] 🔴 VENDU {sym} (momentum faible après 45s)")
+                    # ━━━ CLEANUP COMPLET (R5) ━━━
+                    _log_trade(
+                        token_address=token_address,
+                        token_symbol=sym,
+                        strategy=pos.strategy,
+                        side="SELL",
+                        pnl_pct=pos.pnl_pct,
+                        reason="BC-Momentum faible",
+                        price=pos.current_price,
+                        amount_sol=pos.amount_sol_invested,
+                    )
+                    circuit_breaker.close_position(token_address)
+                    if capital_watchdog:
+                        capital_watchdog.unregister_position(token_address)
+                    if correlation_filter:
+                        correlation_filter.unregister_position(token_address)
+                    if liquidity_guard:
+                        liquidity_guard.unregister_position(token_address)
+                    positions.close_position(token_address)
                     # Notification Telegram
-                    msg = f"🔴 *EXIT MOMENTUM* (45s post-achat)\n\n"
+                    msg = f"{_sim_prefix()}🔴 *EXIT MOMENTUM* (45s post-achat)\n\n"
                     msg += f"🪙 `{token_address}`\n"
                     msg += f"📉 Prix: {price_change_pct:+.1f}%\n"
                     msg += f"📊 Volume 5m: ${volume_5m:,.0f}\n"
