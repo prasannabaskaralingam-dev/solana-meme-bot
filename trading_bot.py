@@ -4454,7 +4454,7 @@ async def health_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Daily Guard
     if daily_pnl_guard:
-        paused = getattr(daily_pnl_guard, 'is_paused', False)
+        paused = daily_pnl_guard.is_paused()
         guard_emoji = "🔴" if paused else "✅"
         lines.append(f"{guard_emoji} *Daily Guard* : {'PAUSE' if paused else 'actif'}")
     else:
