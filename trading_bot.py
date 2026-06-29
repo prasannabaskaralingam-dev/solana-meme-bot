@@ -3167,10 +3167,10 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                        f"Latence={latency_ms:.0f}ms")
 
             # ═══════════════════════════════════════════════════════════════
-            # GATE 2 — MC BONDING CURVE (min $80K)
+            # GATE 2 — MC BONDING CURVE (min $40K)
             # ═══════════════════════════════════════════════════════════════
-            if bc_data.market_cap_usd < 80_000:
-                logger.info(f"[BC] 🚫 REJETÉ [Gate2] (MC trop faible): MC=${bc_data.market_cap_usd:,.0f} < $80,000")
+            if bc_data.market_cap_usd < 40_000:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate2] (MC trop faible): MC=${bc_data.market_cap_usd:,.0f} < $40,000")
                 continue
 
             # ═══════════════════════════════════════════════════════════════
