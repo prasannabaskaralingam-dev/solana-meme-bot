@@ -3167,13 +3167,10 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                        f"Latence={latency_ms:.0f}ms")
 
             # ═══════════════════════════════════════════════════════════════
-            # GATE 2 — MC BONDING CURVE
+            # GATE 2 — MC BONDING CURVE (min $80K)
             # ═══════════════════════════════════════════════════════════════
-            if bc_data.market_cap_usd < 2_000:
-                logger.info(f"[BC] 🚫 REJETÉ (MC trop faible): MC=${bc_data.market_cap_usd:,.0f} < $2,000")
-                continue
-            if bc_data.market_cap_usd > 100_000:
-                logger.info(f"[BC] 🚫 REJETÉ (MC trop élevé): MC=${bc_data.market_cap_usd:,.0f} > $100,000")
+            if bc_data.market_cap_usd < 80_000:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate2] (MC trop faible): MC=${bc_data.market_cap_usd:,.0f} < $80,000")
                 continue
 
             # ═══════════════════════════════════════════════════════════════
@@ -3189,6 +3186,35 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"[BC] 🚫 REJETÉ (sécurité): {address[:8]}... — {' '.join(reasons)}")
                 continue
             logger.info(f"[BC] ✅ Sécurité OK: Mint:✅ Freeze:✅ (score={safety.score})")
+
+            # ═══════════════════════════════════════════════════════════════
+            # GATE 4 — HOLDERS (top holder max 20%, min 50 uniques)
+            # ═══════════════════════════════════════════════════════════════
+            top_holder_pct = bc_data.top_holder_pct if hasattr(bc_data, 'top_holder_pct') else 0
+            unique_holders = bc_data.unique_holders if hasattr(bc_data, 'unique_holders') else 999
+            if top_holder_pct > 20:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate4] (top holder trop gros): "
+                           f"{top_holder_pct:.1f}% > 20% max")
+                continue
+            if unique_holders < 50:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate4] (pas assez de holders): "
+                           f"{unique_holders} < 50 minimum")
+                continue
+            logger.info(f"[BC] ✅ Gate4 Holders OK: top={top_holder_pct:.1f}%, uniques={unique_holders}")
+
+            # ═══════════════════════════════════════════════════════════════
+            # GATE 5 — BC PROGRESS (min 40% remplie, volume 5min min $500)
+            # ═══════════════════════════════════════════════════════════════
+            if bc_data.bonding_progress_pct < 40:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate5] (bonding curve trop basse): "
+                           f"{bc_data.bonding_progress_pct:.1f}% < 40% minimum")
+                continue
+            bc_volume_5m = bc_data.volume_5m_usd if hasattr(bc_data, 'volume_5m_usd') else 0
+            if bc_volume_5m < 500:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate5] (volume 5min trop faible): "
+                           f"${bc_volume_5m:,.0f} < $500 minimum")
+                continue
+            logger.info(f"[BC] ✅ Gate5 BC Progress OK: {bc_data.bonding_progress_pct:.1f}% remplie, vol_5m=${bc_volume_5m:,.0f}")
 
             # ═══════════════════════════════════════════════════════════════
             # GATE 6 — LIQUIDITÉ BONDING CURVE (réserve SOL minimum)

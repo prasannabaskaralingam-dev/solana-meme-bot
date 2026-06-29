@@ -323,11 +323,38 @@ class SmartEntryEngine:
                        f"{len(expired_signals)} signaux expirés")
 
     def _score_for_watchlist(self, analysis: dict) -> Tuple[int, list]:
-        """Scorer un token pour l'ajout à la watchlist"""
+        """Scorer un token pour l'ajout à la watchlist (Gate 7 SmartEntry)"""
         score = 0
         reasons = []
 
-        # Prix en hausse sur 5min
+        # ═══ GATE 7 — FILTRES DURS (rejet immédiat si non respecté) ═══
+        # Ratio achat/vente minimum : 3.5x
+        ratio = analysis.get("buy_sell_ratio_5m", 0)
+        if ratio < 3.5:
+            return 0, []  # Gate 7: ratio trop faible
+
+        # Volume 5min minimum : $1000
+        volume_5m = self._estimate_volume_5m(analysis)
+        if volume_5m < 1000:
+            return 0, []  # Gate 7: volume 5min trop faible
+
+        # Achats 5min minimum : 20
+        buys = analysis.get("buys_5m", 0)
+        if buys < 20:
+            return 0, []  # Gate 7: pas assez d'achats
+
+        # Token frais - SNIPER ONLY: rejeter si > 1h
+        age = analysis.get("age_hours")
+        if age and age > 1:
+            return 0, []  # Trop vieux pour le mode sniper
+
+        # ═══ SCORING (après passage des filtres durs) ═══
+        reasons.append(f"⚡ Ratio {ratio:.1f}x (≥3.5x)")
+        reasons.append(f"💰 Vol5m: ${volume_5m:,.0f} (≥$1K)")
+        reasons.append(f"🛒 {buys} achats/5m (≥20)")
+        score += 3  # 3 points pour avoir passé les 3 filtres durs
+
+        # Prix en hausse sur 5min (bonus)
         p5m = analysis.get("price_change_5m", 0)
         if p5m >= 5:
             score += 1
@@ -335,38 +362,21 @@ class SmartEntryEngine:
         if p5m >= 15:
             score += 1
 
-        # Prix en hausse sur 1h
+        # Prix en hausse sur 1h (bonus)
         p1h = analysis.get("price_change_1h", 0)
         if p1h >= 20:
             score += 1
             reasons.append(f"📈 +{p1h:.0f}% (1h)")
 
-        # Volume significatif
+        # Volume 24h significatif (bonus)
         vol = analysis.get("volume_24h", 0)
         if vol >= 10000:
             score += 1
-            reasons.append(f"💰 Vol: ${vol:,.0f}")
+            reasons.append(f"💰 Vol24h: ${vol:,.0f}")
 
-        # Beaucoup d'achats
-        buys = analysis.get("buys_5m", 0)
-        if buys >= 10:
-            score += 1
-            reasons.append(f"🛒 {buys} achats/5m")
-        if buys >= 30:
-            score += 1
-
-        # Ratio favorable
-        ratio = analysis.get("buy_sell_ratio_5m", 0)
-        if ratio >= 2:
-            score += 1
-            reasons.append(f"⚡ Ratio {ratio:.1f}x")
-
-        # Token frais - SNIPER ONLY: rejeter si > 1h
-        age = analysis.get("age_hours")
-        if age and age > 1:
-            return 0, []  # Trop vieux pour le mode sniper
+        # Token très frais (bonus fort)
         if age and age <= 1:
-            score += 2  # Bonus fort pour les tokens très frais
+            score += 2
             reasons.append(f"🆕 {age:.1f}h")
 
         return score, reasons
