@@ -135,4 +135,64 @@ résultat correct obtenu par un chemin de
 secours lent peut masquer un chemin
 principal cassé (loi de Goodhart).
 
+AJOUT — SIGNAL ORPHELIN :
+Pour tout NOUVEAU signal/log/alerte
+introduit par un fix ou un nouveau
+composant (ex: log 'CRITICAL'), vérifier
+explicitement et documenter :
+(1) où ce signal est envoyé (Telegram
+visible ? logs serveur seulement, donc
+invisible ?)
+(2) quelle ACTION concrète il déclenche
+automatiquement.
+Ne jamais supposer qu'un log critique
+implique une réponse automatique — un
+signal qui existe mais que personne
+n'exploite (ni alerte visible, ni action)
+est une régression silencieuse classique,
+car la checklist R6 fixe ne couvre que
+les chemins déjà connus au moment où elle
+a été écrite, pas les nouveaux signaux
+créés par un nouveau composant.
+
+───────────────────────────────────────────
+
+RÈGLE 7 — INVERSION (PAR COMPOSANT)
+Qu'est-ce qui ferait ÉCHOUER ce composant
+précisément ? Cherche les scénarios de
+panne (double échec, état intermédiaire,
+cache obsolète, changement d'état pendant
+une opération) au lieu de vérifier
+seulement le fonctionnement nominal.
+
+S'applique de façon fractale : au système
+entier ET à chaque composant individuel
+zoomé — pas seulement à l'architecture
+globale.
+
+Exemples de questions Inversion :
+- Double échec : que se passe-t-il si
+  TOUTES les sources de données tombent ?
+- État intermédiaire : existe-t-il un
+  moment où le composant n'est ni dans
+  l'état A ni dans l'état B ?
+- Cache obsolète : un prix/état caché
+  peut-il devenir dangereux si non
+  rafraîchi ?
+- Changement d'état : si l'état change
+  PENDANT une opération, le composant
+  le détecte-t-il ?
+
+───────────────────────────────────────────
+
+ORDRE D'APPLICATION DES RÈGLES :
+
+1. Shannon (R1) — limites, entrées, sources
+2. Entropie (R2) — dégradation 30 jours
+3. Hormozi (R3) — maillon faible en premier
+4. First Principles (R4/R5) — timeouts,
+   séparation
+5. Inversion (R7) — par composant, fractale
+6. Changelog — avant tout déploiement
+
 ═══════════════════════════════════════════
