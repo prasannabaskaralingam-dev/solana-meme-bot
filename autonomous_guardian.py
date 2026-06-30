@@ -139,6 +139,7 @@ class AutonomousGuardian:
         # Compteurs pour les intervalles différents
         self._tick_count = 0
         self._sell_fail_counter: dict = {}
+        self._latency_trackers: dict = {}  # Ref vers _latency_trackers de trading_bot
         self._running = False
         self._task = None
         # Stats
@@ -375,6 +376,11 @@ class AutonomousGuardian:
                 if cb_action.should_sell:
                     is_partial = cb_action.rule == "partial_take_profit"
                     sell_pct = 50.0 if is_partial else 100.0
+                    # ⏱️ Latency: t5 = sell signal, t6 = sell called
+                    _lt = self._latency_trackers.get(pos.token_address)
+                    if _lt:
+                        _lt.t5_sell_signal = time.time()
+                        _lt.t6_sell_called = time.time()
                     result = self.trading_engine.execute_sell(pos, cb_action.reason, sell_pct=sell_pct)
                     if not result:
                         self._sell_fail_counter[pos.token_address] = self._sell_fail_counter.get(pos.token_address, 0) + 1
@@ -383,6 +389,15 @@ class AutonomousGuardian:
                             self._force_close_dead_token(pos)
                         continue
                     self.stats["sells_executed"] += 1
+                    # ⏱️ Latency: t7 = sell confirmé
+                    _lt = self._latency_trackers.get(pos.token_address)
+                    if _lt:
+                        _lt.t7_sell_confirmed = time.time()
+                        _lt.sell_source = "Guardian-Sniper"
+                        _lt.save_sell()
+                        logger.info(f"[⏱️ LATENCY] {pos.token_symbol} buy→sell: "
+                                   f"{(_lt.t7_sell_confirmed - (_lt.t4_buy_confirmed or _lt.t0_ws_detection))*1000:.0f}ms "
+                                   f"[SOURCE: Guardian-Sniper]")
                     logger.info(f"⚡ [SOURCE: Guardian-Sniper] Vente: {pos.token_symbol} "
                                f"PnL={pos.pnl_pct:+.1f}% | {cb_action.reason}")
                     self._log_trade(

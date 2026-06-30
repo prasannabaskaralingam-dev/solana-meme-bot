@@ -34,6 +34,10 @@ from correlation_filter import CorrelationFilter
 from liquidity_guard import LiquidityGuard
 from post_trade_analyzer import PostTradeAnalyzer
 from postmortem_tracker import init_db as init_postmortem_db, start_postmortem_thread
+from latency_metrics import (
+    init_latency_db, LatencyTracker,
+    get_latency_stats, format_latency_telegram,
+)
 from circuit_breaker import CircuitBreaker, CBConfig
 from capital_watchdog import CapitalWatchdog, WatchdogConfig
 from daily_pnl_guard import DailyPnLGuard, DailyPnLGuardConfig
@@ -480,6 +484,9 @@ _ws_queue_first_push: float = 0.0  # timestamp du premier token poussé (0 = jam
 _bot_start_time: float = time.time()  # timestamp de démarrage du bot
 _pipeline_silent_alert_sent: bool = False  # éviter de spammer l'alerte
 
+# Latency Trackers par token (max 50, auto-purge)
+_latency_trackers: dict = {}  # {token_address: LatencyTracker}
+
 
 def init_trading():
     """Initialiser le moteur de trading (après import du wallet)"""
@@ -569,6 +576,10 @@ def init_trading():
     init_postmortem_db()
     logger.info("📋 Postmortem Tracker DB initialisée")
 
+    # Latency Metrics (SQLite)
+    init_latency_db()
+    logger.info("⏱️ Latency Metrics DB initialisée")
+
     # CircuitBreaker centralisé (4 règles de sortie)
     circuit_breaker = CircuitBreaker(CBConfig(
         time_stop_minutes=trading_config.time_stop_minutes,
@@ -643,6 +654,11 @@ def init_trading():
                         reason = cb_action.reason
                         is_partial = cb_action.rule == "partial_take_profit"
                         sell_pct = 50.0 if is_partial else 100.0
+                        # ⏱️ Latency: t5 = sell signal, t6 = sell called
+                        _lt = _latency_trackers.get(token_address)
+                        if _lt:
+                            _lt.t5_sell_signal = time.time()
+                            _lt.t6_sell_called = time.time()
                         logger.info(f"⚡ [SOURCE: HeliusWS] Déclenchement vente: {pos.token_symbol} "
                                    f"PnL={pos.pnl_pct:+.1f}% | Raison: {reason}")
                         result = trading_engine.execute_sell(pos, reason, sell_pct=sell_pct)
@@ -661,6 +677,15 @@ def init_trading():
                             })
                         else:
                             # === VENTE TOTALE: cleanup complet ===
+                            # ⏱️ Latency: t7 = sell confirmé
+                            _lt = _latency_trackers.get(token_address)
+                            if _lt:
+                                _lt.t7_sell_confirmed = time.time()
+                                _lt.sell_source = "HeliusWS"
+                                _lt.save_sell()
+                                logger.info(f"[⏱️ LATENCY] {pos.token_symbol} buy→sell: "
+                                           f"{(_lt.t7_sell_confirmed - (_lt.t4_buy_confirmed or _lt.t0_ws_detection))*1000:.0f}ms "
+                                           f"[SOURCE: HeliusWS]")
                             logger.info(f"⚡ [HeliusWS] VENTE TOTALE: {pos.token_symbol} "
                                        f"PnL={pos.pnl_pct:+.1f}% | {reason}")
                             # PnL Tracker
@@ -741,10 +766,21 @@ def init_trading():
                 return
             # Ajouter à la queue pour traitement par ws_token_processor_job
             global _ws_queue_first_push, _pipeline_silent_alert_sent
+            t0_now = time.time()
+            # Latency: t0 = détection WS, t1 = entrée queue (même instant ici)
+            tracker = LatencyTracker(token_address)
+            tracker.t0_ws_detection = t0_now
+            tracker.t1_queue_entry = t0_now
+            _latency_trackers[token_address] = tracker
+            # Purge auto si trop de trackers
+            if len(_latency_trackers) > 100:
+                oldest = sorted(_latency_trackers, key=lambda k: _latency_trackers[k].t0_ws_detection)[:50]
+                for k in oldest:
+                    del _latency_trackers[k]
             _ws_new_token_queue.append({
                 "address": token_address,
                 "price_usd": price_usd,
-                "timestamp": time.time(),
+                "timestamp": t0_now,
                 "source": "websocket",
             })
             if _ws_queue_first_push == 0.0:
@@ -2341,6 +2377,11 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             cb_action = circuit_breaker.check(pos.token_address, current_price)
 
             if cb_action.should_sell:
+                # ⏱️ Latency: t5 = sell signal, t6 = sell called
+                _lt = _latency_trackers.get(pos.token_address)
+                if _lt:
+                    _lt.t5_sell_signal = time.time()
+                    _lt.t6_sell_called = time.time()
                 # Partial TP: vendre 50% seulement, garder la position ouverte
                 is_partial = cb_action.rule == "partial_take_profit"
                 sell_pct = 50.0 if is_partial else 100.0
@@ -2407,6 +2448,15 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 pass
                     continue
                 if result:
+                    # ⏱️ Latency: t7 = sell confirmé
+                    _lt = _latency_trackers.get(pos.token_address)
+                    if _lt:
+                        _lt.t7_sell_confirmed = time.time()
+                        _lt.sell_source = "Guardian-Poll"
+                        _lt.save_sell()
+                        logger.info(f"[⏱️ LATENCY] {pos.token_symbol} buy→sell: "
+                                   f"{(_lt.t7_sell_confirmed - (_lt.t4_buy_confirmed or _lt.t0_ws_detection))*1000:.0f}ms "
+                                   f"[SOURCE: Guardian-Poll]")
                     # RÈGLE 5: Logger le SELL
                     _log_trade(
                         token_address=pos.token_address,
@@ -3336,12 +3386,17 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
                 "sol_price_usd": _cached_sol_price_usd,
             }
 
-            # Vérifier que le prix est non-zéro
+                        # Vérifier que le prix est non-zéro
             if bc_data.price_usd <= 0:
                 logger.info(f"[BC] 🚫 REJETÉ (prix=0): {address[:8]}...")
                 continue
-
+            # ⏱️ Latency: t2 = gates complètes, t3 = buy appelé
+            _lt = _latency_trackers.get(address)
+            if _lt:
+                _lt.t2_gates_complete = time.time()
             # Exécuter l'achat directement (timeout 30s)
+            if _lt:
+                _lt.t3_buy_called = time.time()
             try:
                 result = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
@@ -3355,6 +3410,13 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             if result:
                 sym = address[:6].upper()
                 total_latency = (time.time() - t_detected) * 1000
+                # ⏱️ Latency: t4 = buy confirmé
+                _lt = _latency_trackers.get(address)
+                if _lt:
+                    _lt.t4_buy_confirmed = time.time()
+                    _lt.save_buy()  # Persister les timestamps d'achat
+                    logger.info(f"[⏱️ LATENCY] {address[:8]} detection→buy: "
+                               f"{(_lt.t4_buy_confirmed - _lt.t0_ws_detection)*1000:.0f}ms")
 
                 _log_trade(
                     token_address=address,
@@ -4868,6 +4930,24 @@ async def health_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def latency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/latency — Statistiques de latence pipeline (20 derniers trades)."""
+    try:
+        stats = get_latency_stats(limit=20)
+        if not stats:
+            await update.message.reply_text(
+                "⏱️ *Latency Metrics*\n\nAucune donnée encore. "
+                "Les métriques seront enregistrées dès le prochain trade.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        msg = format_latency_telegram(stats)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"[/latency] Erreur: {e}")
+        await update.message.reply_text(f"❌ Erreur latency: {e}")
+
+
 async def hourly_health_check_job(context):
     """
     Job automatique toutes les heures.
@@ -5196,6 +5276,7 @@ def main():
     app.add_handler(CommandHandler("resume", unpause_cmd))
     app.add_handler(CommandHandler("verify", verify_cmd))
     app.add_handler(CommandHandler("health_check", health_check_cmd))
+    app.add_handler(CommandHandler("latency", latency_cmd))
 
     # ━━━ R5: GUARDIAN AUTONOME — SL/TP/CB + Watchdog + LP Guard ━━━
     # Ces jobs critiques tournent dans une asyncio task INDÉPENDANTE de Telegram.
@@ -5357,6 +5438,7 @@ def main():
             ws_notification_queue=_ws_notification_queue,
             trading_config=trading_config,
         )
+        autonomous_guardian._latency_trackers = _latency_trackers  # Ref partagée
         await autonomous_guardian.start()
         print("🛡️ Guardian autonome DÉMARRÉ (R5: indépendant de Telegram)")
 
