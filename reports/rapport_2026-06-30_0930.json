@@ -1,0 +1,11 @@
+{
+  "R0":  {"status": "✅", "note": "PID 904324 actif, systemctl active (running), port 443 HeliusWS connecté"},
+  "R1":  {"status": "N-A", "note": "Aucun nouveau message inter-composants introduit — tâche de déploiement de script uniquement"},
+  "R1b": {"status": "N-A", "note": "Pas de jonction entre composants modifiée"},
+  "R2":  {"status": "N-A", "note": "Aucun intervalle de surveillance modifié — script de validation offline"},
+  "R3":  {"status": "N-A", "note": "Tâche de déploiement/documentation, pas de maillon fonctionnel modifié"},
+  "R4":  {"status": "N-A", "note": "Architecture inchangée — ajout d'un outil de validation externe"},
+  "R5":  {"status": "N-A", "note": "Pas de nouveau composant runtime — script exécuté manuellement en fin de tâche"},
+  "R6":  {"status": "✅", "note": "Script déployé et exécutable sur Hetzner, pas de nouveau signal runtime introduit"},
+  "R7":  {"status": "✅", "note": "Vérification automatique intégrée via --changelog, aucune régression détectée"}
+}
