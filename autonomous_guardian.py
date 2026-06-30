@@ -316,6 +316,38 @@ class AutonomousGuardian:
                     if price_result.source == "bonding_curve_rpc":
                         logger.debug(f"[Guardian] {pos.token_symbol} prix=${current_price:.8f} "
                                     f"[SOURCE: BC-RPC] {price_result.latency_ms:.0f}ms")
+                # ─── VENTE D'URGENCE: 5 échecs consécutifs de lecture de prix ───
+                if price_result.emergency_sell:
+                    sell_price = current_price  # dernier prix connu ou fallback
+                    pnl_pct = ((sell_price - pos.entry_price_usd) / pos.entry_price_usd * 100) if pos.entry_price_usd > 0 else -100.0
+                    logger.critical(
+                        f"[Guardian] 🚨 VENTE D'URGENCE PRIX AVEUGLE: {pos.token_symbol} "
+                        f"(5 échecs prix consécutifs, PnL estimé={pnl_pct:+.1f}%)"
+                    )
+                    result = self.trading_engine.execute_sell(
+                        pos, f"🚨 VENTE D'URGENCE — 5 échecs prix consécutifs (prix aveugle)"
+                    )
+                    if result:
+                        self.stats["emergency_sells"] = self.stats.get("emergency_sells", 0) + 1
+                        self.stats["sells_executed"] += 1
+                        self._log_trade(
+                            token_address=pos.token_address,
+                            token_symbol=pos.token_symbol,
+                            strategy=pos.strategy,
+                            side="SELL", pnl_pct=pnl_pct,
+                            reason="Vente urgence: 5 échecs prix (PriceResolver blind)",
+                            price=sell_price, amount_sol=pos.amount_sol_invested,
+                            source="Guardian-EmergencySell",
+                        )
+                        self._cleanup_after_sell(pos, "Emergency prix aveugle")
+                        queue_notification(
+                            f"🚨 *VENTE D'URGENCE PRIX AVEUGLE*\n\n"
+                            f"🪙 {pos.token_name} (${pos.token_symbol})\n"
+                            f"📉 PnL estimé: {pnl_pct:+.1f}%\n"
+                            f"📝 5 échecs consécutifs de lecture de prix\n"
+                            f"⚠️ Position vendue au dernier prix connu"
+                        )
+                    continue
                 # Heartbeat watchdog
                 if self.capital_watchdog:
                     self.capital_watchdog.heartbeat(pos.token_address, current_price)

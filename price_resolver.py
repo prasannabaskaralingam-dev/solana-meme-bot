@@ -48,6 +48,7 @@ class PriceResult:
     source: str  # "bonding_curve_rpc", "dexscreener", "helius_ws_cache", "cached_fallback", "last_known_fallback"
     latency_ms: float
     is_complete: bool  # True = token migré vers Raydium
+    emergency_sell: bool = False  # True = 5 échecs consécutifs, vente d'urgence requise
 
 
 async def get_realtime_price(
@@ -184,7 +185,7 @@ async def get_realtime_price(
             pass
 
     # ─── Étape 6: DOUBLE ÉCHEC — Fallback cache prix récent (max 10s) ───
-    _record_failure(token_address)
+    should_emergency_sell = _record_failure(token_address)
     latency = (time.time() - start) * 1000
 
     if cached and cached.get("price_usd", 0) > 0:
@@ -199,6 +200,7 @@ async def get_realtime_price(
                 source="cached_fallback",
                 latency_ms=latency,
                 is_complete=is_known_migrated,
+                emergency_sell=should_emergency_sell,
             )
 
     # ─── Étape 7: ÉCHEC TOTAL — prix indisponible ───
@@ -211,15 +213,17 @@ async def get_realtime_price(
         source="fallback",
         latency_ms=latency,
         is_complete=is_known_migrated,
+        emergency_sell=should_emergency_sell,
     )
 
 
-def _record_failure(token_address: str):
-    """Enregistre un échec et émet une alerte CRITICAL si seuil atteint."""
+def _record_failure(token_address: str) -> bool:
+    """Enregistre un échec. Retourne True si seuil CRITICAL atteint (vente d'urgence requise)."""
     now = time.time()
     tracker = _failure_tracker.get(token_address)
     if tracker is None:
         _failure_tracker[token_address] = {"count": 1, "first_failure": now}
+        return False
     else:
         tracker["count"] += 1
         if tracker["count"] >= FAILURE_CRITICAL_THRESHOLD:
@@ -227,11 +231,13 @@ def _record_failure(token_address: str):
             logger.critical(
                 f"[PriceResolver] 🚨 ALERTE CRITIQUE: {token_address[:8]}... — "
                 f"{tracker['count']} échecs consécutifs en {duration:.0f}s — "
-                f"AUCUNE source de prix ne répond!"
+                f"AUCUNE source de prix ne répond! VENTE D'URGENCE REQUISE."
             )
             # Reset après alerte pour ne pas spammer
             tracker["count"] = 0
             tracker["first_failure"] = now
+            return True
+        return False
 
 
 def _reset_failure_tracker(token_address: str):
