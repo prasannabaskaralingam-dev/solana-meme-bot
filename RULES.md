@@ -33,6 +33,16 @@ SOURCE   → Quel service externe peut tomber ?
 → Si une SOURCE tombe, le bot doit
   continuer à fonctionner seul
 
+AJOUT : Quand deux systèmes/composants
+communiquent entre eux (ex: callback A
+envoie un message, fonction B le lit),
+vérifier explicitement que le FORMAT
+du message envoyé par l'un correspond
+EXACTEMENT au format ATTENDU par
+l'autre (ex: clés du dictionnaire/JSON
+identiques). Tester ce point de jonction
+AVANT de tester le résultat final global.
+
 ───────────────────────────────────────────
 
 RÈGLE 2 — ENTROPIE (30 JOURS)
@@ -46,6 +56,15 @@ Exemples à ne jamais répéter :
 - Timeout manquant → freeze 311s
 - Watchdog dans Telegram → surveillance morte
 - OpenClaw fantôme → 409 Conflict 2h perdues
+
+AJOUT : Une fréquence/intervalle de vérification
+(ex: polling) qui était négligeable pour
+un cas d'usage (ex: trades longs) peut
+devenir critique si le cas d'usage change
+(ex: trades courts) sans que personne
+n'ajuste le réglage. Toujours réévaluer
+les intervalles de surveillance quand la
+durée typique d'une opération change.
 
 ───────────────────────────────────────────
 
@@ -106,5 +125,14 @@ Après chaque déploiement :
 
 Si un seul ❌ → corriger avant de
 confirmer tâche terminée
+
+AJOUT : Un test ne doit jamais valider seulement
+le RÉSULTAT final (ex: 'vente exécutée'
+= ✅) sans aussi valider le CHEMIN emprunté
+(ex: quel composant exact a déclenché
+l'action, et en combien de temps). Un
+résultat correct obtenu par un chemin de
+secours lent peut masquer un chemin
+principal cassé (loi de Goodhart).
 
 ═══════════════════════════════════════════
