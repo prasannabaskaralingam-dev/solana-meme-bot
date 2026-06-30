@@ -266,13 +266,13 @@ def _safe_symbol(symbol, token_address: str) -> str:
 
 def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
                pnl_pct: float = 0.0, reason: str = "", price: float = 0.0,
-               amount_sol: float = 0.0):
+               amount_sol: float = 0.0, source: str = ""):
     """
     RÈGLE 5: Logger chaque trade dans trades.json (source de vérité post-mortem).
     Format structuré append-only.
+    source: "HeliusWS" | "PriceMonitor" | "Guardian-Poll" | "" (legacy)
     """
     from datetime import datetime, timezone
-
     is_dry_run = trading_config.dry_run if trading_config else False
     trade_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -285,6 +285,7 @@ def _log_trade(token_address: str, token_symbol: str, strategy: str, side: str,
         "price": price,
         "amount_sol": round(amount_sol, 6),
         "dry_run": is_dry_run,
+        "source": source,
     }
 
     try:
@@ -623,7 +624,11 @@ def init_trading():
     helius_api_key = os.environ.get("HELIUS_API_KEY", "")
     if helius_api_key:
         async def _ws_on_price_update(token_address: str, price_usd: float):
-            """Callback Helius WS: met à jour position + cb.check()"""
+            """
+            Callback Helius WS: met à jour position + cb.check() + VENTE DIRECTE.
+            FIX: exécute la vente immédiatement au lieu de mettre en queue.
+            Source tracée: [SOURCE: HeliusWS]
+            """
             pos = positions.get_position(token_address)
             if pos and price_usd > 0:
                 positions.update_position(token_address, price_usd)
@@ -633,11 +638,96 @@ def init_trading():
                 if circuit_breaker:
                     cb_action = circuit_breaker.check(token_address, price_usd)
                     if cb_action and cb_action.should_sell:
-                        _ws_notification_queue.append({
-                            "token_address": token_address,
-                            "action": cb_action,
-                            "price": price_usd,
-                        })
+                        # === VENTE DIRECTE (plus de mise en queue) ===
+                        reason = cb_action.reason
+                        is_partial = cb_action.rule == "partial_take_profit"
+                        sell_pct = 50.0 if is_partial else 100.0
+                        logger.info(f"⚡ [SOURCE: HeliusWS] Déclenchement vente: {pos.token_symbol} "
+                                   f"PnL={pos.pnl_pct:+.1f}% | Raison: {reason}")
+                        result = trading_engine.execute_sell(pos, reason, sell_pct=sell_pct)
+                        if not result:
+                            logger.warning(f"⚡ [HeliusWS] Vente échouée: {pos.token_symbol} ({reason})")
+                            return
+                        if is_partial:
+                            logger.info(f"⚡ [HeliusWS] PARTIAL TP 50%: {pos.token_symbol} +{pos.pnl_pct:.1f}%")
+                            _ws_notification_queue.append({
+                                "type": "partial_tp",
+                                "symbol": pos.token_symbol,
+                                "name": pos.token_name,
+                                "pnl_pct": pos.pnl_pct,
+                                "reason": reason,
+                                "tx": result.get("tx_signature", ""),
+                            })
+                        else:
+                            # === VENTE TOTALE: cleanup complet ===
+                            logger.info(f"⚡ [HeliusWS] VENTE TOTALE: {pos.token_symbol} "
+                                       f"PnL={pos.pnl_pct:+.1f}% | {reason}")
+                            # PnL Tracker
+                            if pnl_tracker:
+                                pnl_tracker.record_trade(
+                                    token_address=pos.token_address,
+                                    token_symbol=pos.token_symbol,
+                                    strategy=pos.strategy,
+                                    entry_time=pos.entry_time,
+                                    amount_sol=pos.amount_sol_invested,
+                                    pnl_pct=pos.pnl_pct,
+                                    exit_reason=reason,
+                                )
+                            # Position Sizer
+                            if position_sizer:
+                                position_sizer.record_result(pos.pnl_pct > 0)
+                                _save_state()
+                            # Daily PnL Guard
+                            if daily_pnl_guard:
+                                pnl_sol = pos.amount_sol_invested * (pos.pnl_pct / 100.0)
+                                daily_pnl_guard.record_trade(pnl_sol, is_stop_loss=(cb_action.rule == "stop_loss"))
+                            # Corrélation
+                            if correlation_filter:
+                                correlation_filter.unregister_position(pos.token_address)
+                            # Liquidity Guard
+                            if liquidity_guard:
+                                liquidity_guard.unregister_position(pos.token_address)
+                            # CircuitBreaker + Watchdog
+                            circuit_breaker.close_position(pos.token_address)
+                            if capital_watchdog:
+                                capital_watchdog.unregister_position(pos.token_address)
+                            # Log trade
+                            _log_trade(
+                                token_address=pos.token_address,
+                                token_symbol=pos.token_symbol,
+                                strategy=pos.strategy,
+                                side="SELL",
+                                pnl_pct=pos.pnl_pct,
+                                reason=reason,
+                                price=price_usd,
+                                amount_sol=pos.amount_sol_invested,
+                                source="HeliusWS",
+                            )
+                            # Blacklist si perte
+                            if pos.pnl_pct < 0:
+                                sl_blacklist[pos.token_address] = time.time() + SL_BLACKLIST_DURATION
+                                _save_blacklist()
+                                seen_tokens.add(pos.token_address)
+                            # Retirer du monitoring
+                            if price_monitor:
+                                try:
+                                    await price_monitor.remove_token(token_address)
+                                except:
+                                    pass
+                            if helius_ws:
+                                helius_ws.unwatch_token(token_address)
+                            # Fermer la position
+                            positions.close_position(pos.token_address)
+                            # Notification Telegram
+                            _ws_notification_queue.append({
+                                "type": "sell",
+                                "symbol": pos.token_symbol,
+                                "name": pos.token_name,
+                                "pnl_pct": pos.pnl_pct,
+                                "reason": reason,
+                                "amount_sol": pos.amount_sol_invested,
+                                "tx": result.get("tx_signature", ""),
+                            })
 
         async def _ws_on_new_token(token_address: str, price_usd: float):
             """Callback Helius WS: nouveau token détecté sur pump.fun → queue pour analyse"""
@@ -852,6 +942,7 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
         reason=reason,
         price=current_price_usd,
         amount_sol=pos.amount_sol_invested,
+        source="PriceMonitor",
     )
 
     # RÈGLE 3: Blacklister si perte (SL déclenché)
@@ -878,7 +969,7 @@ async def on_realtime_price_update(token_address: str, price_sol: float, change_
         "tx": result.get("tx_signature", ""),
     })
 
-    logger.info(f"⚡ VENTE WS INSTANTANÉE: {pos.token_name} PnL: {pos.pnl_pct:+.1f}% - {reason}")
+    logger.info(f"⚡ [SOURCE: PriceMonitor] VENTE WS INSTANTANÉE: {pos.token_name} PnL: {pos.pnl_pct:+.1f}% - {reason}")
 
 
 async def on_ws_fallback_change(is_fallback: bool, reason: str):
@@ -2327,10 +2418,11 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                         reason=cb_action.reason,
                         price=current_price,
                         amount_sol=pos.amount_sol_invested,
+                        source="Guardian-Poll",
                     )
                     if is_partial:
                         # Partial TP: ne PAS fermer la position, le trailing gère la suite
-                        logger.info(f"[SNIPER 3s] Partial TP 50% exécuté pour {pos.token_symbol}")
+                        logger.info(f"[SNIPER 3s] [SOURCE: Guardian-Poll] Partial TP 50% exécuté pour {pos.token_symbol}")
                     else:
                         # Vente totale: fermer tout
                         if pnl_tracker:

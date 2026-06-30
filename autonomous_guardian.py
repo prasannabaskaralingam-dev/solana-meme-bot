@@ -345,6 +345,8 @@ class AutonomousGuardian:
                             self._force_close_dead_token(pos)
                         continue
                     self.stats["sells_executed"] += 1
+                    logger.info(f"⚡ [SOURCE: Guardian-Sniper] Vente: {pos.token_symbol} "
+                               f"PnL={pos.pnl_pct:+.1f}% | {cb_action.reason}")
                     self._log_trade(
                         token_address=pos.token_address,
                         token_symbol=pos.token_symbol,
@@ -352,6 +354,7 @@ class AutonomousGuardian:
                         side="SELL", pnl_pct=pos.pnl_pct,
                         reason=cb_action.reason,
                         price=current_price, amount_sol=pos.amount_sol_invested,
+                        source="Guardian-Sniper",
                     )
                     if not is_partial:
                         self._cleanup_after_sell(pos, cb_action.reason)
