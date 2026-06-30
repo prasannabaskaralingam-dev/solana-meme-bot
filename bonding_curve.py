@@ -115,6 +115,24 @@ def _parse_bonding_curve_data(data: bytes, token_address: str, sol_price_usd: fl
     # Calculer le prix en SOL
     # prix = (virtual_sol_reserves / LAMPORTS_PER_SOL) / (virtual_token_reserves / 10^TOKEN_DECIMALS)
     if virtual_token_reserves == 0:
+        # Token migré (reserves vidées) — retourner avec complete=True et prix=0
+        # Le PriceResolver détectera complete=True et basculera vers DexScreener
+        if complete:
+            return BondingCurveData(
+                token_address=token_address,
+                virtual_token_reserves=0,
+                virtual_sol_reserves=0,
+                real_token_reserves=0,
+                real_sol_reserves=0,
+                token_total_supply=token_total_supply,
+                complete=True,
+                price_sol=0.0,
+                price_usd=0.0,
+                market_cap_usd=0.0,
+                liquidity_sol=0.0,
+                bonding_progress_pct=100.0,
+                fetch_latency_ms=latency_ms,
+            )
         return None
 
     price_sol = (virtual_sol_reserves / LAMPORTS_PER_SOL) / (virtual_token_reserves / (10 ** TOKEN_DECIMALS))
