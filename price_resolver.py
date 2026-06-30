@@ -10,6 +10,12 @@ Pour les tokens migrés sur Raydium :
 Utilisé par :
   - autonomous_guardian.py (_sniper_check)
   - trading_bot.py (sniper_monitor_job)
+
+Robustesse (analyse Inversion) :
+  - Double échec : alerte CRITICAL + compteur + fallback dernier prix connu
+  - État intermédiaire : essaie DexScreener même si pas connu comme migré
+  - TTL cache : prix caché utilisable comme fallback (max 10s)
+  - Changement d'état : cache invalidé dès détection migration via RPC
 """
 
 import os
@@ -23,17 +29,23 @@ from bonding_curve import get_bonding_curve_data
 
 logger = logging.getLogger(__name__)
 
-# Cache pour éviter de re-vérifier l'état BC à chaque tick (3s)
-# Format: {token_address: {"complete": bool, "last_check": float, "price_usd": float}}
+# ─── Cache d'état BC ─────────────────────────────────────────────────────────
+# Format: {token_address: {"complete": bool, "last_check": float, "price_usd": float, "price_ts": float}}
 _bc_state_cache: dict = {}
 BC_CACHE_TTL = 30  # Re-vérifier l'état BC toutes les 30s (migration est rare)
+PRICE_CACHE_TTL = 10  # Prix caché valide max 10s (pour fallback double échec)
+
+# ─── Compteur d'échecs consécutifs ────────────────────────────────────────────
+# Format: {token_address: {"count": int, "first_failure": float}}
+_failure_tracker: dict = {}
+FAILURE_CRITICAL_THRESHOLD = 5  # Alerte CRITICAL après 5 échecs consécutifs (15s)
 
 
 @dataclass
 class PriceResult:
     """Résultat de la résolution de prix."""
     price_usd: float
-    source: str  # "bonding_curve_rpc", "dexscreener", "helius_ws_cache", "fallback"
+    source: str  # "bonding_curve_rpc", "dexscreener", "helius_ws_cache", "cached_fallback", "last_known_fallback"
     latency_ms: float
     is_complete: bool  # True = token migré vers Raydium
 
@@ -49,6 +61,8 @@ async def get_realtime_price(
     Résout le prix d'un token en basculant automatiquement entre :
     1. RPC Helius (bonding curve) — si token encore sur BC
     2. DexScreener API — si token migré ou BC indisponible
+    3. Cache prix récent — si double échec (max 10s)
+    4. Fallback prix=0 — si tout échoue (le caller gère)
 
     Args:
         token_address: Adresse du token
@@ -83,9 +97,11 @@ async def get_realtime_price(
                     "complete": bc_data.complete,
                     "last_check": time.time(),
                     "price_usd": bc_data.price_usd,
+                    "price_ts": time.time(),
                 }
-                if not bc_data.complete:
+                if not bc_data.complete and bc_data.price_usd > 0:
                     # Token encore sur bonding curve — prix RPC direct
+                    _reset_failure_tracker(token_address)
                     return PriceResult(
                         price_usd=bc_data.price_usd,
                         source="bonding_curve_rpc",
@@ -93,7 +109,7 @@ async def get_realtime_price(
                         is_complete=False,
                     )
                 else:
-                    # Token migré — on le sait maintenant
+                    # Token migré — on le sait maintenant, bascule DexScreener
                     is_known_migrated = True
                     logger.info(
                         f"[PriceResolver] {token_address[:8]}... migré Raydium "
@@ -102,19 +118,24 @@ async def get_realtime_price(
         except Exception as e:
             logger.debug(f"[PriceResolver] BC RPC error pour {token_address[:8]}: {e}")
 
-    # ─── Étape 3: Token migré ou BC indisponible → HeliusWS cache ───
-    if helius_ws and helius_ws.is_connected:
-        cached_price = helius_ws._price_cache.get(token_address)
-        if cached_price and time.time() - cached_price["ts"] < 30:
-            latency = (time.time() - start) * 1000
-            return PriceResult(
-                price_usd=cached_price["price"],
-                source="helius_ws_cache",
-                latency_ms=latency,
-                is_complete=is_known_migrated,
-            )
+    # ─── Étape 3: HeliusWS cache (temps réel si alimenté) ───
+    if helius_ws:
+        try:
+            if hasattr(helius_ws, '_price_cache') and helius_ws.is_connected:
+                cached_price = helius_ws._price_cache.get(token_address)
+                if cached_price and time.time() - cached_price["ts"] < 30:
+                    latency = (time.time() - start) * 1000
+                    _reset_failure_tracker(token_address)
+                    return PriceResult(
+                        price_usd=cached_price["price"],
+                        source="helius_ws_cache",
+                        latency_ms=latency,
+                        is_complete=is_known_migrated,
+                    )
+        except Exception:
+            pass
 
-    # ─── Étape 4: DexScreener API ───
+    # ─── Étape 4: DexScreener API (fonctionne pour BC ET migrés) ───
     if dexscreener_api:
         try:
             analysis = dexscreener_api.analyze_token(token_address)
@@ -122,13 +143,14 @@ async def get_realtime_price(
                 price = float(analysis.get("price_usd", 0) or 0)
                 if price > 0:
                     latency = (time.time() - start) * 1000
-                    # Mettre à jour le cache si on ne savait pas l'état
-                    if token_address not in _bc_state_cache:
-                        _bc_state_cache[token_address] = {
-                            "complete": True,  # Si DexScreener a un prix, probablement migré
-                            "last_check": time.time(),
-                            "price_usd": price,
-                        }
+                    # Mettre à jour le cache
+                    _bc_state_cache[token_address] = {
+                        "complete": is_known_migrated or True,
+                        "last_check": time.time(),
+                        "price_usd": price,
+                        "price_ts": time.time(),
+                    }
+                    _reset_failure_tracker(token_address)
                     return PriceResult(
                         price_usd=price,
                         source="dexscreener",
@@ -138,23 +160,52 @@ async def get_realtime_price(
         except Exception as e:
             logger.debug(f"[PriceResolver] DexScreener error pour {token_address[:8]}: {e}")
 
-    # ─── Étape 5: DexScreener direct (sans instance API) ───
+    # ─── Étape 5: DexScreener direct via HeliusWS helper ───
     if helius_ws:
         try:
-            price = helius_ws._get_price_dexscreener(token_address)
-            if price > 0:
-                latency = (time.time() - start) * 1000
-                return PriceResult(
-                    price_usd=price,
-                    source="dexscreener",
-                    latency_ms=latency,
-                    is_complete=is_known_migrated,
-                )
+            if hasattr(helius_ws, '_get_price_dexscreener'):
+                price = helius_ws._get_price_dexscreener(token_address)
+                if price and price > 0:
+                    latency = (time.time() - start) * 1000
+                    _bc_state_cache[token_address] = {
+                        "complete": is_known_migrated,
+                        "last_check": time.time(),
+                        "price_usd": price,
+                        "price_ts": time.time(),
+                    }
+                    _reset_failure_tracker(token_address)
+                    return PriceResult(
+                        price_usd=price,
+                        source="dexscreener",
+                        latency_ms=latency,
+                        is_complete=is_known_migrated,
+                    )
         except Exception:
             pass
 
-    # ─── Fallback: prix indisponible ───
+    # ─── Étape 6: DOUBLE ÉCHEC — Fallback cache prix récent (max 10s) ───
+    _record_failure(token_address)
     latency = (time.time() - start) * 1000
+
+    if cached and cached.get("price_usd", 0) > 0:
+        cache_age = time.time() - cached.get("price_ts", 0)
+        if cache_age < PRICE_CACHE_TTL:
+            logger.warning(
+                f"[PriceResolver] ⚠️ DOUBLE ÉCHEC {token_address[:8]}... — "
+                f"utilise cache prix (âge={cache_age:.1f}s, prix=${cached['price_usd']:.8f})"
+            )
+            return PriceResult(
+                price_usd=cached["price_usd"],
+                source="cached_fallback",
+                latency_ms=latency,
+                is_complete=is_known_migrated,
+            )
+
+    # ─── Étape 7: ÉCHEC TOTAL — prix indisponible ───
+    logger.warning(
+        f"[PriceResolver] ⚠️ ÉCHEC TOTAL {token_address[:8]}... — "
+        f"aucune source de prix disponible (RPC+DexScreener down)"
+    )
     return PriceResult(
         price_usd=0.0,
         source="fallback",
@@ -163,9 +214,35 @@ async def get_realtime_price(
     )
 
 
+def _record_failure(token_address: str):
+    """Enregistre un échec et émet une alerte CRITICAL si seuil atteint."""
+    now = time.time()
+    tracker = _failure_tracker.get(token_address)
+    if tracker is None:
+        _failure_tracker[token_address] = {"count": 1, "first_failure": now}
+    else:
+        tracker["count"] += 1
+        if tracker["count"] >= FAILURE_CRITICAL_THRESHOLD:
+            duration = now - tracker["first_failure"]
+            logger.critical(
+                f"[PriceResolver] 🚨 ALERTE CRITIQUE: {token_address[:8]}... — "
+                f"{tracker['count']} échecs consécutifs en {duration:.0f}s — "
+                f"AUCUNE source de prix ne répond!"
+            )
+            # Reset après alerte pour ne pas spammer
+            tracker["count"] = 0
+            tracker["first_failure"] = now
+
+
+def _reset_failure_tracker(token_address: str):
+    """Reset le compteur d'échecs après un succès."""
+    _failure_tracker.pop(token_address, None)
+
+
 def invalidate_cache(token_address: str):
     """Invalider le cache pour un token (ex: après vente)."""
     _bc_state_cache.pop(token_address, None)
+    _failure_tracker.pop(token_address, None)
 
 
 def get_cache_stats() -> dict:
@@ -175,9 +252,11 @@ def get_cache_stats() -> dict:
     bc_count = sum(1 for v in _bc_state_cache.values() if not v["complete"])
     migrated_count = sum(1 for v in _bc_state_cache.values() if v["complete"])
     stale = sum(1 for v in _bc_state_cache.values() if now - v["last_check"] > BC_CACHE_TTL)
+    failures = sum(1 for v in _failure_tracker.values() if v["count"] > 0)
     return {
         "total_cached": total,
         "bonding_curve": bc_count,
         "migrated": migrated_count,
         "stale": stale,
+        "active_failures": failures,
     }
