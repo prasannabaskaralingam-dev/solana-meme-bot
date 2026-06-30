@@ -42,6 +42,7 @@ from onchain_scorer import OnchainScorer
 from auto_calibration import analyze_postmortems, apply_adjustments
 from helius_websocket import HeliusWebSocket
 from bonding_curve import get_bonding_curve_data, is_safe_bonding_curve, get_sol_price_usd, BondingCurveData
+from price_resolver import get_realtime_price, invalidate_cache as price_cache_invalidate
 from autonomous_guardian import AutonomousGuardian, configure_notifications, queue_notification, flush_notifications
 import requests
 
@@ -786,6 +787,9 @@ def update_sol_price(price_usd: float):
     global _cached_sol_price_usd
     if price_usd > 0:
         _cached_sol_price_usd = price_usd
+        # Propager au Guardian si actif
+        if autonomous_guardian and hasattr(autonomous_guardian, '_cached_sol_price'):
+            autonomous_guardian._cached_sol_price = price_usd
 
 
 async def on_realtime_price_update(token_address: str, price_sol: float, change_pct: float):
@@ -2251,25 +2255,16 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     continue  # WS gère le reste
 
-            # Récupérer le prix : Helius WS cache > DexScreener fallback
-            current_price = 0.0
-            if helius_ws and helius_ws.is_connected:
-                current_price = helius_ws.get_price(pos.token_address)
-            
-            # Fallback DexScreener si Helius n'a pas de prix
-            if current_price <= 0:
-                analysis = api.analyze_token(pos.token_address)
-                current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
-                # Mettre à jour le prix SOL/USD caché
-                if analysis:
-                    sol_price = analysis.get("sol_price_usd", 0)
-                    if not sol_price:
-                        price_native = float(analysis.get("price_native", 0) or 0)
-                        price_usd_val = float(analysis.get("price_usd", 0) or 0)
-                        if price_native > 0 and price_usd_val > 0:
-                            sol_price = price_usd_val / price_native
-                    if sol_price and sol_price > 50:
-                        update_sol_price(sol_price)
+            # ═══ PRICE RESOLVER: bascule auto BC RPC / DexScreener ═══
+            _helius_key = os.environ.get("HELIUS_API_KEY", "")
+            price_result = await get_realtime_price(
+                token_address=pos.token_address,
+                helius_api_key=_helius_key,
+                sol_price_usd=_cached_sol_price_usd,
+                helius_ws=helius_ws,
+                dexscreener_api=api,
+            )
+            current_price = price_result.price_usd
 
             # Si prix indisponible, utiliser le dernier prix connu
             # cb.check() est TOUJOURS appelé (Time Stop doit agir même sans prix frais)
@@ -2278,10 +2273,14 @@ async def sniper_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 if current_price <= 0:
                     current_price = pos.entry_price_usd * 0.01  # assumer -99% si jamais vu
                 logger.warning(f"[SNIPER 3s] Prix indisponible pour {pos.token_symbol}, "
-                              f"utilise fallback=${current_price:.8f}")
+                              f"utilise fallback=${current_price:.8f} "
+                              f"[source: {price_result.source}]")
             else:
                 # Mettre à jour la position avec le prix frais
                 positions.update_position(pos.token_address, current_price)
+                if price_result.source == "bonding_curve_rpc":
+                    logger.debug(f"[SNIPER 3s] {pos.token_symbol} "
+                                f"prix=${current_price:.8f} [BC-RPC {price_result.latency_ms:.0f}ms]")
 
             # Heartbeat watchdog (cette position est surveillée)
             if capital_watchdog:

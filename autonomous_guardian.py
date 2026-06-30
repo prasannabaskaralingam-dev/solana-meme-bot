@@ -19,9 +19,12 @@ Notifications :
 
 import asyncio
 import logging
+import os
 import time
 import requests
 from datetime import datetime, timezone
+
+from price_resolver import get_realtime_price, invalidate_cache
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,7 @@ class AutonomousGuardian:
         self._update_sol_price = update_sol_price_fn
         self._ws_notification_queue = ws_notification_queue
         self.trading_config = trading_config
+        self._cached_sol_price = 150.0  # Mis à jour via _update_sol_price
         # Compteurs pour les intervalles différents
         self._tick_count = 0
         self._sell_fail_counter: dict = {}
@@ -288,28 +292,30 @@ class AutonomousGuardian:
                         pass  # Time Stop ne dépend pas du prix
                     else:
                         continue
-                # Récupérer le prix
-                current_price = 0.0
-                if self.helius_ws and self.helius_ws.is_connected:
-                    current_price = self.helius_ws.get_price(pos.token_address)
-                if current_price <= 0:
-                    analysis = self.api.analyze_token(pos.token_address)
-                    current_price = float(analysis.get("price_usd", 0) or 0) if analysis else 0
-                    if analysis:
-                        sol_price = analysis.get("sol_price_usd", 0)
-                        if not sol_price:
-                            price_native = float(analysis.get("price_native", 0) or 0)
-                            price_usd_val = float(analysis.get("price_usd", 0) or 0)
-                            if price_native > 0 and price_usd_val > 0:
-                                sol_price = price_usd_val / price_native
-                        if sol_price and sol_price > 50:
-                            self._update_sol_price(sol_price)
+                # ═══ PRICE RESOLVER: bascule auto BC RPC / DexScreener ═══
+                helius_key = os.environ.get("HELIUS_API_KEY", "")
+                # Utiliser le prix SOL global (passé via update_sol_price_fn)
+                sol_price = getattr(self, '_cached_sol_price', 150.0)
+                price_result = await get_realtime_price(
+                    token_address=pos.token_address,
+                    helius_api_key=helius_key,
+                    sol_price_usd=sol_price,
+                    helius_ws=self.helius_ws,
+                    dexscreener_api=self.api,
+                )
+                current_price = price_result.price_usd
                 if current_price <= 0:
                     current_price = pos.current_price
                     if current_price <= 0:
                         current_price = pos.entry_price_usd * 0.01
+                    logger.warning(f"[Guardian] Prix indisponible {pos.token_symbol}, "
+                                  f"fallback=${current_price:.8f}")
                 else:
                     self.positions.update_position(pos.token_address, current_price)
+                    # Log source de prix (uniquement si changement significatif)
+                    if price_result.source == "bonding_curve_rpc":
+                        logger.debug(f"[Guardian] {pos.token_symbol} prix=${current_price:.8f} "
+                                    f"[SOURCE: BC-RPC] {price_result.latency_ms:.0f}ms")
                 # Heartbeat watchdog
                 if self.capital_watchdog:
                     self.capital_watchdog.heartbeat(pos.token_address, current_price)
