@@ -185,6 +185,45 @@ Exemples de questions Inversion :
 
 ───────────────────────────────────────────
 
+RÈGLE 8 — CHECKLIST OBLIGATOIRE
+(systématique, à CHAQUE tâche, pas
+seulement pour les nouveaux composants)
+
+À la fin de CHAQUE tâche, avant de
+déclarer "terminé", liste explicitement
+le statut de chacune des règles suivantes
+(✅/❌/N-A avec justification courte) :
+
+R0 — Environnement vérifié
+     (ps aux / systemctl / ss -tnp)
+R1 — Shannon : format des messages
+     entre composants vérifié si
+     applicable
+R2 — Entropie : intervalles de
+     surveillance réévalués si
+     applicable
+R3 — Hormozi : maillon le plus
+     faible traité en premier
+R4 — First Principles : architecture
+     remise en question si pertinent
+R5 — Inversion : scénarios d'échec
+     testés (double échec, état
+     intermédiaire, cache obsolète,
+     changement d'état)
+R6 — Test E2E + Signal orphelin :
+     chemin emprunté validé, et pour
+     tout nouveau signal/log : où il
+     va + quelle action il déclenche
+R7 — Changelog : fixes précédents
+     vérifiés non régressés (grep)
+
+Cette checklist doit apparaître dans
+le rapport final de CHAQUE tâche
+désormais, même les ajustements
+simples (ex: changer un seuil de Gate).
+
+───────────────────────────────────────────
+
 ORDRE D'APPLICATION DES RÈGLES :
 
 1. Shannon (R1) — limites, entrées, sources
@@ -193,6 +232,7 @@ ORDRE D'APPLICATION DES RÈGLES :
 4. First Principles (R4/R5) — timeouts,
    séparation
 5. Inversion (R7) — par composant, fractale
-6. Changelog — avant tout déploiement
+6. Checklist R8 — rapport final systématique
+7. Changelog — avant tout déploiement
 
 ═══════════════════════════════════════════
