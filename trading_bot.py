@@ -3338,7 +3338,8 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
 
             # ═══════════════════════════════════════════════════════════════
             # GATE 5 — BC PROGRESS + RÉSERVES SOL RÉELLES (données on-chain)
-            # volume_5m_usd absent → remplacé par real_sol_reserves (RPC direct)
+           # volume_5m_usd missing - replaced by real_sol_reserves (direct RPC)
+
             # ═══════════════════════════════════════════════════════════════
             if bc_data.bonding_progress_pct < 40:
                 logger.info(f"[BC] 🚫 REJETÉ [Gate5] (bonding curve trop basse): "
@@ -3361,8 +3362,10 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             # ═══════════════════════════════════════════════════════════════
             # GATE 6 — LIQUIDITÉ BONDING CURVE (réserve SOL minimum)
             # ═══════════════════════════════════════════════════════════════
-            # Utiliser virtual_sol_reserves (inclut les 30 SOL initiaux de pump.fun)
-            # car real_sol_reserves = 0 pour les tokens fraîchement créés
+            # Use virtual_sol_reserves (includes the initial 30 SOL from pump.fun)
+
+           # real_sol_reserves = 0 for newly created tokens
+
             virtual_sol = bc_data.virtual_sol_reserves / 1_000_000_000  # lamports → SOL
             if virtual_sol < 10:
                 logger.info(f"[BC] 🚫 REJETÉ (liquidité faible): "
