@@ -3329,31 +3329,32 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"[BC] ✅ Sécurité OK: Mint:✅ Freeze:✅ (score={safety.score})")
 
             # ═══════════════════════════════════════════════════════════════
-            # GATE 4 — HOLDERS (top holder max 20%, min 50 uniques)
+                        # ═══════════════════════════════════════════════════════════════
+            # GATE 4 — SUPPRIMÉE (données holders absentes de BondingCurveData)
+            # hasattr() retournait 0 et 999 — gate fantôme depuis le début.
+            # Couverture assurée par Gate 3 (Mint+Freeze) + Gate 6 (liquidité SOL).
             # ═══════════════════════════════════════════════════════════════
-            top_holder_pct = bc_data.top_holder_pct if hasattr(bc_data, 'top_holder_pct') else 0
-            unique_holders = bc_data.unique_holders if hasattr(bc_data, 'unique_holders') else 999
-            if top_holder_pct > 20:
-                logger.info(f"[BC] 🚫 REJETÉ [Gate4] (top holder trop gros): "
-                           f"{top_holder_pct:.1f}% > 20% max")
-                continue
-            if unique_holders < 50:
-                logger.info(f"[BC] 🚫 REJETÉ [Gate4] (pas assez de holders): "
-                           f"{unique_holders} < 50 minimum")
-                continue
-            logger.info(f"[BC] ✅ Gate4 Holders OK: top={top_holder_pct:.1f}%, uniques={unique_holders}")
+            logger.info(f"[BC] ✅ Gate4 SUPPRIMÉE (couverte par Gate3+Gate6)")
 
             # ═══════════════════════════════════════════════════════════════
-            # GATE 5 — BC PROGRESS (min 40% remplie, volume 5min min $500)
+            # GATE 5 — BC PROGRESS + RÉSERVES SOL RÉELLES (données on-chain)
+            # volume_5m_usd absent → remplacé par real_sol_reserves (RPC direct)
             # ═══════════════════════════════════════════════════════════════
             if bc_data.bonding_progress_pct < 40:
                 logger.info(f"[BC] 🚫 REJETÉ [Gate5] (bonding curve trop basse): "
                            f"{bc_data.bonding_progress_pct:.1f}% < 40% minimum")
                 continue
-            bc_volume_5m = bc_data.volume_5m_usd if hasattr(bc_data, 'volume_5m_usd') else 0
-            if bc_volume_5m < 500:
-                logger.info(f"[BC] 🚫 REJETÉ [Gate5] (volume 5min trop faible): "
-                           f"${bc_volume_5m:,.0f} < $500 minimum")
+            real_sol = bc_data.real_sol_reserves / 1_000_000_000
+            SOL_MIN_GATE5 = 1.0
+            if real_sol < SOL_MIN_GATE5:
+                logger.info(f"[BC] 🚫 REJETÉ [Gate5] (réserves SOL trop faibles): "
+                           f"{real_sol:.3f} SOL < {SOL_MIN_GATE5} SOL minimum")
+                continue
+            logger.info(f"[BC] ✅ Gate5 OK: progress={bc_data.bonding_progress_pct:.1f}%, "
+                       f"real_sol={real_sol:.3f} SOL")
+
+            # ═══════════════════════════════════════════════════════════════
+            
                 continue
             logger.info(f"[BC] ✅ Gate5 BC Progress OK: {bc_data.bonding_progress_pct:.1f}% remplie, vol_5m=${bc_volume_5m:,.0f}")
 
