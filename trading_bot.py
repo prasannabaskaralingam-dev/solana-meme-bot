@@ -3356,8 +3356,8 @@ async def ws_token_processor_job(context: ContextTypes.DEFAULT_TYPE):
 
             # ═══════════════════════════════════════════════════════════════
             
-                continue
-            logger.info(f"[BC] ✅ Gate5 BC Progress OK: {bc_data.bonding_progress_pct:.1f}% remplie, vol_5m=${bc_volume_5m:,.0f}")
+                
+           
 
             # ═══════════════════════════════════════════════════════════════
             # GATE 6 — LIQUIDITÉ BONDING CURVE (réserve SOL minimum)
