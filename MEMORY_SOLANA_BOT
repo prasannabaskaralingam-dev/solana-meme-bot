@@ -1,0 +1,247 @@
+# MEMORY.md — Bot Solana Meme Trading
+## Dernière mise à jour : 2026-07-09
+
+---
+
+## ÉTAT ACTUEL DU BOT
+
+- **Plateforme** : Hetzner CX23, Helsinki, `/opt/solana-meme-bot/`
+- **Repo GitHub** : `prasannabaskaralingam-dev/solana-meme-bot`
+- **Mode** : DRY RUN actif (aucun swap réel)
+- **Solde restant** : 0.0493 SOL (protégé)
+- **Wallet** : Do3oMkAXSmRfxzQcfQ6kv882WbhEg... (Hetzner)
+- **Telegram bot** : actif, répond à /status /stats /history /today
+- **Render** : supprimé
+
+---
+
+## INFRASTRUCTURE
+
+```
+SHELLFISH (SSH) → trouver numéros de ligne (grep -n)
+GITHUB (web)    → modifier le code + committer
+HETZNER         → serveur de production
+
+RÈGLE ABSOLUE SHELLFISH :
+cd /opt/solana-meme-bot
+(taper EN PREMIER avant toute commande git ou systemctl)
+```
+
+---
+
+## BILAN HISTORIQUE DES TRADES
+
+| Pipeline | Trades | Gagnants | WR | PnL moyen |
+|----------|--------|----------|----|-----------|
+| BC (bonding curve) | 40 | 0 | 0% | -51.4% |
+| DexScreener (SmartEntry) | 7 | 2 | 29% | -36.7% |
+| **TOTAL** | **500** | **2** | **0.8%** | **-7.3%** |
+
+**2 seuls gagnants** : Ansem's Army (+70.5%) et NIGGA (+51.2%) — tous deux via pipeline DexScreener + SmartEntry.
+
+---
+
+## FIXES DÉJÀ APPLIQUÉS
+
+### Fix websockets v16.0 (30 juin 2026)
+- **Problème** : `.closed` supprimé par websockets v16.0 → crash toutes les 3s → SL aveugle → pertes à -94%
+- **Fix** : `_ws_is_open()` avec `websockets.protocol.State`
+- **Fichier** : `price_monitor.py`
+
+### Fix Gates 4 et 5 (5 juillet 2026)
+- **Problème** : `top_holder_pct`, `unique_holders`, `volume_5m_usd` absents de `BondingCurveData` → `hasattr()` retournait valeurs fictives (0, 999, 0) → gates fantômes
+- **Fix Gate 4** : Supprimée (couverte par Gate 3 + Gate 6)
+- **Fix Gate 5** : Remplacée par `real_sol_reserves > 1 SOL` (donnée RPC réelle)
+- **Fichier** : `trading_bot.py` lignes ~3333-3354
+
+### R9 — Dépendances figées
+- `requirements.txt` : 44 librairies figées en `==`
+- `UPGRADE.md` : procédure 5 étapes avant toute mise à jour
+- Alerte Telegram si 3 crashs en < 30 secondes
+
+---
+
+## ARCHITECTURE DES GATES (état actuel)
+
+```
+Gate 2 → MC > $40K (bonding curve)
+Gate 3 → Onchain scorer : Mint✅ + Freeze✅ + LP burned
+Gate 4 → SUPPRIMÉE (était fantôme)
+Gate 5 → bonding_progress_pct > 40% ET real_sol_reserves > 1 SOL
+Gate 6 → virtual_sol_reserves > 10 SOL
+```
+
+**Résultat** : 245 tokens rejetés par jour, 0 achat en DRY RUN.
+**Cause principale** : LP:⚠️ (non burned) bloque presque tout en Gate 3.
+
+---
+
+## ANALYSE FIRST PRINCIPLES — "COMMENT IDENTIFIER UN BON TOKEN AVANT L'ACHAT ?"
+
+### Cause Formelle
+Le bot était conçu pour être **RAPIDE** (Helius WS, 150ms) pas **PRÉCIS**.
+Vitesse ≠ Précision. Un avion de chasse sans radar.
+
+### Cause Procédurière
+SmartEntry (double vérification) existe mais **seulement sur pipeline DexScreener**.
+Pipeline BC achète immédiatement sans confirmation momentum.
+**Fix à faire** : Appliquer SmartEntry aussi sur pipeline BC.
+
+### Cause Matérielle
+Données manquantes dans `BondingCurveData` :
+- Volume 5 premières minutes
+- Nombre de wallets acheteurs distincts
+- Vitesse d'accélération du MC
+- Historique du créateur (rugs passés)
+
+---
+
+## 4 SIGNAUX PRÉDICTIFS — ANALYSE COMPLÈTE
+
+### Signal 1 — Vitesse de progression BC ✅ ANALYSÉ
+**Définition** : Token qui passe de 0% à 40% de la bonding curve en moins de 10 minutes.
+
+**Ce qui peut le fausser** :
+- 1 gros wallet qui achète lentement = faux signal de vitesse
+- Pump & dump organisé
+
+**Fix à implémenter** :
+- Récupérer timestamp de création du token via Helius RPC
+- Ajouter critère : `age_token < 10 minutes` dans Gate 5
+- Logger l'âge de chaque token analysé en DRY RUN
+
+---
+
+### Signal 2 — Volume précoce ✅ ANALYSÉ
+**Définition** : Volume réel échangé dans les 5 premières minutes.
+
+**Assomptions fausses identifiées** :
+1. Volume élevé ≠ intérêt réel (bots peuvent générer faux volume)
+2. Volume pump.fun et volume Raydium = compteurs séparés (remis à 0 à la migration)
+3. DexScreener trop lent à indexer les tokens frais (latence 1-2 min)
+4. `volume_5m_usd` n'existe PAS dans BondingCurveData (attribut fantôme corrigé)
+5. Seuil optimal inconnu sans données historiques réelles
+
+**Fix à implémenter** :
+- Appel Helius dédié pour calculer volume réel des 5 premières minutes en USD
+- Logger le chiffre en DRY RUN pour chaque token analysé
+- Seuil à déterminer par les données après 48h DRY RUN (pas fixé à l'avance)
+- `real_sol_reserves > 1 SOL` reste en place comme proxy en attendant
+
+---
+
+### Signal 3 — Wallets uniques ✅ ANALYSÉ
+**Définition** : 20+ wallets différents qui ont acheté le token.
+
+**Assomptions fausses identifiées** :
+1. 1 wallet ≠ 1 personne (ferme de wallets possible)
+2. Un holder peut avoir reçu un airdrop gratuit sans avoir acheté
+3. Des bots achètent/revendent en secondes = apparaissent comme holders
+4. Plus de holders ≠ plus de stabilité (1000 × $1 < 1 × $10K)
+5. Données non disponibles temps réel sans appel supplémentaire
+
+**Fix à implémenter** :
+- Appel Helius `getTokenLargestAccounts` pour compter vrais wallets acheteurs distincts
+- Logger le chiffre en DRY RUN
+- Seuil à déterminer par les données, pas par hypothèse
+
+---
+
+### Signal 4 — Momentum confirmé 2x ✅ ANALYSÉ
+**Définition** : Prix monte au check 1 (t+0) ET encore au check 2 (t+45s).
+
+**Ce qui peut le fausser** :
+- Rug pull qui arrive APRÈS les 45 secondes
+- Groupe qui maintient prix stable pendant exactement le double check
+- 1 gros wallet qui achète lentement = faux momentum sur BC
+- Latence Helius entre les deux checks
+
+**Fix à implémenter** :
+- Appliquer SmartEntry sur pipeline BC (bonding curve) — déjà en place sur DexScreener
+- Détecter → attendre 45s → reconfirmer → acheter seulement si toujours positif
+
+---
+
+## SYNTHÈSE DES FIXES À IMPLÉMENTER (EN UNE SEULE SESSION MANUS)
+
+### Priorité 1 — SmartEntry sur pipeline BC
+```python
+# Dans ws_token_processor_job :
+# Au lieu d'acheter immédiatement après Gate 6 :
+# 1. Ajouter le token à une watchlist BC
+# 2. Attendre 45 secondes
+# 3. Revérifier bonding_progress_pct + real_sol_reserves
+# 4. Si toujours positif → acheter
+```
+
+### Priorité 2 — Timestamp création + critère âge < 10 min
+```python
+# Dans get_bonding_curve_data() (bonding_curve.py) :
+# Récupérer slot de création du token via Helius
+# Calculer age_minutes = (now - creation_time) / 60
+# Ajouter dans Gate 5 : age_minutes < 10
+```
+
+### Priorité 3 — Volume réel 5 premières minutes
+```python
+# Nouvel appel Helius : getSignaturesForAddress
+# Filtrer les transactions des 5 premières minutes
+# Calculer volume total en SOL × prix_SOL = volume USD
+# Logger : f"[BC] Volume 5min réel: ${volume_5m:.0f}"
+# Seuil : à déterminer par DRY RUN (ne pas fixer maintenant)
+```
+
+### Priorité 4 — Wallets acheteurs distincts
+```python
+# Appel Helius : getTokenLargestAccounts(token_address)
+# Compter les wallets avec balance > 0
+# Logger : f"[BC] Wallets distincts: {n_wallets}"
+# Seuil : à déterminer par DRY RUN
+```
+
+---
+
+## CHECKLIST FIRST PRINCIPLES — RESTE À ANALYSER
+
+- [ ] Cause procédurière complète (SmartEntry BC)
+- [ ] Cause matérielle complète (données manquantes)
+- [ ] Backtesting Signal 2 et Signal 3 sur données réelles
+
+---
+
+## BACKTESTING PARTIEL (7 juillet 2026)
+
+| Token | 24h | Volume | MC | Verdict |
+|-------|-----|--------|----|---------|
+| RANCHO | mort | - | - | Rejet correct ✅ |
+| Lock Tf In #1 | +517% | $881K | $87K | Manqué ❌ |
+| Lock Tf In #2 | +288% | $205K | $19K | Manqué ❌ |
+| Lock Tf In #3 | +101% | $420K | $14K | Manqué ❌ |
+| Lock Tf In #4 | -94% | $188K | $1K | Rejet correct ✅ |
+| Lock Tf In #5 | -90% | $279 | $2K | Rejet correct ✅ |
+| 76 #1 | +155% | $365K | $19K | Manqué ❌ |
+| 76 #2 | +130% | $184K | $17K | Manqué ❌ |
+
+**Pattern confirmé** : Les gagnants avaient MC $14K-$87K + Volume $184K-$881K.
+**LP:⚠️ ne prédit pas le rug** — les gagnants aussi avaient LP non burned.
+
+---
+
+## RÈGLES DU FRAMEWORK SHANNON
+
+```
+ORDRE D'APPLICATION :
+Shannon (états + format) → Entropie → Hormozi → First Principles
+→ Inversion → R6 (E2E + signal orphelin) → R7 (changelog)
+→ R8 (checklist finale) → R9 (audit dépendances)
+
+R9 : toutes librairies critiques figées en == dans requirements.txt
+     Jamais pip install sans version exacte sur production
+```
+
+---
+
+## COMMENT UTILISER CE FICHIER
+
+Au début d'une nouvelle conversation Claude, colle ce contenu
+et dis : "Voici ma mémoire de contexte, reprends où on s'était arrêtés."
